@@ -1,0 +1,425 @@
+"""AquaTempBleClient — BLE transport for the Aqua Temp pool heat pump.
+
+Owns the bleak connection and enforces a strict one-at-a-time
+request/response cycle. Responses to a Modbus request arrive as GATT
+notifications on ff02 and MAY be fragmented (typical chunks of 20 bytes at
+default MTU; a single 95-byte notification is possible when the MTU is
+negotiated higher; actual chunking is [V]). Reassembly rules, in order
+(BLUEPRINT §2.2d):
+
+1. expected length (primary completion),
+2. silence timeout (SILENCE_TIMEOUT without a new chunk) — covers unknown
+   response shapes, e.g. high-block queries [V],
+3. request timeout (REQUEST_TIMEOUT, overall deadline) — accepts a
+   CRC-valid buffer if one arrived, else raises AquaTempTimeoutError.
+
+Every completed frame is CRC-validated and function-code-validated before
+the awaiting caller resumes.
+
+Standalone use (outside Home Assistant, e.g. tools/smoke_client.py):
+    sys.path.insert(0, "<repo>/custom_components/aqua_temp_ble")
+    import aqua_client
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from typing import Any
+
+from bleak import BleakClient, BleakScanner
+
+try:  # package import (Home Assistant)
+    from . import const, modbus, registers
+except ImportError:  # standalone tools/tests: run from the component directory
+    import const
+    import modbus
+    import registers
+
+_LOGGER = logging.getLogger(__name__)
+
+
+class AquaTempError(Exception):
+    """Base error for the Aqua Temp BLE client."""
+
+
+class AquaTempConnectionError(AquaTempError):
+    """Cannot connect, or the connection was lost."""
+
+
+class AquaTempTimeoutError(AquaTempError):
+    """No complete response arrived in time."""
+
+
+class AquaTempResponseError(AquaTempError):
+    """Device replied, but the frame is invalid (CRC, shape, exception code).
+
+    Wraps a modbus.ModbusError when one is available (see .modbus_error).
+    """
+
+    def __init__(self, message_or_exc: str | Exception) -> None:
+        if isinstance(message_or_exc, BaseException):
+            self.modbus_error: modbus.ModbusError | None = message_or_exc  # type: ignore[assignment]
+            super().__init__(str(message_or_exc))
+        else:
+            self.modbus_error = None
+            super().__init__(message_or_exc)
+
+
+class AquaTempBleClient:
+    """Bleak connection + single-flight Modbus request/response cycle."""
+
+    def __init__(
+        self, address: str, name: str | None = None, hass: Any | None = None
+    ) -> None:
+        self._address = address
+        self._name = name
+        self._hass = hass  # optional Home Assistant instance (device cache)
+        self._client: BleakClient | None = None
+        self._write_with_response = True
+        self._rx = bytearray()
+        self._pending: asyncio.Future[bytes] | None = None
+        self._expected_fc: int | None = None
+        self._silence_timer: asyncio.TimerHandle | None = None
+
+    # ------------------------------------------------------------------ state
+    @property
+    def address(self) -> str:
+        return self._address
+
+    @property
+    def is_connected(self) -> bool:
+        return self._client is not None and bool(self._client.is_connected)
+
+    # ------------------------------------------------------------ connection
+    async def connect(self) -> None:
+        """Resolve the device, connect (2 attempts) and subscribe to ff02."""
+        if self.is_connected:
+            return
+        device = await self._resolve_device()
+        if device is None:
+            raise AquaTempConnectionError(
+                f"no Aqua Temp device found for address {self._address}"
+            )
+        last_exc: Exception | None = None
+        for attempt in (1, 2):
+            client = BleakClient(device, disconnected_callback=self._on_disconnect)
+            try:
+                await client.connect(timeout=const.CONNECT_TIMEOUT)
+                self._client = client
+                await client.start_notify(const.UUID_NOTIFY, self._on_notify)
+                self._resolve_write_characteristic(client)
+                _LOGGER.info(
+                    "Connected to %s (%s)",
+                    self._address,
+                    self._name or getattr(device, "name", "") or "",
+                )
+                return
+            except AquaTempError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                _LOGGER.warning(
+                    "connect attempt %d/2 to %s failed: %s", attempt, self._address, exc
+                )
+                try:
+                    await client.disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
+                if self._client is client:
+                    self._client = None
+        raise AquaTempConnectionError(
+            f"could not connect to {self._address}: {last_exc}"
+        ) from last_exc
+
+    async def disconnect(self) -> None:
+        """Idempotent disconnect; clears all pending request state."""
+        self._cancel_silence_timer()
+        self._fail_pending(AquaTempError("client disconnected"))
+        client = self._client
+        self._client = None
+        self._rx.clear()
+        if client is not None:
+            try:
+                await client.disconnect()
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.debug("disconnect error (ignored): %s", exc)
+
+    def _on_disconnect(self, _client: BleakClient) -> None:
+        """bleak disconnected_callback — runs in the event loop thread."""
+        _LOGGER.warning("BLE connection to %s lost", self._address)
+        self._cancel_silence_timer()
+        self._fail_pending(AquaTempConnectionError(f"connection to {self._address} lost"))
+
+    def _resolve_write_characteristic(self, client: BleakClient) -> None:
+        """Pick the write mode from the ff01 characteristic properties.
+
+        The app's Dart call hints at Android WRITE_TYPE_DEFAULT (write with
+        response); detection makes us robust either way. [V]
+        """
+        try:
+            char = client.services.get_characteristic(const.UUID_WRITE)
+        except Exception as exc:  # noqa: BLE001
+            raise AquaTempConnectionError(f"cannot inspect GATT services: {exc}") from exc
+        if char is None:
+            raise AquaTempConnectionError(
+                f"write characteristic {const.UUID_WRITE} not found on the device"
+            )
+        props = list(getattr(char, "properties", []) or [])
+        self._write_with_response = "write" in props
+        _LOGGER.debug(
+            "ff01 properties %s -> write_with_response=%s",
+            props,
+            self._write_with_response,
+        )
+
+    async def _resolve_device(self) -> Any | None:
+        """Find the BLE device: HA cache -> bleak by address -> name prefix scan."""
+        # 1. HA bluetooth manager cache (no scan needed)
+        if self._hass is not None:
+            try:
+                from homeassistant.components.bluetooth import (
+                    async_ble_device_from_address,
+                )
+            except ImportError:
+                _LOGGER.debug("HA bluetooth helper not available (standalone mode)")
+            else:
+                device = async_ble_device_from_address(
+                    self._hass, self._address, connectable=True
+                )
+                if device is not None:
+                    return device
+        # 2. bleak direct lookup by address
+        try:
+            device = await BleakScanner.find_device_by_address(self._address, timeout=5.0)
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning("find_device_by_address failed: %s", exc)
+            device = None
+        if device is not None:
+            return device
+        # 3. scan by name prefix (MAC may have changed across reboots)
+        _LOGGER.warning(
+            "address %s not found directly; scanning by name prefix %s ...",
+            self._address,
+            const.NAME_PREFIXES,
+        )
+        try:
+            devices = await BleakScanner.discover(timeout=5.0)
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning("BleakScanner.discover failed: %s", exc)
+            return None
+        matches = [
+            d for d in devices if (d.name or "").lower().startswith(const.NAME_PREFIXES)
+        ]
+        if not matches:
+            return None
+        if len(matches) > 1:
+            _LOGGER.warning(
+                "multiple Aqua Temp candidates found: %s",
+                [(d.name, d.address) for d in matches],
+            )
+        chosen = matches[0]
+        if chosen.address.lower() != self._address.lower():
+            _LOGGER.warning(
+                "Device found at a DIFFERENT address %s (configured: %s). The MAC "
+                "has probably changed — please re-configure the integration with "
+                "the new address. Using the discovered device for this session.",
+                chosen.address,
+                self._address,
+            )
+        return chosen
+
+    # -------------------------------------------------------- request/response
+    async def _write_frame(self, frame: bytes) -> None:
+        """Transport seam — send a raw frame on ff01. (Overridden in tests.)"""
+        await self._client.write_gatt_char(
+            const.UUID_WRITE, bytes(frame), response=self._write_with_response
+        )
+
+    async def _request(self, frame: bytes, expected_fc: int | None, timeout: float) -> bytes:
+        """Send one frame and await its complete, validated response.
+
+        expected_fc=None accepts any function code (used for the experimental
+        high-block queries whose response shape is unknown [V]).
+        """
+        if self._pending is not None and not self._pending.done():
+            raise AquaTempError("another request is already in flight")
+        if not self.is_connected:
+            raise AquaTempConnectionError("not connected")
+        loop = asyncio.get_running_loop()
+        self._pending = loop.create_future()
+        self._expected_fc = expected_fc
+        self._rx.clear()
+        _LOGGER.debug("TX (%d bytes): %s", len(frame), frame.hex())
+        try:
+            try:
+                await self._write_frame(frame)
+            except AquaTempError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                raise AquaTempConnectionError(f"GATT write failed: {exc}") from exc
+            try:
+                async with asyncio.timeout(timeout):
+                    return await self._pending
+            except TimeoutError:
+                # Rule 3: overall deadline — accept a CRC-valid buffer if any.
+                if len(self._rx) >= 5 and modbus.validate_crc(bytes(self._rx)):
+                    _LOGGER.debug(
+                        "deadline accepts CRC-valid frame (%d bytes): %s",
+                        len(self._rx),
+                        bytes(self._rx).hex(),
+                    )
+                    return bytes(self._rx)
+                raise AquaTempTimeoutError(
+                    f"no complete response within {timeout:.1f}s "
+                    f"(got {len(self._rx)} bytes)"
+                ) from None
+        finally:
+            self._cancel_silence_timer()
+            self._pending = None
+            self._expected_fc = None
+            self._rx.clear()
+
+    def _on_notify(self, *args: Any) -> None:
+        """Handle one GATT notification chunk.
+
+        bleak < 0.22 calls (sender, data); newer bleak calls (data). [V]
+        """
+        data = args[-1] if args else b""
+        if const.DEBUG_RAW:
+            _LOGGER.debug("ff02 chunk (%d): %s", len(data), bytes(data).hex())
+        pending = self._pending
+        if pending is None or pending.done():
+            self._rx.clear()  # stale push: drop
+            return
+        self._rx.extend(data)
+        if self._rx and self._rx[0] != modbus.SLAVE_ID:
+            _LOGGER.warning(
+                "dropping non-Modbus notify: %s", bytes(self._rx).hex()
+            )
+            self._rx.clear()
+            return
+        if len(self._rx) > const.MAX_RX_BUFFER:
+            self._rx.clear()
+            self._fail_pending(AquaTempResponseError("response too long"))
+            return
+        if len(self._rx) >= 2 and self._expected_fc is not None:
+            fc = self._rx[1]
+            if fc not in (self._expected_fc, self._expected_fc | 0x80):
+                _LOGGER.warning(
+                    "dropping unexpected function code 0x%02X: %s",
+                    fc,
+                    bytes(self._rx).hex(),
+                )
+                self._rx.clear()
+                return
+        expected = modbus.expected_response_length(bytes(self._rx))
+        if expected is not None and len(self._rx) >= expected:
+            # Rule 1: expected length reached — complete (remainder dropped).
+            self._complete(bytes(self._rx[:expected]))
+            return
+        # More (or unknown-shape) data may follow: arm the silence timer.
+        self._arm_silence_timer()
+
+    def _arm_silence_timer(self) -> None:
+        """(Re)arm the silence timer after every chunk (rule 2)."""
+        self._cancel_silence_timer()
+        loop = asyncio.get_running_loop()
+        self._silence_timer = loop.call_later(const.SILENCE_TIMEOUT, self._on_silence)
+
+    def _on_silence(self) -> None:
+        self._silence_timer = None
+        pending = self._pending
+        if pending is None or pending.done():
+            return
+        buf = bytes(self._rx)
+        if len(buf) >= 5 and modbus.validate_crc(buf):
+            _LOGGER.debug(
+                "silence timer completes frame (%d bytes): %s", len(buf), buf.hex()
+            )
+            self._complete(buf)
+        else:
+            # Chunks may still arrive; the request timeout is the final deadline.
+            _LOGGER.debug(
+                "silence after %d bytes (no valid CRC yet); waiting for the request timeout",
+                len(buf),
+            )
+
+    def _complete(self, frame: bytes) -> None:
+        """Validate CRC + function code of a complete frame, then resolve."""
+        pending = self._pending
+        self._cancel_silence_timer()
+        if pending is None or pending.done():
+            self._rx.clear()
+            return
+        _LOGGER.debug("RX frame (%d bytes): %s", len(frame), frame.hex())
+        if not modbus.validate_crc(frame):
+            self._rx.clear()
+            self._fail_pending(AquaTempResponseError(modbus.ModbusCRCError(
+                f"bad CRC: {frame.hex()}"
+            )))
+            return
+        fc = frame[1]
+        if fc & 0x80:
+            code = frame[2]
+            self._rx.clear()
+            self._fail_pending(AquaTempResponseError(modbus.ModbusExceptionError(code)))
+            return
+        self._rx.clear()  # any remainder beyond the frame is dropped
+        pending.set_result(frame)
+
+    def _fail_pending(self, exc: Exception) -> None:
+        pending = self._pending
+        self._cancel_silence_timer()
+        if pending is not None and not pending.done():
+            pending.set_exception(exc)
+
+    def _cancel_silence_timer(self) -> None:
+        if self._silence_timer is not None:
+            self._silence_timer.cancel()
+            self._silence_timer = None
+
+    # ----------------------------------------------------------- high level
+    async def read_registers(self, start: int, count: int) -> dict[int, int]:
+        """FC03 read; returns {register: raw signed int16}."""
+        frame = modbus.build_read_holding_registers(start, count)
+        resp = await self._request(frame, modbus.FC_READ_HOLDING, const.REQUEST_TIMEOUT)
+        try:
+            return modbus.parse_read_response(
+                resp,
+                start,
+                count,
+                little_endian=registers.REG_DATA_LITTLE_ENDIAN,
+            )
+        except modbus.ModbusError as exc:
+            raise AquaTempResponseError(exc) from exc
+
+    async def query_block(self, start: int, count: int) -> bytes:
+        """Experimental 8-byte block query; response shape is unknown [V].
+
+        Returns the raw CRC-validated response bytes. Never used by polling.
+        """
+        frame = modbus.build_query_block(start, count)
+        return await self._request(frame, None, const.REQUEST_TIMEOUT)
+
+    async def write_registers(self, start: int, values: list[int]) -> None:
+        """FC10 write (H1 layout) + optional echo wait (registers.WRITE_ECHO_EXPECTED)."""
+        frame = modbus.build_write_registers(start, values)
+        if not registers.WRITE_ECHO_EXPECTED or const.WRITE_ECHO_TIMEOUT <= 0:
+            # fire-and-forget mode
+            if not self.is_connected:
+                raise AquaTempConnectionError("not connected")
+            _LOGGER.debug("TX fire-and-forget (%d bytes): %s", len(frame), frame.hex())
+            try:
+                await self._write_frame(frame)
+            except AquaTempError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                raise AquaTempConnectionError(f"GATT write failed: {exc}") from exc
+            return
+        echo = await self._request(frame, modbus.FC_WRITE_MULTI, const.WRITE_ECHO_TIMEOUT)
+        try:
+            modbus.parse_write_echo(echo, start, len(values))
+        except modbus.ModbusError as exc:
+            raise AquaTempResponseError(exc) from exc
+        _LOGGER.debug("write echo OK: %s", echo.hex())

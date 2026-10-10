@@ -1,0 +1,67 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Sélectionnez votre pompe à chaleur",
+        "description": "Les unités Aqua Temp découvertes à proximité sont listées ci-dessous. Si la vôtre n'apparaît pas, son adresse Bluetooth vous sera demandée.",
+        "data": {
+          "address": "Appareil"
+        }
+      },
+      "manual": {
+        "title": "Adresse manuelle",
+        "description": "Saisissez l'adresse Bluetooth de l'unité, ex. `XX:XX:XX:XX:XX:XX`. Fermez d'abord l'application du fabricant — l'unité accepte une seule connexion.",
+        "data": {
+          "address": "Adresse Bluetooth"
+        }
+      },
+      "test": {
+        "title": "Test de connexion",
+        "description": "Connexion à {address} et lecture du bloc de registres de base (7-51)…"
+      },
+      "confirm": {
+        "title": "Nommez votre appareil",
+        "description": "Le test de connexion vers {address} a réussi.\n\n- Alimentation : {power}\n- Mode : {mode}\n- Température d'eau entrante : {inlet}\n- Température d'eau sortante : {outlet}\n- Température ambiante : {ambient}\n\nChoisissez un nom convivial pour cette pompe à chaleur :",
+        "data": {
+          "name": "Nom"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Impossible de se connecter à l'appareil. Vérifiez que l'application du fabricant est fermée (l'unité n'accepte qu'une seule connexion Bluetooth) et que l'unité est à portée, puis réessayez.",
+      "no_response": "L'appareil a accepté la connexion mais n'a pas répondu. Rapprochez-vous et réessayez.",
+      "crc_error": "L'appareil a répondu, mais la réponse était corrompue. Réessayez.",
+      "invalid_address": "Format d'adresse Bluetooth invalide (attendu : XX:XX:XX:XX:XX:XX)."
+    },
+    "abort": {
+      "already_configured": "Cette pompe à chaleur est déjà configurée.",
+      "not_supported": "Cet appareil Bluetooth n'est pas une pompe à chaleur Aqua Temp."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "data": {
+          "poll_interval": "Intervalle d'interrogation (secondes)",
+          "temperature_unit": "Unité de température affichée"
+        }
+      }
+    }
+  },
+  "services": {
+    "probe_registers": {
+      "name": "Sonder les registres",
+      "description": "Lit un bloc de registres bruts via BLE et journalise chaque registre (valeur brute, hex, /10) pour la calibration. Fermez d'abord l'application du fabricant.",
+      "fields": {
+        "device_id": {
+          "name": "Appareil",
+          "description": "Appareil à sonder. Laissez vide pour sonder toutes les unités Aqua Temp configurées."
+        },
+        "block": {
+          "name": "Bloc",
+          "description": "Bloc de registres à lire. Les blocs hauts sont expérimentaux."
+        }
+      }
+    }
+  }
+}

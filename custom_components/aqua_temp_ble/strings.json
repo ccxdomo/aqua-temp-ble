@@ -1,0 +1,67 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Select your heat pump",
+        "description": "Aqua Temp units discovered nearby are listed below. If yours is missing, you will be asked for its Bluetooth address.",
+        "data": {
+          "address": "Device"
+        }
+      },
+      "manual": {
+        "title": "Manual address",
+        "description": "Enter the Bluetooth address of the unit, e.g. `XX:XX:XX:XX:XX:XX`. Make sure the vendor app is closed first — the unit accepts a single connection.",
+        "data": {
+          "address": "Bluetooth address"
+        }
+      },
+      "test": {
+        "title": "Testing the connection",
+        "description": "Connecting to {address} and reading the base register block (7-51)…"
+      },
+      "confirm": {
+        "title": "Name your device",
+        "description": "The connection test to {address} succeeded.\n\n- Power: {power}\n- Mode: {mode}\n- Inlet water temperature: {inlet}\n- Outlet water temperature: {outlet}\n- Ambient temperature: {ambient}\n\nChoose a friendly name for this heat pump:",
+        "data": {
+          "name": "Name"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to the device. Make sure the vendor app is closed (the unit accepts a single Bluetooth connection) and that the unit is in range, then try again.",
+      "no_response": "The device accepted the connection but did not answer. Move closer and try again.",
+      "crc_error": "The device replied, but the response was corrupted. Try again.",
+      "invalid_address": "Invalid Bluetooth address format (expected XX:XX:XX:XX:XX:XX)."
+    },
+    "abort": {
+      "already_configured": "This heat pump is already configured.",
+      "not_supported": "This Bluetooth device is not an Aqua Temp heat pump."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "data": {
+          "poll_interval": "Polling interval (seconds)",
+          "temperature_unit": "Display temperature unit"
+        }
+      }
+    }
+  },
+  "services": {
+    "probe_registers": {
+      "name": "Probe registers",
+      "description": "Reads a raw register block over BLE and logs every register (raw value, hex, /10) for calibration. Close the vendor app first.",
+      "fields": {
+        "device_id": {
+          "name": "Device",
+          "description": "Device to probe. Leave empty to probe every configured Aqua Temp unit."
+        },
+        "block": {
+          "name": "Block",
+          "description": "Register block to read. High blocks are experimental."
+        }
+      }
+    }
+  }
+}

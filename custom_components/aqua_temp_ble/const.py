@@ -1,0 +1,31 @@
+"""Constants for the aqua_temp_ble integration.
+
+Kept stdlib-only (no Home Assistant imports) so the standalone tools and the
+unit tests can import this module outside HA.
+"""
+
+DOMAIN = "aqua_temp_ble"
+
+# Platform names — identical to homeassistant.const.Platform values. Plain
+# strings are used on purpose (see module docstring).
+PLATFORMS = ["climate", "sensor", "binary_sensor", "button"]
+
+# GATT characteristics recovered from the vendor app (FINDINGS.md §3, §11.3)
+UUID_WRITE = "0000ff01-0000-1000-8000-00805f9b34fb"   # [P] handle 2214
+UUID_NOTIFY = "0000ff02-0000-1000-8000-00805f9b34fb"  # [P] handle 2216
+# ff03 (handle 2215) exists but its role is unknown — do NOT use it. [V]
+
+# BLE name prefixes the vendor app itself filters on (Dart pool). [P]
+NAME_PREFIXES = ("bluerng-", "hiflying-", "prov_")
+
+CONNECT_TIMEOUT = 15.0    # seconds
+REQUEST_TIMEOUT = 8.0    # max wait for a full Modbus response
+SILENCE_TIMEOUT = 0.6    # gap without a new chunk that ends a fragmented response
+WRITE_ECHO_TIMEOUT = 3.0  # max wait for an FC10 echo; 0 = fire-and-forget
+MAX_RX_BUFFER = 512
+
+DEFAULT_POLL_INTERVAL = 30  # seconds (options: 10..600)
+DEFAULT_TEMPERATURE_UNIT = "C"  # display only; wire is always x10 Celsius [P]
+
+# Set True to log every raw notification chunk in hex (debug aid, noisy).
+DEBUG_RAW = False

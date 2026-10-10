@@ -1,0 +1,134 @@
+"""The Aqua Temp BLE integration: setup/unload, options, probe service.
+
+Entry flow (BLUEPRINT §5/§6): create client + coordinator ->
+`async_config_entry_first_refresh()` (failure -> ConfigEntryNotReady) ->
+forward platforms -> register the domain service once. Unload reverses all
+of it; when the last entry is unloaded the service is removed.
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import timedelta
+from typing import Any
+
+import voluptuous as vol
+
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import device_registry as dr
+
+from .aqua_client import AquaTempBleClient, AquaTempError
+from .const import DEFAULT_POLL_INTERVAL, DOMAIN, PLATFORMS
+from .coordinator import AquaTempCoordinator
+
+_LOGGER = logging.getLogger(__name__)
+
+# Blocks accepted by the probe service (base block + the 6 recovered query
+# blocks). No writes are ever sent to blocks 1001-2090.
+PROBE_BLOCKS = {"base", "1001", "1046", "1091", "1136", "2001", "2046"}
+
+PROBE_SCHEMA = vol.Schema(
+    {
+        vol.Optional("device_id"): vol.Any(str, [str]),
+        vol.Optional("block", default="base"): vol.In(PROBE_BLOCKS),
+    }
+)
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Set up one Aqua Temp heat pump from a config entry."""
+    hass.data.setdefault(DOMAIN, {})
+    address = entry.data["address"]
+    client = AquaTempBleClient(address, name=entry.data.get("name"), hass=hass)
+    coordinator = AquaTempCoordinator(hass, entry, client)
+    hass.data[DOMAIN][entry.entry_id] = {"client": client, "coordinator": coordinator}
+
+    # Raises ConfigEntryNotReady on failure -> HA retries with backoff.
+    await coordinator.async_config_entry_first_refresh()
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    entry.async_on_unload(entry.add_update_listener(_async_update_options))
+    _async_register_services(hass)
+    return True
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Unload one config entry; remove the service when the last one goes."""
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if unload_ok:
+        data = hass.data[DOMAIN].pop(entry.entry_id)
+        try:
+            await data["client"].disconnect()
+        except Exception:  # noqa: BLE001
+            _LOGGER.debug("disconnect during unload failed", exc_info=True)
+        if not hass.data[DOMAIN]:
+            hass.services.async_remove(DOMAIN, "probe_registers")
+    return unload_ok
+
+
+async def _async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Apply option changes without reloading: poll interval (unit is dynamic)."""
+    coordinator: AquaTempCoordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
+    coordinator.update_interval = timedelta(
+        seconds=entry.options.get("poll_interval", DEFAULT_POLL_INTERVAL)
+    )
+
+
+def _async_register_services(hass: HomeAssistant) -> None:
+    """Register the domain-level probe service exactly once."""
+    if hass.services.has_service(DOMAIN, "probe_registers"):
+        return
+
+    async def _async_probe_registers(call: ServiceCall) -> dict[str, Any]:
+        """Read a raw register block and log it for calibration (§4)."""
+        block = str(call.data.get("block", "base"))
+        device_ids = call.data.get("device_id")
+        if isinstance(device_ids, str):
+            device_ids = [device_ids]
+
+        coordinators: dict[str, AquaTempCoordinator] = {}
+        if device_ids:
+            registry = dr.async_get(hass)
+            for device_id in device_ids:
+                device = registry.async_get(device_id)
+                if device is None:
+                    raise HomeAssistantError(f"unknown device: {device_id}")
+                for entry_id in device.config_entries:
+                    if entry_id in hass.data.get(DOMAIN, {}):
+                        coordinators[entry_id] = hass.data[DOMAIN][entry_id][
+                            "coordinator"
+                        ]
+            if not coordinators:
+                raise HomeAssistantError(
+                    f"device {device_ids[0]} is not set up by {DOMAIN}"
+                )
+        else:
+            for entry_id, data in hass.data.get(DOMAIN, {}).items():
+                coordinators[entry_id] = data["coordinator"]
+        if not coordinators:
+            raise HomeAssistantError(f"no {DOMAIN} devices configured")
+
+        result: dict[str, Any] = {}
+        for coordinator in coordinators.values():
+            address = coordinator.config_entry.data["address"]
+            try:
+                probe = await coordinator.async_probe_block(block)
+            except AquaTempError as err:
+                _LOGGER.error(
+                    "probe of %s (block %s) failed: %s", address, block, err
+                )
+                result[address] = {"block": block, "error": str(err)}
+            else:
+                result.update(probe)
+        return result
+
+    hass.services.async_register(
+        DOMAIN,
+        "probe_registers",
+        _async_probe_registers,
+        schema=PROBE_SCHEMA,
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+    _LOGGER.debug("service %s.probe_registers registered", DOMAIN)
