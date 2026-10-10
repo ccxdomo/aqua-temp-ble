@@ -15,7 +15,6 @@ from homeassistant.config_entries import (
     ConfigFlowResult,
     OptionsFlow,
 )
-from homeassistant.core import callback
 
 from . import registers
 from .aqua_client import (
@@ -215,8 +214,9 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
         )
 
     @staticmethod
-    @callback
     def async_get_options_flow(entry: Any) -> AquaTempOptionsFlowHandler:
+        # HA calls this getter synchronously (config_entries.OptionsFlowManager),
+        # so no @callback marker is needed here.
         return AquaTempOptionsFlowHandler()
 
 

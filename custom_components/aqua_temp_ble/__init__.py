@@ -9,13 +9,14 @@ of it; when the last entry is unloaded the service is removed.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from datetime import timedelta
 from typing import Any
 
 import voluptuous as vol
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
+from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr
 
@@ -48,6 +49,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Raises ConfigEntryNotReady on failure -> HA retries with backoff.
     await coordinator.async_config_entry_first_refresh()
 
+    # Publish the firmware version to the device registry at the first cycle
+    # that reports it (entities embed DeviceInfo only once, at add time).
+    entry.async_on_unload(_async_track_firmware(hass, entry, coordinator))
+
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_update_options))
     _async_register_services(hass)
@@ -74,6 +79,39 @@ async def _async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None
     coordinator.update_interval = timedelta(
         seconds=entry.options.get("poll_interval", DEFAULT_POLL_INTERVAL)
     )
+    # Re-render every entity right away: the display unit is a property read
+    # at state-write time, so without this the °C/°F switch would only become
+    # visible at the next poll (up to `poll_interval` seconds later).
+    coordinator.async_update_listeners()
+
+
+@callback
+def _async_track_firmware(
+    hass: HomeAssistant, entry: ConfigEntry, coordinator: AquaTempCoordinator
+) -> Callable[[], None]:
+    """Publish the firmware to the device registry as soon as it is known.
+
+    HA merges ``DeviceInfo`` into the device registry only when entities are
+    added, so a firmware string that arrives later (registers 48..51 read as
+    sentinel during the first cycles, or after a vendor firmware update)
+    would never reach the registry. This listener patches ``sw_version`` at
+    the very cycle that reports it, and stays registered so a firmware
+    upgrade on the unit is reflected too.
+    """
+    device_registry = dr.async_get(hass)
+    address = entry.data["address"]
+
+    @callback
+    def _async_update_firmware() -> None:
+        data = coordinator.data
+        if data is None or data.firmware is None:
+            return
+        device = device_registry.async_get_device(identifiers={(DOMAIN, address)})
+        if device is None or device.sw_version == data.firmware:
+            return
+        device_registry.async_update_device(device.id, sw_version=data.firmware)
+
+    return coordinator.async_add_listener(_async_update_firmware)
 
 
 def _async_register_services(hass: HomeAssistant) -> None:
