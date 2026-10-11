@@ -66,6 +66,24 @@ class AquaTempResponseError(AquaTempError):
             super().__init__(message_or_exc)
 
 
+def _exc_chain(exc: BaseException) -> str:
+    """Render an exception with its cause chain, root cause included.
+
+    The production incident showed the real transport error never reaching
+    the logs; this renders 'Type: message <- RootType: root message' so log
+    lines and AquaTempConnectionError strings always carry the underlying
+    failure, not just the outer wrapper.
+    """
+    parts = [f"{type(exc).__name__}: {exc}"]
+    seen = {exc}
+    cause = exc.__cause__
+    while cause is not None and cause not in seen:
+        seen.add(cause)
+        parts.append(f" <- {type(cause).__name__}: {cause}")
+        cause = cause.__cause__
+    return "".join(parts)
+
+
 class AquaTempBleClient:
     """Bleak connection + single-flight Modbus request/response cycle."""
 
@@ -92,8 +110,39 @@ class AquaTempBleClient:
         return self._client is not None and bool(self._client.is_connected)
 
     # ------------------------------------------------------------ connection
+    def _load_retry_connector(self) -> Any | None:
+        """Lazily import bleak_retry_connector; None when not installed.
+
+        Deliberately NOT a module-level import: standalone tools and the
+        test suite run without the library (no Home Assistant), while Home
+        Assistant always ships it via the bluetooth integration.
+        """
+        try:
+            import bleak_retry_connector  # lazy on purpose: absent standalone
+        except ImportError:
+            _LOGGER.debug(
+                "bleak_retry_connector not installed; "
+                "falling back to raw BleakClient (standalone mode)"
+            )
+            return None
+        return bleak_retry_connector
+
     async def connect(self) -> None:
-        """Resolve the device, connect (2 attempts) and subscribe to ff02."""
+        """Resolve the device, connect (2 attempts) and subscribe to ff02.
+
+        Home Assistant path: bleak_retry_connector.establish_connection() —
+        retried connects with per-failure backoff, stale bluez connection
+        cleanup, already-connected device reuse and best-backend selection
+        by the HA wrapper (the official pattern for all HA Bluetooth
+        integrations; calling BleakClient.connect() directly is what HA's
+        "without bleak-retry-connector" warning is about).
+
+        Standalone fallback (library absent): raw BleakClient 2-attempt
+        loop, identical in spirit to the historic implementation.
+
+        Either way the REAL failure (type + message + cause chain) is
+        logged before being converted to AquaTempConnectionError.
+        """
         if self.is_connected:
             return
         device = await self._resolve_device()
@@ -101,36 +150,96 @@ class AquaTempBleClient:
             raise AquaTempConnectionError(
                 f"no Aqua Temp device found for address {self._address}"
             )
+        try:
+            brc = self._load_retry_connector()
+            if brc is not None:
+                # max_attempts=2 preserves the historic retry budget;
+                # transient errors (bluez slots, EOF, BrokenPipe) get
+                # additional retries with backoff inside the library.
+                # Extra kwargs are forwarded to the BleakClient
+                # constructor, which is the canonical place for the connect
+                # timeout in bleak >= 0.21 (connect() still honours a
+                # `timeout` kwarg for backwards compatibility, but the
+                # constructor is the path documented and exercised by the
+                # library). const.CONNECT_TIMEOUT therefore stays effective
+                # per attempt; bleak-retry-connector adds its own safety
+                # deadline on top.
+                client: BleakClient = await brc.establish_connection(
+                    BleakClient,
+                    device,
+                    name=self._name or getattr(device, "name", "") or self._address,
+                    disconnected_callback=self._on_disconnect,
+                    max_attempts=2,
+                    timeout=const.CONNECT_TIMEOUT,
+                )
+            else:
+                client = await self._connect_with_raw_client(device)
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.error(
+                "connect to %s failed: %s", self._address, _exc_chain(exc)
+            )
+            raise AquaTempConnectionError(
+                f"could not connect to {self._address}: {_exc_chain(exc)}"
+            ) from exc
+        self._client = client
+        try:
+            await client.start_notify(const.UUID_NOTIFY, self._on_notify)
+            self._resolve_write_characteristic(client)
+        except AquaTempError:
+            # Link is up but ff02/ff01 setup failed: tear down so the next
+            # connect() starts from a clean state.
+            await self.disconnect()
+            raise
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.error(
+                "post-connect setup (ff02 notify / ff01 lookup) on %s "
+                "failed: %s",
+                self._address,
+                _exc_chain(exc),
+            )
+            await self.disconnect()
+            raise AquaTempConnectionError(
+                f"could not connect to {self._address}: {_exc_chain(exc)}"
+            ) from exc
+        _LOGGER.info(
+            "Connected to %s (%s)",
+            self._address,
+            self._name or getattr(device, "name", "") or "",
+        )
+
+    async def _connect_with_raw_client(self, device: Any) -> BleakClient:
+        """Standalone fallback: raw BleakClient with the historic 2-attempt
+        loop. Used only when bleak_retry_connector is not installed
+        (standalone tools / tests, no Home Assistant).
+        """
         last_exc: Exception | None = None
         for attempt in (1, 2):
-            client = BleakClient(device, disconnected_callback=self._on_disconnect)
+            client = BleakClient(
+                device,
+                disconnected_callback=self._on_disconnect,
+                timeout=const.CONNECT_TIMEOUT,
+            )
             try:
+                # Constructor timeout is the canonical path in bleak
+                # >= 0.21; the kwarg is kept for older bleak, which reads
+                # it from connect() instead.
                 await client.connect(timeout=const.CONNECT_TIMEOUT)
-                self._client = client
-                await client.start_notify(const.UUID_NOTIFY, self._on_notify)
-                self._resolve_write_characteristic(client)
-                _LOGGER.info(
-                    "Connected to %s (%s)",
-                    self._address,
-                    self._name or getattr(device, "name", "") or "",
-                )
-                return
-            except AquaTempError:
-                raise
+                return client
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
                 _LOGGER.warning(
-                    "connect attempt %d/2 to %s failed: %s", attempt, self._address, exc
+                    "connect attempt %d/2 to %s failed: %s: %s",
+                    attempt,
+                    self._address,
+                    type(exc).__name__,
+                    exc,
                 )
                 try:
                     await client.disconnect()
                 except Exception:  # noqa: BLE001
                     pass
-                if self._client is client:
-                    self._client = None
-        raise AquaTempConnectionError(
-            f"could not connect to {self._address}: {last_exc}"
-        ) from last_exc
+        assert last_exc is not None  # the loop always runs twice
+        raise last_exc
 
     async def disconnect(self) -> None:
         """Idempotent disconnect; clears all pending request state."""
