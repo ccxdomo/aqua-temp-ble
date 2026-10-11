@@ -55,13 +55,39 @@ HIGH_BLOCKS: dict[str, int] = {
 # Log each unknown Mode value only once per HA session.
 _logged_unknown_modes: set[int | None] = set()
 
+# Log one implausible-raw warning per register address per HA session (FR-2,
+# decode-contract.md §7). Sentinels are NOT logged — they are normal "sensor
+# absent" states, not errors; they stay visible as raw values in the probe
+# dumps, which is exactly where they are useful.
+_logged_implausible: set[int] = set()
+
+
+def decode_temp_logged(address: int, raw: int | None) -> float | None:
+    """registers.decode_temp + the once-per-address implausible warning.
+
+    Shared by the coordinator snapshot and the sensor platform (the two
+    decode consumers) so that whichever decodes an implausible raw first
+    logs exactly one WARNING per address per HA session (FR-2).
+    """
+    value = registers.decode_temp(raw)
+    if (
+        value is None
+        and raw is not None
+        and not registers.is_sentinel(raw)
+        and address not in _logged_implausible
+    ):
+        _logged_implausible.add(address)
+        _LOGGER.warning(
+            "register %d reports implausible raw %d — treated as absent",
+            address,
+            raw,
+        )
+    return value
+
 
 def _scaled(regs: dict[int, int], address: int) -> float | None:
-    """Register raw -> scaled value; None when missing or sentinel."""
-    raw = regs.get(address)
-    if raw is None or raw == registers.SENTINEL_RAW:
-        return None
-    return raw / registers.TEMP_SCALE
+    """Register raw -> scaled value; None when absent, sentinel or implausible."""
+    return decode_temp_logged(address, regs.get(address))
 
 
 @dataclass
@@ -135,20 +161,17 @@ class AquaTempData:
         fw_raw = [regs.get(a) for a in range(registers.REG_FIRMWARE_FIRST,
                                              registers.REG_FIRMWARE_LAST + 1)]
         firmware: str | None = None
-        if all(r is not None and r != registers.SENTINEL_RAW for r in fw_raw):
+        if all(r is not None and not registers.is_sentinel(r) for r in fw_raw):
             firmware = ".".join(str(r) for r in fw_raw)  # [V] semantics
 
         binaries: dict[str, bool | None] = {}
         for d in registers.BINARIES:
             if d.address is None:
                 continue  # not calibrated -> entity not created, no data shown
-            raw = regs.get(d.address)
-            if raw is None:
-                binaries[d.key] = None
-            elif registers.BINARY_ACTIVE_WHEN_NONZERO:
-                binaries[d.key] = raw != 0
-            else:
-                binaries[d.key] = raw == 0
+            # Per-RegDef polarity, else the global default (FR-4).
+            binaries[d.key] = registers.decode_flag(
+                regs.get(d.address), registers.resolve_polarity(d)
+            )
 
         return cls(
             registers=regs,
@@ -218,6 +241,11 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
 
     async def async_write_register(self, address: int, value: int) -> None:
         """Serialize a write against reads, then confirm with one refresh."""
+        # FR-9: the single write funnel guard — before any lock or I/O, so no
+        # code path can ever write outside {8, 13, 14} (+19-21 behind the
+        # WRITE_MODE_SETPOINT_TOO switch). Installer settings (H/R/P) and the
+        # high blocks 1001-2090 are never writable (spec 003 §6).
+        registers.ensure_writable(address)
         async with self._io_lock:
             await self.client.write_registers(address, [value])
         await self.async_request_refresh()  # debounced confirmation read

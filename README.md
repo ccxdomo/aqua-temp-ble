@@ -24,9 +24,11 @@ parent directory.
 | What | Status | Entities |
 |---|---|---|
 | Inlet / outlet / ambient water temperatures | **[P] proven** | 3 sensors (°C, ÷10 scaling, sentinel-aware) |
+| Suction / coil / exhaust temperatures | **[V] registers not pinned yet** | 3 sensors (appear after calibration) |
 | Power on/off, mode heat/cool/auto, setpoint | **[P] read, [V] write to confirm live** | 1 climate entity |
 | Fault code, firmware | **[P] address, [V] semantics** | 2 sensors (diagnostic) |
-| Compressor / circulate pump / 4-way valve | **[V] registers not pinned yet** | hidden until calibration |
+| Compressor / circulate pump / high fan / 4-way valve | **[V] registers not pinned yet** | 4 binary sensors (appear after calibration) |
+| HP / LP / flow switch (safety inputs) | **[V] registers not pinned yet** | 3 binary sensors, diagnostic (appear after calibration) |
 | Register probe / calibration tool | **working** | 1 button + 1 service |
 
 Protocol facts baked into the code (all CRC-verified against the app):
@@ -34,7 +36,9 @@ Protocol facts baked into the code (all CRC-verified against the app):
 - GATT write `0000ff01-…`, notify `0000ff02-…` (BlueNRG module)
 - Base read: `63 03 0007 002D` → 45 holding registers (7..51), 95-byte response
 - Writes: FC10 with the safe **16-bit H1 layout** (`63 10 addr 0001 02 value`)
-- Temperatures: `value = int(degrees × 10)`; sentinel `-9990` = sensor absent
+- Temperatures: `value = int(degrees × 10)`; "sensor absent" sentinels
+  `-9990` **and** `32765` (`0x7FFD`) — plus a −45…+150 °C plausibility guard —
+  always decode to `unknown`, never to a number
 
 ## Requirements
 
@@ -117,16 +121,32 @@ Options (Configure on the device card):
 
 ## Entities
 
+Entities marked **[V]** are prepared placeholders: the panel observation
+(spec 003) confirmed their labels, but their register indices are not
+proven yet, so **no entity is created until calibration pins them** — no
+unconfirmed data can ever appear under a label.
+
 | Entity | Register | Notes |
 |---|---|---|
 | Climate | 8/13/14 (+19-25, 26) | on/off, heat/cool/auto, setpoint (0.5 steps) |
 | Inlet water temperature | 26 | ÷10, sentinel → unknown |
 | Outlet water temperature | 27 | ÷10 |
 | Ambient temperature | 28 | ÷10 |
+| Suction temperature (T01) | **[V]** | appears after calibration |
+| Coil temperature (T04) | **[V]** | appears after calibration |
+| Exhaust temperature (T06) | **[V]** | appears after calibration |
 | Fault code | 47 | 0 = no fault assumed (**[A]**, verify step 6) |
 | Firmware | 48-51 | dot-joined (**[V]** semantics, verify) |
 | Probe registers (button) | — | reads block 7..51 and logs it |
-| Compressor / pump / valve | 29..46 [V] | appear after calibration |
+| Compressor (O01) / Circulate pump (O02) / High fan (O03) / 4-way valve (O04) | **[V]** 29..46 | binary sensors, appear after calibration |
+| HP switch (S01) / LP switch (S02) / Flow switch (S03) | **[V]** | binary sensors, diagnostic; appear after calibration |
+
+**Sensor-absent honesty.** The unit uses two "sensor absent" sentinel
+conventions on the wire (`-9990` and `32765`/`0x7FFD`), and any temperature
+raw outside −45…+150 °C is treated as absent. An absent sensor always shows
+`unknown` — the vendor app's own display of an absent sensor as
+**3276.5 °C** is a display bug this integration deliberately does not
+replicate.
 
 ## Calibration (one live session)
 
@@ -175,42 +195,18 @@ Local-only BLE; no cloud, no account, no credentials, no data leaves the LAN.
 This integration sends writes only to registers 8 (power), 13 (mode) and 14
 (setpoint) in the base block, and never writes to blocks 1001-2090.
 
+**Installer settings are unreachable from HA** (spec 003 §6): the machine
+settings (**H**), regulation thresholds (**R**) and filtration program
+(**P**) families have **no entity and no service** — an erroneous write to
+the H04 exhaust safety threshold (105.0 °C) or an R limit can damage the
+heat pump or prevent it from starting. The single write funnel
+(`async_write_register`) enforces an allowlist
+(`registers.ensure_writable`): {8, 13, 14}, plus 19/20/21 only behind a
+default-off calibration switch. There is deliberately **no generic
+"write register" service**.
+
 ## License & disclaimer
 
 Provided as-is for personal use. This controls a pool heat pump — always
 verify temperatures and behaviour on the device panel after installation,
 especially before the calibration runbook is complete.
-
----
-
-## Version française (résumé)
-
-Intégration Home Assistant pour les pompes à chaleur de piscine PHNIX
-(application « Aqua Temp »). Communication directe en **Bluetooth Low
-Energy** (Modbus RTU sur GATT) — pas de cloud constructeur, pas de compte, la
-PAC n'a même pas de WiFi.
-
-**Installation** : via HACS (dépôt custom, catégorie Integration) ou copie
-manuelle de `custom_components/aqua_temp_ble/` dans `config/custom_components/`,
-puis redémarrage de HA.
-
-**Avant la première connexion** : appareillez la PAC avec l'application du
-constructeur au moins une fois (bouton du panneau maintenu ~5 s jusqu'à
-l'affichage **`bLE`**). **Fermez ensuite complètement l'application** — la PAC
-n'accepte qu'**une seule** connexion BLE à la fois.
-
-**Configuration** : Paramètres → Appareils et services → Ajouter une
-intégration → Aqua Temp BLE. L'unité s'annonce sous le nom `BlueNRG-…`. Un
-test de connexion réel est effectué avant la création de l'appareil.
-
-**Statut** : le mappage des registres est établi à ~80% par analyse statique
-de l'APK. Les 20% restants se calibrent en une session (~10 min) avec le
-**bouton « Probe registers »** et le runbook [`docs/CALIBRATION.md`](docs/CALIBRATION.md)
-(qui explique aussi la capture logcat de l'application et le mot de passe
-debug « 66 »). Aucune donnée non confirmée ne s'affiche sous un label — les
-capteurs binaires (compresseur, pompe, vanne 4 voies) n'apparaissent qu'une
-fois leurs registres confirmés.
-
-**Avertissement** : cette intégration pilote une PAC de piscine. Vérifiez
-toujours les températures et le comportement sur le panneau de l'appareil,
-en particulier avant la fin de la calibration.

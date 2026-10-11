@@ -148,6 +148,128 @@ switches (1001-1180), control parameters like Cooling/Heating/Auto Set,
 Defrost, EEV Mode (2001-2090). Response shapes are unknown [V] — the probe
 logs raw hex and never crashes on odd answers. **No writes to 2001-2090.**
 
+## 8. Spec 003 — the seven families (T/H/R/P/S/O/D)
+
+The vendor app's parameter view (debug password `66`, see the aid below)
+exposes the complete parameter table in seven families. The panel
+observation (2026-10, `specs/003-sensor-coverage/data-model.md`) proves the
+labels and displayed values — **never the numeric register indices**. New
+entities appear **only** after pinning; never guess an index
+(`address=None` ⇒ no entity).
+
+| Family | Meaning | HA exposure |
+|---|---|---|
+| T (T01–T06) | live temperatures | temperature sensors — 26/27/28 pinned [P]; T01/T04/T06 placeholders |
+| H (H01–H06, H70–H72) | machine settings | **none — never writable from HA** |
+| R (R01–R11) | regulation thresholds (installer) | **none — never writable from HA** |
+| P (P01–P04) | filtration program | **none — never writable from HA** |
+| S (S01–S06) | safety inputs | binary sensors, DIAGNOSTIC (placeholders) |
+| O (O01–O04) | outputs | binary sensors (placeholders) |
+| D (D01–D06) | digital states | **none** — page not photographed, no speculation |
+
+> 🔒 **Read-only policy for H/R/P (spec 003 §6).** H04 Exhaust Temp. High
+> (105.0 °C) is a **safety shutdown threshold**; R01–R11 are installer
+> regulation limits; P01–P04 drive the filtration program. They are
+> **never writable from Home Assistant**: no entity, no service, and the
+> single write funnel (`coordinator.async_write_register`) starts with
+> `registers.ensure_writable()`, which raises `ValueError` for anything
+> outside {8, 13, 14} (+19/20/21 behind the default-off
+> `WRITE_MODE_SETPOINT_TOO` switch). Record their addresses in your notes if
+> the probe reveals them — do not pin them as entities, never write them.
+
+### 8.1 Panel worksheet (calibration anchors)
+
+With the vendor app open in the parameter view, photograph every family
+page (including **D** — still missing) and note the time; the unit state
+must match during the probe. Idle-state predicted raws (displayed ×10 [A]):
+
+| Member | Displayed | Predicted raw (hex) |
+|---|---|---|
+| T01 Suction | 3276.5 (absent) | `32765 / 0x7FFD` **or** `−9990 / 0xD8FA` — whichever appears is this register's sentinel convention |
+| T02 Inlet | 17.0 | `170 / 0x00AA` (expect reg 26) |
+| T03 Outlet | 19.5 | `195 / 0x00C3` (expect reg 27) |
+| T04 Coil | 19.5 | `195 / 0x00C3` (the other one) |
+| T05 Ambient | 18.0 | `180 / 0x00B4` (expect reg 28) |
+| T06 Exhaust | 17.5 | `175 / 0x00AF` |
+| H03 Comp. stop | 0.0 | `0` (mapping note only) |
+| H04 Exhaust high | 105.0 | `1050 / 0x041A` (mapping note only) |
+| S01 / S02 / S03 | OFF / OFF / ON | `0` / `0` / `1` [A] |
+| O01–O04 | all OFF | `0` [A] |
+| P02 / P03 / P04 | 0 / 3 / 0 | `0` / `3` / `0` [A] |
+| R01–R11 | 0.5–40.0 range | `5–400` (mapping note only) |
+
+Temperatures drift — re-photograph the T page at probe time if the session
+is not back-to-back (a 0.1–0.2 °C drift is fine; a different *pattern* is
+not).
+
+### 8.2 Pinning the T family
+
+Probe `base` + all six high blocks within a few minutes of the photos
+(§1/§7 above), then:
+
+1. **Confirm the scale + existing identities**: regs 26/27/28 must read
+   `170 / 195 / 180` if the panel showed T02=17.0, T03=19.5, T05=18.0 at
+   probe time → T02≡26, T03≡27, T05≡28 confirmed. Byte-swapped
+   (`0xAA00`-style)? → step 2 (endianness) first.
+2. **T06 Exhaust**: look for raw `175`. Prefer a base-block (7..51) match —
+   entities are only created for the polled base block (FR-7).
+3. **T04 Coil**: the remaining `195` (T03 is reg 27). Disambiguate with a
+   state change: probe again while heating — coil and outlet diverge.
+4. **T01 Suction**: look for the sentinel — `32765` (`0x7FFD`) or `−9990`
+   (`0xD8FA`). Record **which convention** this register uses. The suction
+   sensor is absent on this unit: the entity will honestly show `unknown` —
+   HA never displays 3276.5 °C.
+5. Pin in `registers.py` (new constants next to the existing placeholders):
+
+```python
+REG_SUCTION_TEMP = <addr>   # T01
+REG_COIL_TEMP = <addr>      # T04
+REG_EXHAUST_TEMP = <addr>   # T06
+```
+
+### 8.3 Pinning the S and O families — the two-state method
+
+One idle dump is **not** enough (~25 unmapped base registers read 0):
+
+1. **Idle probe**: O candidates = registers reading `0`; S01/S02
+   candidates = `0`; S03 candidates = `1` [A].
+2. **Heating probe (required)**: probe again with the compressor + pump +
+   fan running. Registers flipping `0 → nonzero` map to the O family;
+   correlate fan vs pump vs 4-way valve (the valve changes only on a mode
+   change, if ever). A flow-switch candidate flips when pool circulation
+   stops/starts.
+3. **Polarity**: set each entry's `active_when_nonzero` so the entity
+   matches the **panel** OFF/ON text in both observed states (S03 Flow
+   reading ON at idle is expected — keep the panel semantics, not a guess).
+4. Pin in `registers.py` (+ per-entry polarity where inverted):
+
+```python
+REG_COMPRESSOR = <addr>      # O01
+REG_CIRCULATE_PUMP = <addr>  # O02
+REG_HIGH_FAN = <addr>        # O03
+REG_FOUR_WAY_VALVE = <addr>  # O04
+REG_HP_SWITCH = <addr>       # S01
+REG_LP_SWITCH = <addr>       # S02
+REG_FLOW_SWITCH = <addr>     # S03
+```
+
+### 8.4 Restart & verify
+
+Restart HA. New entities appear for every member pinned inside 7..51
+(exact names per `specs/003-sensor-coverage/contracts/entity-contract.md`).
+A member found **only in a high block** stays absent — high-block polling
+is **phase B**, a future spec; note the block in your runbook notes and
+leave the register unpinned (pinning it fails the import-time integrity
+check loudly). Cross-check each new entity against a **fresh panel photo**:
+values within one poll interval, sentinels shown as `unknown` (never
+3276.5), S/O states matching the panel text.
+
+Failure modes: two labels pinned to one register → the import-time
+integrity check raises at startup (re-run the disambiguation); a predicted
+raw matching many registers → use the two-state method, never pin on a
+single coincidence; binary states inverted vs the panel → flip that
+entry's `active_when_nonzero`, no code change.
+
 ## Extra aid: debug password "66"
 
 In the vendor app, entering **`66`** in the settings/parameter view switches

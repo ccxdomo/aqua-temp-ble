@@ -2,7 +2,9 @@
 
 Entities come from registers.SENSORS; entries whose address is None (not yet
 verified live) are skipped entirely, so no unconfirmed data can ever appear
-under a label.
+under a label. A pinned address must also lie inside the polled base block
+(7..51) — outside it the entity is skipped with a loud warning (FR-7:
+high-block polling is a future phase).
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from . import registers
 from .const import DOMAIN
-from .coordinator import AquaTempCoordinator
+from .coordinator import AquaTempCoordinator, decode_temp_logged
 from .entity import AquaTempEntity
 from .registers import RegDef
 
@@ -27,9 +29,17 @@ SENSOR_NAMES: dict[str, str] = {
     "inlet_water_temp": "Inlet water temperature",
     "outlet_water_temp": "Outlet water temperature",
     "ambient_temp": "Ambient temperature",
+    "suction_temp": "Suction temperature",
+    "coil_temp": "Coil temperature",
+    "exhaust_temp": "Exhaust temperature",
     "fault_code": "Fault code",
     "firmware": "Firmware",
 }
+
+
+def _base_block_end() -> int:
+    """Last polled base-block register (7..51) — for FR-7 gating messages."""
+    return registers.BASE_BLOCK_START + registers.BASE_BLOCK_COUNT - 1
 
 
 async def async_setup_entry(
@@ -41,6 +51,17 @@ async def async_setup_entry(
         if regdef.address is None:
             _LOGGER.debug(
                 "sensor %s skipped: register not calibrated yet", regdef.key
+            )
+            continue
+        if not registers.in_base_block(regdef.address):
+            _LOGGER.warning(
+                "sensor %s skipped: register %d is outside the polled base "
+                "block %d..%d; high-block polling is not implemented "
+                "(spec 003 §8)",
+                regdef.key,
+                regdef.address,
+                registers.BASE_BLOCK_START,
+                _base_block_end(),
             )
             continue
         entities.append(AquaTempSensorEntity(coordinator, entry, regdef))
@@ -75,10 +96,12 @@ class AquaTempSensorEntity(AquaTempEntity, SensorEntity):
             # Special-case: regs 48..51 joined as "a.b.c.d". [V] semantics
             return data.firmware
         raw = data.registers.get(self._regdef.address)
-        if raw is None or raw == registers.SENTINEL_RAW:
-            return None  # sensor absent -> state "unknown"
         if self._regdef.device_class == "temperature":
-            return round(raw / self._regdef.scale, 1)
+            # FR-1/FR-2: both sentinel conventions + plausibility guard ->
+            # state "unknown"; the shared helper warns once per address.
+            return decode_temp_logged(self._regdef.address, raw)
+        if raw is None or raw == registers.SENTINEL_RAW:
+            return None  # register absent or sentinel -> state "unknown"
         if self._regdef.scale == 1.0:
             return raw
         return raw / self._regdef.scale
