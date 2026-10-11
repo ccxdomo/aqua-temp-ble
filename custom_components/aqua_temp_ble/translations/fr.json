@@ -2,15 +2,36 @@
   "config": {
     "step": {
       "user": {
+        "title": "Ajouter une pompe à chaleur Aqua Temp",
+        "description": "Appareils Bluetooth détectés à proximité : {total}. Unités Aqua Temp reconnues : {recognized}. Les unités déjà configurées ne sont pas listées.",
+        "menu_options": {
+          "device": "Choisir un appareil détecté",
+          "scan": "Relancer le scan",
+          "manual": "Saisir l'adresse Bluetooth manuellement"
+        }
+      },
+      "device": {
         "title": "Sélectionnez votre pompe à chaleur",
-        "description": "Les unités Aqua Temp découvertes à proximité sont listées ci-dessous. Si la vôtre n'apparaît pas, son adresse Bluetooth vous sera demandée.",
+        "description": "Les unités Aqua Temp reconnues sont listées en premier, puis les autres appareils Bluetooth à proximité (les plus proches d'abord). Si votre unité n'apparaît pas, mettez-la en mode appairage — maintenez le bouton du panneau environ 5 secondes jusqu'à l'affichage « bLE » clignotant une fois par seconde — puis revenez et relancez le scan.",
         "data": {
           "address": "Appareil"
         }
       },
+      "scan": {
+        "title": "Scan en cours",
+        "description": "Recherche des appareils Bluetooth à proximité. Cela prend environ {seconds} secondes…"
+      },
+      "no_devices": {
+        "title": "Aucune unité Aqua Temp trouvée",
+        "description": "Aucun appareil Bluetooth non configuré n'a été détecté à proximité.\n\nPour rendre votre pompe à chaleur visible :\n\n1. Mettez-la en mode appairage : maintenez le bouton du panneau environ 5 secondes, jusqu'à l'affichage « bLE » clignotant une fois par seconde.\n2. L'unité s'annonce alors sous un nom commençant par « BlueNRG ».\n3. Fermez complètement l'application du fabricant — l'unité n'accepte qu'une seule connexion Bluetooth.\n4. Restez à portée, puis relancez le scan.\n\nSi aucun appareil Bluetooth n'apparaît du tout, vérifiez que Home Assistant dispose d'un adaptateur Bluetooth (Paramètres → Système → Matériel) ou d'un proxy Bluetooth actif.",
+        "menu_options": {
+          "scan": "Relancer le scan",
+          "manual": "Saisir l'adresse Bluetooth manuellement"
+        }
+      },
       "manual": {
         "title": "Adresse manuelle",
-        "description": "Saisissez l'adresse Bluetooth de l'unité, ex. `XX:XX:XX:XX:XX:XX`. Fermez d'abord l'application du fabricant — l'unité accepte une seule connexion.",
+        "description": "Saisissez l'adresse Bluetooth de l'unité, ex. `XX:XX:XX:XX:XX:XX`. Fermez d'abord l'application du fabricant — l'unité n'accepte qu'une seule connexion.\n\nAstuce : si vous ne connaissez pas l'adresse, mettez l'unité en mode appairage (maintenez le bouton du panneau ~5 s jusqu'à l'affichage « bLE ») et relancez le scan.",
         "data": {
           "address": "Adresse Bluetooth"
         }
@@ -35,7 +56,8 @@
     },
     "abort": {
       "already_configured": "Cette pompe à chaleur est déjà configurée.",
-      "not_supported": "Cet appareil Bluetooth n'est pas une pompe à chaleur Aqua Temp."
+      "not_supported": "Cet appareil Bluetooth n'est pas une pompe à chaleur Aqua Temp.",
+      "no_bluetooth_adapter": "Home Assistant ne dispose d'aucun adaptateur ou proxy Bluetooth fonctionnel. Branchez un adaptateur pris en charge (ou vérifiez l'intégration Bluetooth), puis réessayez. Sur les installations conteneur, vérifiez que bluez et /var/run/dbus sont disponibles."
     }
   },
   "options": {

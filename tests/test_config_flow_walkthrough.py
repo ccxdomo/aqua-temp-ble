@@ -1,0 +1,665 @@
+#!/usr/bin/env python3
+"""Walkthrough tests for the spec 002 config flow state machine.
+
+Unlike test_config_flow_list.py (the pure list builder), this file drives
+the ACTUAL flow steps end to end — user menu -> device list -> live test
+-> confirm -> entry — plus every branch: rescan, no-devices menu,
+adapter-less abort, manual path, test-failure routing back to the origin
+form, and the dormant bluetooth path (contracts/config-flow-states.md §2
+is the normative transition table; labels per plan.md §6).
+
+Home Assistant is fully stubbed (no real HA install needed): config_flow
+is imported against minimal fake homeassistant/voluptuous/bleak modules,
+and the stubbed result helpers record every step result for inspection.
+The goal: a flow path that becomes unrunnable — a forgotten required
+argument, a broken transition, a progress step whose progress_action
+does not match its step_id — fails HERE, not on a live instance.
+
+Run standalone:
+
+    python3 tests/test_config_flow_walkthrough.py
+
+No pytest API is used, so plain python works.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import importlib.util
+import json
+import sys
+import types
+from pathlib import Path
+
+COMPONENT_DIR = Path(__file__).resolve().parents[1] / "custom_components" / "aqua_temp_ble"
+PKG = "_aqua_flow_e2e"  # synthetic package name (distinct from the list test)
+
+
+class AlreadyConfigured(Exception):
+    """Stand-in for HA's AbortFlow(already_configured) from the guard."""
+
+
+# ---------------------------------------------------------------------------
+# Minimal but FUNCTIONAL stubs so config_flow.py imports and runs outside
+# Home Assistant. These are installed unconditionally: the walkthrough
+# must be deterministic regardless of what is (or is not) installed.
+# ---------------------------------------------------------------------------
+
+
+def _install_stubs() -> None:
+    vol_mod = types.ModuleType("voluptuous")
+
+    class _Vol:  # tiny stand-in: no validation, full introspection
+        @staticmethod
+        def Schema(schema):
+            return schema
+
+        @staticmethod
+        def Required(key, **kwargs):
+            return key
+
+        @staticmethod
+        def In(container):
+            return container
+
+        @staticmethod
+        def All(*args):
+            return args
+
+        @staticmethod
+        def Coerce(type_):
+            return type_
+
+        @staticmethod
+        def Range(**kwargs):
+            return kwargs
+
+    for name in ("Schema", "Required", "In", "All", "Coerce", "Range"):
+        setattr(vol_mod, name, getattr(_Vol, name))
+    sys.modules["voluptuous"] = vol_mod
+
+    bleak_mod = types.ModuleType("bleak")
+    bleak_mod.BleakClient = object
+    bleak_mod.BleakScanner = object
+    sys.modules["bleak"] = bleak_mod
+
+    class _StubConfigFlow:
+        """Functional stand-in for homeassistant.config_entries.ConfigFlow."""
+
+        def __init_subclass__(cls, **kwargs):
+            super().__init_subclass__()
+
+        # -- results (recorded for inspection) --------------------------
+        def async_show_menu(
+            self,
+            *,
+            step_id,
+            menu_options=None,
+            description_placeholders=None,
+        ):
+            return {
+                "type": "menu",
+                "step_id": step_id,
+                "menu_options": dict(menu_options or {}),
+                "description_placeholders": dict(description_placeholders or {}),
+            }
+
+        def async_show_form(
+            self,
+            *,
+            step_id,
+            data_schema=None,
+            errors=None,
+            description_placeholders=None,
+        ):
+            return {
+                "type": "form",
+                "step_id": step_id,
+                "data_schema": data_schema,
+                "errors": dict(errors) if errors else None,
+                "description_placeholders": dict(description_placeholders or {}),
+            }
+
+        def async_show_progress(
+            self,
+            *,
+            step_id,
+            progress_action=None,
+            progress_task=None,
+            description_placeholders=None,
+        ):
+            return {
+                "type": "progress",
+                "step_id": step_id,
+                "progress_action": progress_action,
+                "progress_task": progress_task,
+                "description_placeholders": dict(description_placeholders or {}),
+            }
+
+        def async_abort(self, *, reason):
+            return {"type": "abort", "reason": reason}
+
+        def async_create_entry(self, *, title=None, data=None, options=None):
+            return {
+                "type": "create_entry",
+                "title": title,
+                "data": data,
+                "options": options,
+            }
+
+        # -- unique-id machinery -----------------------------------------
+        async def async_set_unique_id(self, unique_id, *, raise_on_progress=True):
+            self._stub_unique_id = unique_id
+
+        def _abort_if_unique_id_configured(self):
+            if getattr(self, "_stub_unique_id", None) in self.hass.current_ids:
+                raise AlreadyConfigured(self._stub_unique_id)
+
+        def _async_current_ids(self, include_ignore=True):
+            return list(self.hass.current_ids)
+
+    class _StubOptionsFlow:
+        pass
+
+    ha = types.ModuleType("homeassistant")
+    ha_components = types.ModuleType("homeassistant.components")
+    ha_helpers = types.ModuleType("homeassistant.helpers")
+
+    cfg_entries = types.ModuleType("homeassistant.config_entries")
+    cfg_entries.ConfigFlow = _StubConfigFlow
+    cfg_entries.ConfigFlowResult = dict  # annotations only (stringified)
+    cfg_entries.OptionsFlow = _StubOptionsFlow
+
+    ha_bt = types.ModuleType("homeassistant.components.bluetooth")
+
+    def _bt_async_scanner_count(hass, connectable=True):
+        return hass.bt_scanner_count
+
+    def _bt_async_discovered_service_info(hass, connectable=True):
+        return list(hass.bt_infos)
+
+    ha_bt.async_scanner_count = _bt_async_scanner_count
+    ha_bt.async_discovered_service_info = _bt_async_discovered_service_info
+
+    ha_translation = types.ModuleType("homeassistant.helpers.translation")
+
+    async def _tr_async_get_translations(
+        hass, language, category, integrations, *, config_flow=False
+    ):
+        return dict(hass.translations)
+
+    ha_translation.async_get_translations = _tr_async_get_translations
+
+    ha.config = types.SimpleNamespace(language="en")
+    ha.components = ha_components
+    ha.helpers = ha_helpers
+    ha_components.bluetooth = ha_bt
+
+    for name, module in {
+        "homeassistant": ha,
+        "homeassistant.components": ha_components,
+        "homeassistant.components.bluetooth": ha_bt,
+        "homeassistant.config_entries": cfg_entries,
+        "homeassistant.helpers": ha_helpers,
+        "homeassistant.helpers.translation": ha_translation,
+    }.items():
+        sys.modules[name] = module
+
+
+def _import_config_flow():
+    """Import config_flow.py as part of a synthetic package."""
+    _install_stubs()
+    pkg = types.ModuleType(PKG)
+    pkg.__path__ = [str(COMPONENT_DIR)]  # supports `from . import x`
+    sys.modules[PKG] = pkg
+    spec = importlib.util.spec_from_file_location(
+        f"{PKG}.config_flow", COMPONENT_DIR / "config_flow.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[f"{PKG}.config_flow"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+cf = _import_config_flow()
+_build_device_list = cf._build_device_list  # noqa: SLF001 — test seam, see list tests
+UUID_WRITE = cf.UUID_WRITE
+
+
+# ---------------------------------------------------------------------------
+# Fakes
+# ---------------------------------------------------------------------------
+
+
+class FakeInfo:
+    """Stand-in for a discovered BluetoothServiceInfoBleak entry."""
+
+    def __init__(self, address, name, rssi, service_uuids=()):
+        self.address = address
+        self.name = name
+        self.rssi = rssi
+        self.service_uuids = list(service_uuids)
+
+
+class FakeHass:
+    """Hass stub: everything the config flow touches, nothing else."""
+
+    def __init__(
+        self,
+        scanner_count=1,
+        infos=None,
+        current_ids=None,
+        language="en",
+        translations=None,
+    ):
+        self.config = types.SimpleNamespace(language=language)
+        self.bt_scanner_count = scanner_count
+        self.bt_infos = list(infos or [])
+        self.current_ids = set(current_ids or ())
+        # Empty -> the flow's EN fallback labels; a flattened strings
+        # dict -> the runtime translation path (probed key format).
+        self.translations = dict(translations or {})
+
+    def async_create_task(self, target):
+        return asyncio.ensure_future(target)
+
+
+class FakeClient:
+    """Stand-in for AquaTempBleClient, with per-test fault injection."""
+
+    instances = []
+    fault = None  # exception class/instance raised by connect(), if any
+    regs = {}  # register block returned by read_registers()
+
+    @classmethod
+    def reset(cls):
+        cls.instances = []
+        cls.fault = None
+        cls.regs = {
+            cf.registers.REG_POWER: 1,          # on
+            cf.registers.REG_MODE: 1,           # heat
+            cf.registers.REG_INLET_WATER_TEMP: 245,    # 24.5 degC
+            cf.registers.REG_OUTLET_WATER_TEMP: 232,   # 23.2 degC
+            cf.registers.REG_AMBIENT_TEMP: cf.registers.SENTINEL_RAW,  # absent
+        }
+
+    def __init__(self, address, name=None, hass=None):
+        self.address = address
+        self.name = name
+        self.hass = hass
+        self.connected = False
+        self.disconnected = False
+        type(self).instances.append(self)
+
+    async def connect(self):
+        if type(self).fault is not None:
+            raise type(self).fault
+        self.connected = True
+
+    async def read_registers(self, start, count):
+        assert (start, count) == (
+            cf.registers.BASE_BLOCK_START,
+            cf.registers.BASE_BLOCK_COUNT,
+        )
+        return dict(type(self).regs)
+
+    async def disconnect(self):
+        self.connected = False
+        self.disconnected = True
+
+
+def make_flow(hass):
+    """Build a fresh flow bound to the fake hass (client fakes reset)."""
+    FakeClient.reset()
+    # Seam: async_step_test builds its client through this module-level
+    # name — swap the real transport for the recording fake.
+    cf.AquaTempBleClient = FakeClient
+    flow = cf.AquaTempConfigFlow()
+    flow.hass = hass
+    return flow
+
+
+def _flatten_translations(domain, data):
+    """Flatten a strings-style dict the way the HA translation helper does:
+    nested dicts become dotted component.<domain>.<path> keys."""
+    out = {}
+
+    def rec(prefix, obj):
+        for key, value in obj.items():
+            path = f"{prefix}.{key}"
+            if isinstance(value, dict):
+                rec(path, value)
+            else:
+                out[path] = value
+
+    rec(f"component.{domain}", data)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Walkthrough tests (contracts/config-flow-states.md §2)
+# ---------------------------------------------------------------------------
+
+
+async def test_happy_path_menu_device_test_confirm_entry():
+    """START -> user menu -> device form -> test progress -> confirm -> entry."""
+    hass = FakeHass(
+        infos=[
+            FakeInfo("AA:BB:CC:DD:EE:10", "BlueNRG-7A", -62),
+            FakeInfo("AA:BB:CC:DD:EE:11", "TV Salon", -75),
+        ]
+    )
+    flow = make_flow(hass)
+
+    # 1. First step is a MENU with 3 options (AC-11: live counts shown).
+    result = await flow.async_step_user()
+    assert result["type"] == "menu", result
+    assert result["step_id"] == "user", result
+    assert list(result["menu_options"]) == ["device", "scan", "manual"], result
+    assert result["menu_options"]["device"] == "Select a discovered device"
+    assert result["menu_options"]["scan"] == "Scan again"
+    assert result["menu_options"]["manual"] == "Enter the Bluetooth address manually"
+    assert result["description_placeholders"] == {"recognized": 1, "total": 2}, result
+
+    # 2. Menu pick "device": HA calls async_step_device() with NO input.
+    #    The form lists real addresses only — no sentinel pseudo-entries.
+    result = await flow.async_step_device()
+    assert result["type"] == "form" and result["step_id"] == "device", result
+    options = result["data_schema"]["address"]
+    assert list(options) == ["AA:BB:CC:DD:EE:10", "AA:BB:CC:DD:EE:11"], options
+    assert "__rescan__" not in options and "__manual__" not in options
+    assert options["AA:BB:CC:DD:EE:10"] == "BlueNRG-7A — AA:BB:CC:DD:EE:10 — RSSI -62"
+
+    # 3. Submit the pick: unique-id guard, then the test progress step.
+    result = await flow.async_step_device(
+        user_input={"address": "AA:BB:CC:DD:EE:10"}
+    )
+    assert result["type"] == "progress" and result["step_id"] == "test", result
+    assert result["progress_action"] == "test"  # must match the step_id
+    assert result["progress_task"] is not None
+    assert flow._stub_unique_id == "AA:BB:CC:DD:EE:10"  # upper-cased unique id
+    await result["progress_task"]
+    client = FakeClient.instances[-1]
+    # FR-9: the client is built with the flow's hass; name does not leak.
+    assert client.hass is hass
+    assert client.address == "AA:BB:CC:DD:EE:10"
+    assert client.name is None
+    assert client.disconnected  # the test always closes the link
+
+    # 4. Progress task done -> re-entry routes to confirm with decoded regs.
+    result = await flow.async_step_test()
+    assert result["type"] == "form" and result["step_id"] == "confirm", result
+    placeholders = result["description_placeholders"]
+    assert placeholders["address"] == "AA:BB:CC:DD:EE:10"
+    assert placeholders["power"] == "on", placeholders
+    assert placeholders["mode"] == "heat", placeholders
+    assert placeholders["inlet"] == "24.5 °C", placeholders
+    assert placeholders["outlet"] == "23.2 °C", placeholders
+    assert placeholders["ambient"] == "sensor absent", placeholders
+
+    # 5. Confirm -> entry created with address + default options.
+    result = await flow.async_step_confirm(user_input={"name": "Pool heat pump"})
+    assert result["type"] == "create_entry", result
+    assert result["data"] == {"address": "AA:BB:CC:DD:EE:10", "name": "Pool heat pump"}
+    assert result["options"] == {"poll_interval": 30, "temperature_unit": "C"}
+
+
+async def test_failed_test_returns_to_device_form_with_error():
+    """P3: a failed test returns to the DEVICE LIST with the error (AC-2/AC-7)."""
+    hass = FakeHass(infos=[FakeInfo("AA:BB:CC:DD:EE:10", "BlueNRG-7A", -50)])
+    flow = make_flow(hass)
+    await flow.async_step_user()  # menu
+    await flow.async_step_device()  # device form
+
+    FakeClient.fault = cf.AquaTempConnectionError("vendor app holds the link")
+    result = await flow.async_step_device(
+        user_input={"address": "AA:BB:CC:DD:EE:10"}
+    )
+    assert result["type"] == "progress" and result["step_id"] == "test", result
+    await result["progress_task"]
+    result = await flow.async_step_test()
+
+    # Back to the device form with the error — NOT to the menu.
+    assert result["type"] == "form", result
+    assert result["step_id"] == "device", result
+    assert result["errors"] == {"base": "cannot_connect"}, result
+    assert "AA:BB:CC:DD:EE:10" in result["data_schema"]["address"]
+
+    # Recovery: a retry with a working unit completes the flow.
+    FakeClient.fault = None
+    result = await flow.async_step_device(
+        user_input={"address": "AA:BB:CC:DD:EE:10"}
+    )
+    await result["progress_task"]
+    result = await flow.async_step_test()
+    assert result["type"] == "form" and result["step_id"] == "confirm", result
+
+
+async def test_manual_path_and_failure_symmetry():
+    """Manual: invalid MAC -> field error; failure -> back to manual (AC-7/AC-8)."""
+    hass = FakeHass(infos=[])  # manual stays reachable with no devices (FR-3)
+    flow = make_flow(hass)
+    await flow.async_step_user()  # no_devices menu
+    result = await flow.async_step_manual()  # menu pick "manual"
+    assert result["type"] == "form" and result["step_id"] == "manual", result
+
+    # Malformed MAC -> invalid_address on the same form.
+    result = await flow.async_step_manual(user_input={"address": "not a mac"})
+    assert result["step_id"] == "manual", result
+    assert result["errors"] == {"address": "invalid_address"}, result
+
+    # Valid MAC -> unique-id guard (upper-cased) -> test step.
+    result = await flow.async_step_manual(
+        user_input={"address": "aa:bb:cc:dd:ee:ff"}
+    )
+    assert result["type"] == "progress" and result["step_id"] == "test", result
+    assert flow._stub_unique_id == "AA:BB:CC:DD:EE:FF"
+    FakeClient.fault = cf.AquaTempTimeoutError("no complete response")
+    await result["progress_task"]
+    result = await flow.async_step_test()
+
+    # Symmetric routing: back to the MANUAL form with the error key.
+    assert result["type"] == "form" and result["step_id"] == "manual", result
+    assert result["errors"] == {"base": "no_response"}, result
+
+    # An already-configured address aborts BEFORE any test runs.
+    FakeClient.fault = None
+    hass.current_ids.add("AA:BB:CC:DD:EE:FF")
+    try:
+        await flow.async_step_manual(user_input={"address": "AA:BB:CC:DD:EE:FF"})
+    except AlreadyConfigured:
+        pass
+    else:
+        raise AssertionError("a configured address must abort the flow")
+    assert len(FakeClient.instances) == 1  # no new test started
+
+
+async def test_scan_branch_returns_to_user_menu():
+    """Menu pick "scan": bounded progress, then the user menu with fresh counts."""
+    hass = FakeHass(infos=[FakeInfo("AA:BB:CC:DD:EE:10", "BlueNRG-7A", -50)])
+    flow = make_flow(hass)
+    await flow.async_step_user()
+
+    # Speed up the bounded wait for the test run (value itself asserted
+    # against const in test_flow_state_constants).
+    original_wait = cf.SCAN_WAIT_SECONDS
+    cf.SCAN_WAIT_SECONDS = 0.01
+    try:
+        result = await flow.async_step_scan()
+        assert result["type"] == "progress" and result["step_id"] == "scan", result
+        assert result["progress_action"] == "scan"  # must match the step_id
+        assert result["description_placeholders"]["seconds"] == 0.01, result
+        await result["progress_task"]
+
+        # Re-entry after the wait -> back to the USER menu, counts refreshed.
+        hass.bt_infos.append(FakeInfo("AA:BB:CC:DD:EE:99", "BlueNRG-2", -40))
+        result = await flow.async_step_scan()
+        assert result["type"] == "menu" and result["step_id"] == "user", result
+        assert list(result["menu_options"]) == ["device", "scan", "manual"]
+        assert result["description_placeholders"] == {"recognized": 2, "total": 2}
+
+        # E-11: an immediate second scan is harmless.
+        result = await flow.async_step_scan()
+        await result["progress_task"]
+        result = await flow.async_step_scan()
+        assert result["type"] == "menu" and result["step_id"] == "user", result
+    finally:
+        cf.SCAN_WAIT_SECONDS = original_wait
+
+
+async def test_no_devices_menu_and_configured_exclusion():
+    """E-5: only configured devices nearby -> no-devices menu with 2 options."""
+    hass = FakeHass(
+        infos=[FakeInfo("AA:BB:CC:DD:EE:10", "BlueNRG-7A", -50)],
+        current_ids={"AA:BB:CC:DD:EE:10"},
+    )
+    flow = make_flow(hass)
+    result = await flow.async_step_user()
+    assert result["type"] == "menu" and result["step_id"] == "no_devices", result
+    assert list(result["menu_options"]) == ["scan", "manual"], result  # exactly 2
+
+    # From the no-devices menu both actions stay reachable.
+    result = await flow.async_step_manual()
+    assert result["type"] == "form" and result["step_id"] == "manual", result
+    result = await flow.async_step_device()  # defensive: empty history
+    assert result["type"] == "menu" and result["step_id"] == "no_devices", result
+
+
+async def test_no_bluetooth_adapter_aborts():
+    """FR-2/AC-5: no scanner at all -> abort no_bluetooth_adapter."""
+    hass = FakeHass(scanner_count=0)
+    flow = make_flow(hass)
+    result = await flow.async_step_user()
+    assert result["type"] == "abort", result
+    assert result["reason"] == "no_bluetooth_adapter", result
+
+
+async def test_menu_labels_follow_real_translations():
+    """FR-13/AC-9: menu labels resolve from the real strings/*.json keys.
+
+    This locks the contract between the probed key format
+    (component.<domain>.config.step.<menu>.menu_options.<key>) and the
+    shipped translation files: if either side drifts, labels fall back
+    to English and this test fails.
+    """
+    fr = json.loads(
+        (COMPONENT_DIR / "translations" / "fr.json").read_text(encoding="utf-8")
+    )
+    translations = _flatten_translations(cf.DOMAIN, fr)
+    hass = FakeHass(
+        infos=[FakeInfo("AA:BB:CC:DD:EE:10", "BlueNRG-7A", -50)],
+        language="fr",
+        translations=translations,
+    )
+    flow = make_flow(hass)
+    result = await flow.async_step_user()
+    fr_user = fr["config"]["step"]["user"]["menu_options"]
+    assert list(result["menu_options"]) == ["device", "scan", "manual"]
+    assert result["menu_options"] == {
+        "device": fr_user["device"],
+        "scan": fr_user["scan"],
+        "manual": fr_user["manual"],
+    }, result
+
+    # Same probe against the no-devices menu.
+    hass_empty = FakeHass(infos=[], language="fr", translations=translations)
+    flow_empty = make_flow(hass_empty)
+    result = await flow_empty.async_step_user()
+    fr_no_devices = fr["config"]["step"]["no_devices"]["menu_options"]
+    assert result["menu_options"] == {
+        "scan": fr_no_devices["scan"],
+        "manual": fr_no_devices["manual"],
+    }, result
+
+
+async def test_dormant_bluetooth_path():
+    """FR-12: async_step_bluetooth stays dormant-but-intact.
+
+    Wrong name -> not_supported abort; matching name -> straight to the
+    test step; a failed test routes to the device list with the error
+    (origin="user": menus cannot display errors).
+    """
+    hass = FakeHass(
+        infos=[
+            FakeInfo("AA:BB:CC:DD:EE:10", "BlueNRG-7A", -50),
+            FakeInfo("AA:BB:CC:DD:EE:11", "Living room TV", -60),
+        ]
+    )
+    flow = make_flow(hass)
+
+    result = await flow.async_step_bluetooth(
+        types.SimpleNamespace(name="Living room TV", address="AA:BB:CC:DD:EE:11")
+    )
+    assert result["type"] == "abort" and result["reason"] == "not_supported", result
+
+    FakeClient.fault = cf.AquaTempConnectionError("link lost")
+    result = await flow.async_step_bluetooth(
+        types.SimpleNamespace(name="BlueNRG-7A", address="AA:BB:CC:DD:EE:10")
+    )
+    assert result["type"] == "progress" and result["step_id"] == "test", result
+    await result["progress_task"]
+    client = FakeClient.instances[-1]
+    assert client.name == "BlueNRG-7A"  # discovery name reaches the client
+    assert client.hass is hass
+
+    result = await flow.async_step_test()
+    assert result["type"] == "form" and result["step_id"] == "device", result
+    assert result["errors"] == {"base": "cannot_connect"}, result
+
+
+async def test_flow_state_constants_and_no_sentinels():
+    """P5: constants live in const.py under contract names; no sentinels."""
+    assert cf.SCAN_WAIT_SECONDS == 8.0
+    assert cf.MAX_OTHER_DEVICES == 30
+    assert cf.UNNAMED_LABEL == "Unnamed device"
+    assert not hasattr(cf, "RESCAN_KEY")
+    assert not hasattr(cf, "MANUAL_KEY")
+    assert not hasattr(cf, "SCAN_WAIT")
+    assert not hasattr(cf, "OTHER_DEVICES_MAX")
+    const_mod = sys.modules[f"{PKG}.const"]
+    assert const_mod.SCAN_WAIT_SECONDS == 8.0
+    assert const_mod.MAX_OTHER_DEVICES == 30
+
+
+async def test_device_list_in_form_matches_contract_builder():
+    """The device form's options ARE the contract list builder's output."""
+    infos = [
+        FakeInfo("AA:BB:CC:DD:EE:10", "BlueNRG-7A", -62),
+        FakeInfo("AA:BB:CC:DD:EE:11", "AA:BB:CC:DD:EE:11", -58, [UUID_WRITE.upper()]),
+        FakeInfo("AA:BB:CC:DD:EE:12", "TV Salon", -75),
+    ]
+    hass = FakeHass(infos=infos, current_ids={"AA:BB:CC:DD:EE:99"})
+    flow = make_flow(hass)
+    await flow.async_step_user()
+    result = await flow.async_step_device()
+    options = result["data_schema"]["address"]
+    expected, counts = _build_device_list(infos, {"AA:BB:CC:DD:EE:99"}, cf.UNNAMED_LABEL)
+    assert list(options) == list(expected)
+    assert options == expected
+    assert counts == {"recognized": 2, "total": 3}
+
+
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    tests = [
+        test_happy_path_menu_device_test_confirm_entry,
+        test_failed_test_returns_to_device_form_with_error,
+        test_manual_path_and_failure_symmetry,
+        test_scan_branch_returns_to_user_menu,
+        test_no_devices_menu_and_configured_exclusion,
+        test_no_bluetooth_adapter_aborts,
+        test_menu_labels_follow_real_translations,
+        test_dormant_bluetooth_path,
+        test_flow_state_constants_and_no_sentinels,
+        test_device_list_in_form_matches_contract_builder,
+    ]
+    for test in tests:
+        asyncio.run(test())
+        print(f"PASS  {test.__name__}")
+    print(f"\nPASSED: {len(tests)}/{len(tests)} config flow walkthrough tests")
+
+
+if __name__ == "__main__":
+    main()

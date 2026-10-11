@@ -76,11 +76,37 @@ then restart Home Assistant.
 
 Settings → Devices & Services → Add Integration → **Aqua Temp BLE**
 
-1. Discovered units are listed; or enter the BLE address manually
-   (`XX:XX:XX:XX:XX:XX`).
+The flow starts with a **menu** offering three choices:
+
+- **Select a discovered device** — the full list of every Bluetooth device
+  Home Assistant has seen, in two tiers:
+
+  1. **Recognized Aqua Temp units first** — advertised name starting with
+     `BlueNRG-`, `HIFLYING-` or `PROV_`, or the ff01/ff02 GATT service UUIDs;
+  2. then **other nearby devices**, nearest first (RSSI sort).
+
+  Already-configured units are excluded, and unnamed devices appear as
+  `Unnamed device — <address> — RSSI <value>` — the live connection test
+  decides what is really a heat pump, not the advertised name.
+
+- **Scan again** — waits ~8 s so a unit you just put in pairing mode has
+  time to advertise, then rebuilds the menu with fresh counts (put the unit
+  in **pairing mode** first: hold the panel button ~5 s until the display
+  shows **`bLE`** blinking 1×/s);
+- **Enter the Bluetooth address manually** — type the MAC
+  (`XX:XX:XX:XX:XX:XX`) yourself. This stays one click away for
+  MAC-changed units.
+
+1. Pick a device (or enter the address manually).
 2. HA performs a live connection test and shows what it read
-   (power, mode, temperatures).
+   (power, mode, temperatures). A wrong pick simply fails with a clear
+   error and returns to the same list — retry or pick another device.
 3. Name the device — done.
+
+If nothing at all is discovered, the menu shows the full pairing
+procedure (hold the panel button ~5 s until **`bLE`** blinks 1×/s, close
+the vendor app — the unit accepts a single BLE connection) plus the two
+remaining actions.
 
 Options (Configure on the device card):
 
@@ -135,6 +161,7 @@ data:
 
 | Symptom | Cause / fix |
 |---|---|
+| Unit not listed in the flow | not in pairing mode / out of range → pairing mode (`bLE` blinking 1×/s), then **Scan again** |
 | Entities unavailable | vendor app holds the single BLE connection — close it |
 | Setup fails `cannot_connect` | unit asleep / out of range / address changed → re-configure |
 | MAC changed after power cycle | name-based fallback reconnects, but re-configure for a clean unique_id |

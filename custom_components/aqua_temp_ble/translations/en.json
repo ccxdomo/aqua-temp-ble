@@ -2,15 +2,36 @@
   "config": {
     "step": {
       "user": {
+        "title": "Add an Aqua Temp heat pump",
+        "description": "Bluetooth devices seen nearby: {total}. Recognized Aqua Temp units: {recognized}. Units already configured are not listed.",
+        "menu_options": {
+          "device": "Select a discovered device",
+          "scan": "Scan again",
+          "manual": "Enter the Bluetooth address manually"
+        }
+      },
+      "device": {
         "title": "Select your heat pump",
-        "description": "Aqua Temp units discovered nearby are listed below. If yours is missing, you will be asked for its Bluetooth address.",
+        "description": "Recognized Aqua Temp units are listed first, followed by other nearby Bluetooth devices (nearest first). If your unit is missing, put it in pairing mode — hold the panel button for about 5 seconds until the display shows \"bLE\" blinking once per second — then go back and scan again.",
         "data": {
           "address": "Device"
         }
       },
+      "scan": {
+        "title": "Scanning",
+        "description": "Looking for nearby Bluetooth devices. This takes about {seconds} seconds…"
+      },
+      "no_devices": {
+        "title": "No Aqua Temp unit found",
+        "description": "No unconfigured Bluetooth device was seen nearby.\n\nTo make your heat pump visible:\n\n1. Put it in pairing mode: press and hold the panel button for about 5 seconds, until the display shows \"bLE\" blinking once per second.\n2. The unit then advertises under a name starting with \"BlueNRG\".\n3. Close the vendor app completely — the unit accepts only one Bluetooth connection.\n4. Stay within range, then scan again.\n\nIf no Bluetooth device appears at all, check that Home Assistant has a Bluetooth adapter (Settings → System → Hardware) or an active Bluetooth proxy.",
+        "menu_options": {
+          "scan": "Scan again",
+          "manual": "Enter the Bluetooth address manually"
+        }
+      },
       "manual": {
         "title": "Manual address",
-        "description": "Enter the Bluetooth address of the unit, e.g. `XX:XX:XX:XX:XX:XX`. Make sure the vendor app is closed first — the unit accepts a single connection.",
+        "description": "Enter the Bluetooth address of the unit, e.g. `XX:XX:XX:XX:XX:XX`. Make sure the vendor app is closed first — the unit accepts a single connection.\n\nTip: if you do not know the address, put the unit in pairing mode (hold the panel button ~5 s until the display shows \"bLE\") and scan again.",
         "data": {
           "address": "Bluetooth address"
         }
@@ -35,7 +56,8 @@
     },
     "abort": {
       "already_configured": "This heat pump is already configured.",
-      "not_supported": "This Bluetooth device is not an Aqua Temp heat pump."
+      "not_supported": "This Bluetooth device is not an Aqua Temp heat pump.",
+      "no_bluetooth_adapter": "Home Assistant has no working Bluetooth adapter or proxy. Plug in a supported adapter (or check the Bluetooth integration), then try again. On container installs, make sure bluez and /var/run/dbus are available."
     }
   },
   "options": {

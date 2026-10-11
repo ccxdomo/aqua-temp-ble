@@ -16,7 +16,10 @@ UUID_NOTIFY = "0000ff02-0000-1000-8000-00805f9b34fb"  # [P] handle 2216
 # ff03 (handle 2215) exists but its role is unknown — do NOT use it. [V]
 
 # BLE name prefixes the vendor app itself filters on (Dart pool). [P]
-NAME_PREFIXES = ("bluerng-", "hiflying-", "prov_")
+# Note: "bluenrg-" matches the ST BlueNRG module prefix the owner's unit
+# advertises (FINDINGS.md §3, confirmed by observation). A previous revision
+# had the letters transposed ("bluerng-") and could never match a real unit.
+NAME_PREFIXES = ("bluenrg-", "hiflying-", "prov_")
 
 CONNECT_TIMEOUT = 15.0    # seconds
 REQUEST_TIMEOUT = 8.0    # max wait for a full Modbus response
@@ -26,6 +29,12 @@ MAX_RX_BUFFER = 512
 
 DEFAULT_POLL_INTERVAL = 30  # seconds (options: 10..600)
 DEFAULT_TEMPERATURE_UNIT = "C"  # display only; wire is always x10 Celsius [P]
+
+# Config flow (spec 002) — scanning UX tuning (tasks.md block 1).
+# Flow-facing constants live here, next to the other integration-wide
+# knobs; everything above stays protocol-only.
+SCAN_WAIT_SECONDS = 8.0  # bounded rescan grace delay (FR-6)
+MAX_OTHER_DEVICES = 30  # cap on the "other devices" tier (FR-4)
 
 # Set True to log every raw notification chunk in hex (debug aid, noisy).
 DEBUG_RAW = False
