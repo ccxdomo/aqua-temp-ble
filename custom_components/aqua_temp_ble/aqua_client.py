@@ -40,7 +40,7 @@ import asyncio
 import logging
 import struct
 import time
-from collections import namedtuple
+from collections import Counter, namedtuple
 from dataclasses import dataclass
 from typing import Any
 
@@ -258,6 +258,19 @@ class AquaTempBleClient:
         self._req_frame_count = 0     # complete CRC-valid frames seen
         self._req_block_starts: list[int] = []  # block starts seen (census)
         self._idle_census_logged = False  # one INFO census per connect while idle
+        # Spec 009 FR-1 census timing state (plan 009 §2.1, contract 009
+        # §3): _req_t0 stamps the request start; _req_first_seen/
+        # _req_last_seen track the first/last census offsets rendered in
+        # the timeout message; _idle_pushes collects (start, t after
+        # subscribe) for the idle-window summary — the E2 push-onset
+        # evidence (research 009 §1.1); _t_subscribe is stamped by
+        # connect() right after the CCCD write.
+        self._req_t0: float | None = None
+        self._req_first_seen: float | None = None
+        self._req_last_seen: float | None = None
+        self._idle_pushes: list[tuple[int, float]] = []
+        self._t_subscribe: float | None = None
+        self._idle_summary_logged = False  # one idle summary per connection
         self._silence_timer: asyncio.TimerHandle | None = None
 
     # ------------------------------------------------------------------ state
@@ -418,6 +431,15 @@ class AquaTempBleClient:
                 self._notify_uuid or const.UUID_NOTIFY, self._on_notify
             )
             t_notify = _now()
+            # Spec 009 FR-1 (plan 009 §2.2): remember the subscribe moment
+            # and reset the idle-window state — the settle pushes below
+            # land in _idle_pushes with offsets relative to this stamp
+            # (contract 009 §3, research 009 §1.1 E2). No notification can
+            # be lost to this reset: nothing is awaited between here and
+            # the settle sleep, so the handler cannot interleave.
+            self._t_subscribe = t_notify
+            self._idle_pushes = []
+            self._idle_summary_logged = False
             self._resolve_write_characteristic(client)
             t_write_char = _now()
             # Vendor parity (research 006 §2 step 4): give the module a
@@ -542,6 +564,15 @@ class AquaTempBleClient:
         self._req_frame_count = 0
         self._req_block_starts = []
         self._idle_census_logged = False
+        # Spec 009 FR-1 (contract 009 §3, contract 008-B §7): clear the
+        # census timing and idle-window state with the 008 census — a
+        # fresh connect starts a fresh idle window.
+        self._req_t0 = None
+        self._req_first_seen = None
+        self._req_last_seen = None
+        self._idle_pushes = []
+        self._t_subscribe = None
+        self._idle_summary_logged = False
         if client is not None:
             try:
                 await client.disconnect()
@@ -1045,13 +1076,28 @@ class AquaTempBleClient:
             response=self._write_with_response,
         )
 
-    async def _request(self, frame: bytes, match: _ResponseMatch, timeout: float) -> bytes:
+    async def _request(
+        self,
+        frame: bytes,
+        match: _ResponseMatch,
+        timeout: float,
+        *,
+        resend_every: float | None = None,
+        resend_max: int = 0,
+    ) -> bytes:
         """Send one frame and await the complete, matching response.
 
         The match spec (contract 008-B §1) is the ONLY authority on what
         may complete the request — the c8d8260 expected-fc gate is gone
         (research 008 §3). Non-matching frames are census-logged and
         never fatal (FR-2).
+
+        Spec 009 FR-2 (contract 009 §5): when resend_every is set and
+        resend_max > 0, a background loop re-sends the IDENTICAL frame
+        every resend_every seconds, up to resend_max extra writes — all
+        inside the SAME timeout window (single-flight untouched: one
+        pending request; the loop only re-writes). Used only by the
+        config-flow connection test (NFR-3).
         """
         if self._pending is not None and not self._pending.done():
             raise AquaTempError("another request is already in flight")
@@ -1063,8 +1109,19 @@ class AquaTempBleClient:
         self._req_rx_bytes = 0
         self._req_frame_count = 0
         self._req_block_starts = []
+        # Spec 009 FR-1 (plan 009 §2.2): stamp the request start and
+        # reset the per-request census timing — _census_frame renders
+        # its t+ offsets relative to _req_t0 and updates
+        # _req_first_seen/_req_last_seen for the timeout message
+        # (contract 009 §3).
+        self._req_t0 = _now()
+        self._req_first_seen = None
+        self._req_last_seen = None
         self._rx.clear()
+        self._log_idle_summary_once()
         _LOGGER.debug("TX (%d bytes): %s", len(frame), frame.hex())
+        resend_task: asyncio.Task[None] | None = None
+        done: asyncio.Event | None = None
         try:
             try:
                 await self._write_frame(frame)
@@ -1072,6 +1129,15 @@ class AquaTempBleClient:
                 raise
             except Exception as exc:  # noqa: BLE001
                 raise AquaTempConnectionError(f"GATT write failed: {exc}") from exc
+            if resend_every is not None and resend_max > 0:
+                # Spec 009 FR-2 (contract 009 §5): the bounded re-send loop
+                # — spawned AFTER the initial write so a failed initial
+                # write never re-sends; cancelled in the finally so it
+                # never leaks past the request.
+                done = asyncio.Event()
+                resend_task = asyncio.create_task(
+                    self._resend_loop(frame, resend_every, resend_max, done)
+                )
             try:
                 async with asyncio.timeout(timeout):
                     return await self._pending
@@ -1090,21 +1156,111 @@ class AquaTempBleClient:
                         buf.hex(),
                     )
                     return buf
+                # Spec 009 FR-1 (contract 009 §3): per-start counts +
+                # first/last census offsets — the 4-block-cycle model
+                # (research 009 §0.3) becomes testable from one run.
+                # The first/last clause is omitted when nothing was
+                # censused (there is no offset to report; the honest
+                # totals stay — contract 008-B §5/§6 carried by 009 §3).
+                counts = Counter(self._req_block_starts)
                 starts_seen = (
-                    ", ".join(str(s) for s in sorted(set(self._req_block_starts)))
+                    ", ".join(f"{start}x{n}" for start, n in sorted(counts.items()))
                     or "none"
+                )
+                first_last = (
+                    f"; first t+{self._req_first_seen:.1f}s, "
+                    f"last t+{self._req_last_seen:.1f}s"
+                    if self._req_first_seen is not None
+                    else ""
                 )
                 raise AquaTempTimeoutError(
                     f"no matching response within {timeout:.1f}s "
                     f"(received {self._req_frame_count} frame(s) / "
-                    f"{self._req_rx_bytes} bytes; blocks seen: {starts_seen}; "
+                    f"{self._req_rx_bytes} bytes; blocks seen: {starts_seen}"
+                    f"{first_last}; "
                     f"none for start {match.start})"
                 ) from None
         finally:
             self._cancel_silence_timer()
+            if resend_task is not None and done is not None:
+                # Contract 009 §5: the re-send loop is cancelled when the
+                # request completes, fails or the client disconnects —
+                # never leaks past the request (plan 009 §3.2).
+                done.set()
+                resend_task.cancel()
             self._pending = None
             self._match = None
             self._rx.clear()
+
+    async def _resend_loop(
+        self, frame: bytes, every: float, max_sends: int, done: asyncio.Event
+    ) -> None:
+        """Re-send the identical frame on a fixed cadence (spec 009 FR-2,
+        contract 009 §5).
+
+        Sends at t+every, t+2*every, … up to max_sends extra writes, all
+        inside the caller's request window (the config-flow first read
+        passes every=2.0, max_sends=3 → t+0/2/4/6 s inside the unchanged
+        8.0 s window — research 009 §8: 4 × 8 bytes of idempotent FC03
+        reads, the app's plausible 2 s poll cadence, research 009 §1.3).
+        Stops when the request completes (done / pending done), the
+        client disconnects, or a re-send write fails; a failed re-send
+        never fails the request — the deadline and the census stay in
+        charge (plan 009 §3.2).
+        """
+        for n in range(1, max_sends + 1):
+            try:
+                await asyncio.sleep(every)
+            except asyncio.CancelledError:
+                return
+            if done.is_set() or self._pending is None or self._pending.done():
+                return
+            _LOGGER.info(
+                "first-read re-send %d/%d: %s", n, max_sends, frame.hex()
+            )
+            try:
+                await self._write_frame(frame)
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.warning(
+                    "first-read re-send %d/%d failed: %s: %s",
+                    n,
+                    max_sends,
+                    type(exc).__name__,
+                    exc,
+                )
+                return
+
+    def _log_idle_summary_once(self) -> None:
+        """Emit the idle-window summary at the FIRST request of a
+        connection (spec 009 FR-1, contract 009 §3).
+
+        Exactly one INFO line per connect, logged BEFORE the TX debug
+        line of that first request: the number of block pushes that
+        arrived while idle, their starts, and the first push offset
+        relative to the subscribe — the E2 push-onset evidence (research
+        009 §1.1). The zero-push case is itself the datum ('0 block
+        push(es)': push onset later than the settle — quickstart 009
+        §0/§1).
+        """
+        if self._idle_summary_logged:
+            return
+        self._idle_summary_logged = True
+        if self._idle_pushes:
+            starts = ", ".join(
+                str(start) for start in sorted({s for s, _ in self._idle_pushes})
+            )
+            first = self._idle_pushes[0][1]
+            _LOGGER.info(
+                "idle window before first request: %d block push(es), "
+                "starts seen: %s, first at t+%.2fs after subscribe",
+                len(self._idle_pushes),
+                starts,
+                first,
+            )
+        else:
+            _LOGGER.info("idle window before first request: 0 block push(es)")
 
     def _on_notify(self, *args: Any) -> None:
         """Handle one GATT notification chunk.
@@ -1222,6 +1378,17 @@ class AquaTempBleClient:
         )
         if crc_ok:
             self._req_frame_count += 1
+        # Spec 009 FR-1 (plan 009 §2.2): every censused frame updates the
+        # first/last offsets; census lines render t+%.2fs relative to the
+        # request start (contract 009 §3). The 0.0 fallback only exists
+        # for direct-notify test paths — _request stamps _req_t0 before
+        # any notification can be processed.
+        offset = 0.0
+        if self._req_t0 is not None:
+            offset = _now() - self._req_t0
+            if self._req_first_seen is None:
+                self._req_first_seen = offset
+            self._req_last_seen = offset
         if is_block:
             start, qty = struct.unpack(">HH", frame[2:6])
             if crc_ok:
@@ -1229,30 +1396,34 @@ class AquaTempBleClient:
                 _LOGGER.log(
                     level,
                     "block push observed: start=%d qty=%d len=%d crc=%s "
-                    "(waiting for start %s)",
+                    "(waiting for start %s; t+%.2fs)",
                     start,
                     qty,
                     len(frame),
                     verdict,
                     self._match.start if self._match is not None else None,
+                    offset,
                 )
             else:
                 _LOGGER.log(
                     level,
-                    "block push observed: start=%d qty=%d len=%d crc=%s",
+                    "block push observed: start=%d qty=%d len=%d crc=%s; "
+                    "t+%.2fs",
                     start,
                     qty,
                     len(frame),
                     verdict,
+                    offset,
                 )
         else:
             _LOGGER.log(
                 level,
                 "frame observed: fc=0x%02X len=%d crc=%s (non-matching; "
-                "request keeps waiting)",
+                "request keeps waiting; t+%.2fs)",
                 frame[1],
                 len(frame),
                 verdict,
+                offset,
             )
 
     def _idle_census(self, data: bytes) -> None:
@@ -1284,6 +1455,17 @@ class AquaTempBleClient:
             )
             if is_block:
                 start, qty = struct.unpack(">HH", frame[2:6])
+                # Spec 009 FR-1 (plan 009 §2.2): collect (start, t after
+                # subscribe) for the idle-window summary — the E2
+                # push-onset evidence (research 009 §1.1). Offset 0.0
+                # when the subscribe stamp is unknown (direct-notify
+                # test paths; production always stamps it in connect()).
+                offset = (
+                    _now() - self._t_subscribe
+                    if self._t_subscribe is not None
+                    else 0.0
+                )
+                self._idle_pushes.append((start, offset))
                 if not self._idle_census_logged:
                     self._idle_census_logged = True
                     _LOGGER.info(
@@ -1378,19 +1560,35 @@ class AquaTempBleClient:
             self._silence_timer = None
 
     # ----------------------------------------------------------- high level
-    async def read_registers(self, start: int, count: int) -> dict[int, int]:
+    async def read_registers(
+        self,
+        start: int,
+        count: int,
+        *,
+        resend_every: float | None = None,
+        resend_max: int = 0,
+    ) -> dict[int, int]:
         """FC03 read; returns {register: raw signed int16}.
 
         Spec 008 FR-3: the request completes on EITHER the FC03 answer OR
         the unit's block frame echoing (start, count) — the production
         first-read fix (research 008 §1). The request bytes are unchanged
         (the vendor-proven base read, research 008 §5 Q5).
+
+        Spec 009 FR-2 (contract 009 §5): resend_every/resend_max re-send
+        the identical frame on a fixed cadence INSIDE the unchanged
+        request window — used ONLY by the config-flow connection test
+        (resend_every=2.0, resend_max=3 → sends at t+0/2/4/6 s). The
+        coordinator's polling path keeps the single-shot default until a
+        follow-up spec cites evidence (NFR-3).
         """
         frame = modbus.build_read_holding_registers(start, count)
         resp = await self._request(
             frame,
             _ResponseMatch(accept_fc03=True, accept_block=True, start=start, count=count),
             const.REQUEST_TIMEOUT,
+            resend_every=resend_every,
+            resend_max=resend_max,
         )
         try:
             if resp[1] == modbus.FC_BLOCK:

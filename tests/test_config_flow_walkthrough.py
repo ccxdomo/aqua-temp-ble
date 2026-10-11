@@ -340,6 +340,7 @@ class FakeClient:
         self.connected = False
         self.disconnected = False
         self.connect_kwargs = None  # recorded by connect() (spec 006 AC-3)
+        self.read_kwargs = None  # recorded by read_registers() (spec 009 FR-2)
         type(self).instances.append(self)
 
     async def connect(self, max_attempts=None):
@@ -351,11 +352,15 @@ class FakeClient:
             raise type(self).fault
         self.connected = True
 
-    async def read_registers(self, start, count):
+    async def read_registers(self, start, count, *, resend_every=None, resend_max=0):
         assert (start, count) == (
             cf.registers.BASE_BLOCK_START,
             cf.registers.BASE_BLOCK_COUNT,
         )
+        # Spec 009 FR-2: the flow's first read passes the bounded re-send
+        # parameters (contract 009 §5) — recorded so the walkthrough pins
+        # the call site.
+        self.read_kwargs = {"resend_every": resend_every, "resend_max": resend_max}
         return dict(type(self).regs)
 
     async def disconnect(self):
@@ -367,9 +372,9 @@ class SlowFakeClient(FakeClient):
     """FakeClient whose read hangs briefly, to observe a re-entry while
     the progress task is still running (E-7: mid-progress refresh)."""
 
-    async def read_registers(self, start, count):
+    async def read_registers(self, start, count, **kwargs):
         await asyncio.sleep(0.05)
-        return await super().read_registers(start, count)
+        return await super().read_registers(start, count, **kwargs)
 
 
 class HangingFakeClient(FakeClient):
@@ -825,6 +830,10 @@ async def test_connection_test_budget_and_attempts():
     the vendor app's own persistence — two attempts inside 70 s
     (2 x 20 s connects + backoff + 2 s settle + 8 s read + margin,
     plan 006 §3.1; the vendor app retries connects, research 006 §2.2).
+
+    Spec 009 FR-2: the first read also carries the bounded app-parity
+    re-send (resend_every=2.0, resend_max=3 — contract 009 §5), inside
+    the unchanged budget and window.
     """
     assert cf.TEST_TIMEOUT == 70.0, cf.TEST_TIMEOUT
     hass = FakeHass(infos=[FakeInfo("AA:BB:CC:DD:EE:10", "BlueNRG-7A", -50)])
@@ -838,6 +847,12 @@ async def test_connection_test_budget_and_attempts():
     client = FakeClient.instances[-1]
     # The fake client records the kwargs _async_test passed (spec 006 FR-3).
     assert client.connect_kwargs == {"max_attempts": 2}, client.connect_kwargs
+    # Spec 009 FR-2 (contract 009 §5): the first read re-sends the
+    # identical vendor frame on the 2 s cadence, 3 extra sends, inside
+    # the unchanged 8 s window.
+    assert client.read_kwargs == {"resend_every": 2.0, "resend_max": 3}, (
+        client.read_kwargs
+    )
 
 
 async def test_scan_branch_returns_to_user_menu():

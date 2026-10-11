@@ -461,8 +461,14 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
                 await client.connect(max_attempts=2)
                 stage = "first-read"
                 try:
+                    # Spec 009 FR-2 (contract 009 §5): the bounded
+                    # app-parity re-send — the identical vendor frame,
+                    # 2 s apart, up to 3 extra sends, all inside the
+                    # unchanged 8.0 s request window (the app's 2 s
+                    # Duration may be a poll cadence, research 009 §1.3).
                     self._regs = await client.read_registers(
-                        registers.BASE_BLOCK_START, registers.BASE_BLOCK_COUNT
+                        registers.BASE_BLOCK_START, registers.BASE_BLOCK_COUNT,
+                        resend_every=2.0, resend_max=3,
                     )
                 finally:
                     await client.disconnect()

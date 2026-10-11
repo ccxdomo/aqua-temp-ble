@@ -13,7 +13,9 @@ frames; the c8d8260 FC drop-gate deleted each one
 - pushes for other blocks are census-logged at INFO and never complete
   or fail the request (AC-4);
 - the timeout message reports the census — frames received, bytes,
-  block starts — never a bare "got 0 bytes" (AC-5);
+  block starts — never a bare "got 0 bytes" (AC-5). Pinned to the
+  spec-009 grammar (NFR-6): per-start counts (`1001x2, …`) plus the
+  first/last census offsets — the 008 semantic properties stay pinned;
 - the write-echo path is unchanged, including the pathological echo
   whose CRC low byte equals 2*qty: the silence/deadline paths self-heal
   it (AC-6, contract 008-B §4.2/§4.3);
@@ -283,6 +285,7 @@ def test_push_for_other_block_censused_request_unaffected() -> None:
         assert any(
             "block push observed: start=1001 qty=45 len=99 crc=OK" in m
             and "waiting for start 7" in m
+            and "; t+" in m  # spec 009 FR-1 census timing (contract 009 §3)
             for m in census
         ), census
 
@@ -291,8 +294,11 @@ def test_push_for_other_block_censused_request_unaffected() -> None:
 
 def test_timeout_message_names_received_frames() -> None:
     """AC-5: pushes only — the timeout message reports the census
-    (12 frames / 1188 bytes, the six block starts, 'none for start 7'),
-    never a bare 'got 0 bytes' (research 008 §5 Q3)."""
+    (12 frames / 1188 bytes, per-start block counts, first/last t+
+    offsets, 'none for start 7'), never a bare 'got 0 bytes' (research
+    008 §5 Q3). Grammar updated by spec 009 FR-1 (NFR-6, contract 009
+    §3): counts go from sorted-unique starts to `startxN`, and the
+    first/last offsets are added — the semantic properties stay."""
 
     async def run() -> None:
         blocks = [1001, 1046, 1091, 1136, 2001, 2046]
@@ -318,7 +324,10 @@ def test_timeout_message_names_received_frames() -> None:
         finally:
             const.REQUEST_TIMEOUT = old
         assert "received 12 frame(s) / 1188 bytes" in msg, msg
-        assert "blocks seen: 1001, 1046, 1091, 1136, 2001, 2046" in msg, msg
+        # Spec 009 FR-1 grammar (contract 009 §3): per-start counts —
+        # 12 pushes = 2 full cycles of the app's six canonical blocks.
+        assert "blocks seen: 1001x2, 1046x2, 1091x2, 1136x2, 2001x2, 2046x2" in msg, msg
+        assert "first t+" in msg and "last t+" in msg, msg
         assert "none for start 7" in msg, msg
         assert "got 0 bytes" not in msg, msg
 
