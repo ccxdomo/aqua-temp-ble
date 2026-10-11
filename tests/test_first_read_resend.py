@@ -115,7 +115,7 @@ class ResendTestClient(aqua_client.AquaTempBleClient):
         self.answer = answer
         self.answer_on_write = answer_on_write
 
-    async def _write_frame(self, frame: bytes) -> None:
+    async def _write_frame(self, frame: bytes, *, force_response: bool = False) -> None:
         self.sent.append(bytes(frame))
         if self.answer is not None and len(self.sent) == self.answer_on_write:
             self._on_notify(bytearray(self.answer))

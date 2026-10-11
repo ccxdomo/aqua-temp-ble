@@ -297,6 +297,13 @@ Matching recovered frames: `03E9`=1001, `0416`=1046, `0443`=1091, `0470`=1136,
 The `ff01`/`ff02` UUIDs are the **generic Chinese-module convention**
 (`0xFF00`-`0xFFFF`), not vendor-specific.
 
+> **Correction (spec 010, 2026-10-11):** the Dart operating channel
+> selects write = ff03 / notify = ff02 by UUID bucket
+> ({ff03,2215,2aa6} / {ff02,2216,2a00}); the `ff01` DEX constant belongs
+> to the non-operating Java BLE path. The `ff01→2214/ff02→2216/ff03→2215`
+> "handle" pairs are two GATT generations' UUID sets. See
+> `specs/010-write-characteristic/research.md`.
+
 ### 11.4 Field ↔ register mapping
 
 Class `VR.Yzd` maps display labels to register indices:

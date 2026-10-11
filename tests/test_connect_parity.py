@@ -12,8 +12,13 @@ These tests pin BOTH parity behaviours on the shipped client:
 - AC-1: connect() awaits exactly one SETTLE_AFTER_SUBSCRIBE sleep,
   ordered AFTER start_notify and BEFORE the first request frame.
 - AC-2: _resolve_write_characteristic prefers write-without-response
-  (response=False), falls back to write (response=True), and raises
-  AquaTempConnectionError when ff01 advertises neither property.
+  (response=False), falls back to write (response=True), and (spec 010
+  FR-3) a characteristic advertising NO write property at all is used
+  ANYWAY — without response, with an app-parity WARNING — never a
+  connect-time refusal. The pre-010 code hard-refused that case
+  (spec 006 AC-2); the refusal was only ever reachable through the
+  deleted ff01-first branch, and the app — property-blind (research
+  010 §1) — writes regardless.
 
 Red-first: every AC-1/AC-2 assertion below reproduces the gap with the
 vendor app — on the pre-006 code there is no settle sleep and the write
@@ -153,7 +158,7 @@ class ParityClient(aqua_client.AquaTempBleClient):
     def _load_retry_connector(self):
         return None  # force the standalone raw-client path
 
-    async def _connect_with_raw_client(self, _device):
+    async def _connect_with_raw_client(self, _device, pair: bool = False):
         self._fake.events.append("connect")
         return self._fake
 
@@ -224,12 +229,15 @@ def test_settle_after_subscribe_before_first_request() -> None:
 
 
 def test_write_mode_property_matrix() -> None:
-    """AC-2: without-response preferred, write fallback, neither -> error.
+    """AC-2: without-response preferred, write fallback, no-property ->
+    used anyway (spec 010 FR-3).
 
     Red-first rows: ['write-without-response', 'write'] currently maps to
     WITH response (the vendor writes without — research 006 §2.1), and
-    ['notify'] currently degrades to a silent fire-and-forget instead of
-    failing loudly.
+    ['notify'] currently raises AquaTempConnectionError instead of the
+    FR-3 without-response-anyway + WARNING (spec 010 supersedes the
+    spec-006 refusal row — the app, property-blind, writes regardless,
+    research 010 §1/§2.3).
     """
 
     async def run() -> None:
@@ -242,17 +250,15 @@ def test_write_mode_property_matrix() -> None:
             client._resolve_write_characteristic(fake)
             assert client._write_with_response is expected, (props, expected)
 
+        # Spec 010 FR-3: no write property advertised — the bucket pick
+        # (the fake answers every UUID lookup) is used WITHOUT response
+        # anyway, never a connect-time refusal. The exact WARNING is
+        # pinned in tests/test_write_mode.py.
         fake = RecordingBleakClient(("notify",), [], None)
         client = ParityClient(fake)
-        try:
-            client._resolve_write_characteristic(fake)
-        except aqua_client.AquaTempConnectionError as exc:
-            assert "no usable write property" in str(exc), str(exc)
-        else:
-            raise AssertionError(
-                "a characteristic with no write property must raise "
-                "AquaTempConnectionError"
-            )
+        client._resolve_write_characteristic(fake)
+        assert client._write_with_response is False, client._write_with_response
+        assert client._write_uuid == const.UUID_WRITE, client._write_uuid
 
     asyncio.run(run())
 
@@ -260,8 +266,10 @@ def test_write_mode_property_matrix() -> None:
 def test_write_mode_reaches_the_wire() -> None:
     """AC-2 end-to-end: _write_frame passes the resolved mode to bleak.
 
-    Without-response ff01 -> every GATT write carries response=False
-    (vendor parity, research 006 §2.1); write-only ff01 -> response=True.
+    Without-response ff03 (the app's write bucket head — the fake
+    answers every UUID lookup with the same char) -> every GATT write
+    carries response=False (vendor parity, research 006 §2.1, research
+    010 §2.3); write-only -> response=True (the FR-3 ATT divergence).
     Red-first: the without-response case writes response=True on the
     pre-006 code.
     """

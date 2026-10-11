@@ -97,7 +97,7 @@ class ScriptedClient(aqua_client.AquaTempBleClient):
         self.chunks = list(chunks or [])
         self.sent: list[bytes] = []
 
-    async def _write_frame(self, frame: bytes) -> None:
+    async def _write_frame(self, frame: bytes, *, force_response: bool = False) -> None:
         self.sent.append(bytes(frame))
         for chunk in self.chunks:
             # feed chunks synchronously as if the device just notified us
@@ -180,10 +180,10 @@ class ConnectableScriptedClient(aqua_client.AquaTempBleClient):
     def _load_retry_connector(self):
         return None  # force the standalone raw-client path
 
-    async def _connect_with_raw_client(self, _device):
+    async def _connect_with_raw_client(self, _device, pair: bool = False):
         return self.bleak
 
-    async def _write_frame(self, frame: bytes) -> None:
+    async def _write_frame(self, frame: bytes, *, force_response: bool = False) -> None:
         self.sent.append(bytes(frame))
         await self.bleak.write_gatt_char(None, frame, response=self._write_with_response)
 
@@ -498,7 +498,7 @@ def test_single_flight_guard() -> None:
     async def run() -> None:
         client = _connected()
 
-        async def slow_write(frame: bytes) -> None:
+        async def slow_write(frame: bytes, *, force_response: bool = False) -> None:
             await asyncio.sleep(0.2)
 
         client._write_frame = slow_write  # type: ignore[method-assign]

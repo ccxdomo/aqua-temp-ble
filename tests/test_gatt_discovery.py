@@ -11,22 +11,30 @@ discovery contract:
   services and logs the full GATT table (service + characteristic
   UUIDs, handles, properties) at INFO via "GATT enumeration" lines —
   one connect must be enough to see the real layout.
-- AC-2 (write fallback): ff01 stays the FIRST choice; when absent the
-  resolution falls back to (b) a writable characteristic of a
-  vendor-specific service (preferring services that also notify),
-  (c) ff03 as a last-resort candidate, (d) an explicit
-  AquaTempConnectionError whose MESSAGE lists the real table.
-- AC-3 (notify fallback): ff02 stays the FIRST choice; when absent the
-  client subscribes to a notify/indicate characteristic of the same
-  service as the write candidate, else of a vendor service, else the
-  same explicit listing error — never from a standard SIG service.
-- AC-4 (alternative logging): whenever an ALTERNATIVE uuid is used, ONE
-  INFO line "using write/notify characteristic <uuid> (properties=...)"
-  names the choice.
-- AC-5 (regression): units that expose ff01/ff02 behave exactly as
-  before — same uuids on the wire, same vendor session order (spec 006
-  FR-1), same write-mode property gate (spec 006 FR-2), and no
-  "using ..." announcement.
+- AC-2 (write resolution): the app's write bucket {ff03, 2215,
+  2aa6} (research 010 §1, spec 010 FR-2) resolves FIRST,
+  property-blind; when no bucket UUID exists the resolution falls
+  back to (b) a writable characteristic of a vendor-specific service
+  (preferring services that also notify), (c) an explicit
+  AquaTempConnectionError whose MESSAGE lists the real table. The
+  historic ff01-first preference is GONE — the app never selects a
+  characteristic ff01 (research 010 §1.3); a unit whose only writable
+  char IS ff01 still gets it via the adaptive fallback (b).
+- AC-3 (notify resolution): the app's notify bucket {ff02, 2216,
+  2a00} resolves FIRST, property-blind; the classic ff02 pick stays
+  silent, anything else is announced at INFO. When no bucket UUID
+  exists the client subscribes to a notify/indicate characteristic of
+  the same service as the write candidate, else of a vendor service,
+  else the same explicit listing error — never from a standard SIG
+  service.
+- AC-4 (choice logging): the write choice is ALWAYS announced with
+  ONE INFO line "using write characteristic <uuid> (properties=...)"
+  (the E4' evidence line, quickstart 010 §0); notify alternatives
+  keep the "using notify characteristic ..." line.
+- AC-5 (regression): the production layout (service ff01 hosting
+  ff02+ff03) keeps the exact historic behaviour — same uuids on the
+  wire, same vendor session order (spec 006 FR-1), without-response
+  writes (spec 006 FR-2 / research 010 §2.3).
 
 Red-first: on the pre-discovery code every test below fails — the write
 fallback dies with the hard "not found" error, no enumeration lines
@@ -81,12 +89,20 @@ import modbus  # noqa: E402
 ADDRESS = "08:06:A6:C0:94:1C"  # the production unit's address
 DEVICE_NAME = "BlueNRG-C0941C"
 
-# Known UUIDs (first choice, FINDINGS.md §3, §11.3)
-FF01 = const.UUID_WRITE
+# The app's bucket heads (spec 010 FR-1, research 010 §1): ff02 is the
+# notify char, ff03 the write char — the pair the production census
+# log already showed. The full buckets live in
+# const.UUID_NOTIFY_BUCKETS / const.UUID_WRITE_BUCKETS.
 FF02 = const.UUID_NOTIFY
+FF03 = const.UUID_WRITE
 
-# Candidate UUIDs for the adaptive discovery
-FF03 = "0000ff03-0000-1000-8000-00805f9b34fb"      # handle 2215, role unknown
+# The historic DEX "write" UUID (FINDINGS.md §3 + the §11.3 spec-010
+# correction): NOT in the app's buckets — the app never selects a
+# characteristic ff01 (research 010 §1.3). Fixture-only from spec 010
+# on: a unit whose ONLY writable char is ff01 still gets it via the
+# adaptive vendor-service scan (the c8d8260 safety net).
+FF01 = "0000ff01-0000-1000-8000-00805f9b34fb"
+FF01_SVC = "0000ff01-0000-1000-8000-00805f9b34fb"  # the owner unit's SERVICE uuid (research 010 §0)
 FF00 = "0000ff00-0000-1000-8000-00805f9b34fb"      # plausible vendor service
 GAP = "00001800-0000-1000-8000-00805f9b34fb"       # standard service
 DEV_NAME = "00002a00-0000-1000-8000-00805f9b34fb"  # GAP device name char
@@ -218,7 +234,7 @@ class DiscoveryClient(aqua_client.AquaTempBleClient):
     def _load_retry_connector(self):
         return None  # force the standalone raw-client path
 
-    async def _connect_with_raw_client(self, _device):
+    async def _connect_with_raw_client(self, _device, pair: bool = False):
         self._fake.events.append("connect")
         return self._fake
 
@@ -266,7 +282,10 @@ def _capture():
 
 
 def classic_unit(response=None):
-    """The documented unit: ff01/ff02 present (handles FINDINGS §11.3)."""
+    """The historic "documented" layout (ff01 writable + ff03 read-only
+    + ff02 notify, handles FINDINGS §11.3): from spec 010 the write
+    bucket picks ff03 even though ff01 is the only writable char — the
+    app never writes a characteristic ff01 (research 010 §1.3)."""
     services = FakeServices(
         [
             _svc(GAP, 1, FakeChar(DEV_NAME, 2, ["read"])),
@@ -276,6 +295,24 @@ def classic_unit(response=None):
                 FakeChar(FF01, 2214, ["write", "write-without-response"]),
                 FakeChar(FF03, 2215, ["read"]),
                 FakeChar(FF02, 2216, ["notify"]),
+            ),
+        ]
+    )
+    return RecordingBleakClient(services, response)
+
+
+def owner_unit(response=None):
+    """The PRODUCTION unit's layout (research 010 §0/§6.2): service ff01
+    hosting ff02 (notify) + ff03 (write, write-without-response) — the
+    pair the ce41aa5 census run already resolved at runtime."""
+    services = FakeServices(
+        [
+            _svc(GAP, 1, FakeChar(DEV_NAME, 2, ["read"])),
+            _svc(
+                FF01_SVC,
+                2212,
+                FakeChar(FF02, 2216, ["notify"]),
+                FakeChar(FF03, 2215, ["write", "write-without-response"]),
             ),
         ]
     )
@@ -329,15 +366,22 @@ def test_enumeration_logs_full_gatt_table() -> None:
 
 
 def test_known_uuids_still_win() -> None:
-    """AC-5 regression: ff01/ff02 units keep the exact historic behaviour.
+    """AC-5 regression, spec-010 edition: the production layout (service
+    ff01 hosting ff02+ff03, research 010 §0) resolves notify=ff02 /
+    write=ff03 — the pair the ce41aa5 census already used at runtime —
+    with the byte-identical observable session: same uuids on the
+    wire, same vendor session order (spec 006 FR-1), without-response
+    writes (spec 006 FR-2 / research 010 §2.3), the census write line
+    present, and NO notify announcement (the classic ff02 pick stays
+    silent).
 
-    Red-first: _write_uuid/_notify_uuid do not exist on the
-    pre-discovery code.
+    Red-first: on the pre-010 code the write resolution prefers the
+    ff01-first branch, so the ff03 bucket pick never happens.
     """
 
     async def run() -> None:
         resp = _build_response(SYNTHETIC_VALUES)
-        fake = classic_unit(resp)
+        fake = owner_unit(resp)
         client = DiscoveryClient(fake)
         # Sleeps are recorded into the FAKE's event list so the session
         # order (transport calls interleaved with the settle) is one
@@ -346,11 +390,12 @@ def test_known_uuids_still_win() -> None:
             await client.connect()
             regs = await client.read_registers(7, 45)
         assert regs[26] == 243, regs  # the scripted session answered
-        assert client._write_uuid == FF01
+        assert client._write_uuid == FF03
         assert client._notify_uuid == FF02
         assert fake.notified_uuids == [FF02], fake.notified_uuids
-        assert all(uuid == FF01 for uuid, _f, _r in fake.writes), fake.writes
-        # Property gate (spec 006 FR-2): without-response preferred.
+        assert all(uuid == FF03 for uuid, _f, _r in fake.writes), fake.writes
+        # Property gate (spec 006 FR-2 / research 010 §2.3):
+        # without-response preferred — the app's only WriteType.
         assert all(r is False for _u, _f, r in fake.writes), fake.writes
         # Vendor session order (spec 006 FR-1) is untouched.
         assert fake.events == [
@@ -359,17 +404,26 @@ def test_known_uuids_still_win() -> None:
             ("sleep", const.SETTLE_AFTER_SUBSCRIBE),
             "write",
         ], fake.events
-        # Known UUIDs are never announced as alternatives.
-        using = [m for m in logs if m.startswith("using ")]
-        assert not using, using
+        # AC-4: the census write line, byte-identical to the production
+        # format (the E4' grep target, quickstart 010 §0).
+        assert (
+            f"using write characteristic {FF03} "
+            f"(properties=['write', 'write-without-response']) "
+            f"on {ADDRESS}" in logs
+        ), logs
+        # The classic ff02 pick is never announced.
+        assert not [m for m in logs if m.startswith("using notify characteristic")], logs
+        # No property advisories on the clean layout.
+        assert not [m for m in logs if "app parity" in m], logs
 
     asyncio.run(run())
 
 
-def test_write_fallback_finds_writable_char_when_ff01_absent() -> None:
-    """AC-2(b)/AC-3/AC-4: no ff01 and no ff02 — a full 128-bit vendor
+def test_write_fallback_finds_writable_char_when_bucket_uuids_absent() -> None:
+    """AC-2(b)/AC-3/AC-4: no bucket UUID anywhere — a full 128-bit vendor
     service exposes write + notify. connect() must USE them end to end
-    and announce both choices at INFO.
+    and announce both choices at INFO (the unchanged c8d8260 adaptive
+    safety net).
 
     Red-first: the pre-discovery code dies with "write characteristic
     ... not found on the device".
@@ -378,9 +432,15 @@ def test_write_fallback_finds_writable_char_when_ff01_absent() -> None:
     async def run() -> None:
         events: list = []
         resp = _build_response(SYNTHETIC_VALUES)
+        # No bucket UUID anywhere: the GAP device-name char 2a00 is
+        # itself a notify-bucket UUID (research 010 §1.3 — a table
+        # exposing it resolves 2a00 property-blind, see T5 in
+        # test_characteristic_resolution.py), so the fixture uses a
+        # battery service instead: only the full 128-bit vendor service
+        # exposes write + notify.
         services = FakeServices(
             [
-                _svc(GAP, 1, FakeChar(DEV_NAME, 2, ["read"])),
+                _svc(BATTERY, 10, FakeChar(BATT_LEVEL, 11, ["read"])),
                 _svc(
                     CUSTOM_SVC,
                     64,
@@ -420,12 +480,14 @@ def test_write_fallback_finds_writable_char_when_ff01_absent() -> None:
     asyncio.run(run())
 
 
-def test_write_fallback_uses_ff03_when_writable() -> None:
-    """AC-2(b): the documented sibling ff03 (handle 2215, role unknown,
-    FINDINGS §11.3) advertises write — it must be chosen when ff01 is
-    absent, while ff02 keeps the notify role.
+def test_write_bucket_picks_ff03_when_writable() -> None:
+    """AC-2/plan-010 T1 end to end: the write bucket head ff03
+    advertising only 'write' is picked FIRST (property-blind), with
+    the with-response ATT divergence + WARNING (FR-3), while ff02
+    keeps the notify role.
 
-    Red-first: the pre-discovery code dies "not found".
+    Red-first: the pre-010 code prefers the absent ff01 and only
+    reaches ff03 through the last-resort branch.
     """
 
     async def run() -> None:
@@ -456,13 +518,14 @@ def test_write_fallback_uses_ff03_when_writable() -> None:
     asyncio.run(run())
 
 
-def test_ff03_last_resort_without_write_property() -> None:
-    """AC-2(c): ff03 exists but advertises NO write property — the
-    last-resort candidate is still tried (its role was never confirmed),
-    with a WARNING naming the missing property and the vendor-parity
-    write mode (without response).
+def test_bucket_ff03_without_write_property_is_used_anyway() -> None:
+    """AC-2 / plan-010 T2: ff03 exists but advertises NO write property —
+    the bucket pick is property-BLIND, so ff03 is still the write char
+    with the app-parity WARNING naming the missing property and the
+    vendor-parity write mode (without response, research 010 §1/§2.3).
 
-    Red-first: the pre-discovery code dies "not found".
+    Red-first: the pre-010 code reaches ff03 only through the
+    last-resort branch with the old wording.
     """
 
     async def run() -> None:
@@ -481,10 +544,11 @@ def test_ff03_last_resort_without_write_property() -> None:
         with _record_sleeps([]), _capture() as logs:
             await client.connect()
         assert client._write_uuid == FF03
-        # No property advertises a mode -> vendor parity: without response.
+        # No property advertises a mode -> app parity: without response.
         assert client._write_with_response is False
-        warns = [m for m in logs if "does not advertise a write property" in m]
+        warns = [m for m in logs if "app parity: writing anyway" in m]
         assert warns and FF03 in warns[0], logs
+        assert "advertises no write property" in warns[0], warns
         assert (
             f"using write characteristic {FF03} (properties=['read']) "
             f"on {ADDRESS}" in logs
@@ -522,8 +586,9 @@ def test_no_writable_characteristic_error_lists_gatt_table() -> None:
         assert raised is not None, "connect() must raise AquaTempConnectionError"
         msg = str(raised)
         assert "no usable write characteristic" in msg, msg
-        # The known UUID's absence is named...
-        assert FF01 in msg, msg
+        # No write-bucket UUID (ff03/2215/2aa6) and no vendor writable
+        # char anywhere — the known UUID absence is named...
+        assert FF03 in msg, msg
         # ...and the message lists what the device REALLY exposes.
         assert DEV_NAME in msg and "['read']" in msg, msg
         assert BATT_LEVEL in msg and "['read', 'notify']" in msg, msg
@@ -542,15 +607,21 @@ def test_no_writable_characteristic_error_lists_gatt_table() -> None:
 
 
 def test_no_notify_characteristic_error_lists_gatt_table() -> None:
-    """AC-3 error twin: no notify/indicate anywhere — explicit error
-    BEFORE any subscription, listing the real table (the write
-    characteristic exists but nothing can deliver responses)."""
+    """AC-3 error twin: NO notify bucket UUID (ff02/2216/2a00 all
+    absent) and no vendor notify/indicate char — explicit error BEFORE
+    any subscription, listing the real table. The notifying battery
+    char (2a19, a STANDARD service) is listed but never a candidate.
+
+    Spec-010 note: a table exposing 2a00 would NOT fail here — 2a00 is
+    in the app's notify bucket (research 010 §1.3), so the bucket walk
+    would pick it (T5 in test_characteristic_resolution.py).
+    """
 
     async def run() -> None:
         services = FakeServices(
             [
-                _svc(GAP, 1, FakeChar(DEV_NAME, 2, ["read"])),
                 _svc(FF00, 2212, FakeChar(FF01, 2214, ["write", "write-without-response"])),
+                _svc(BATTERY, 10, FakeChar(BATT_LEVEL, 11, ["read", "notify"])),
             ]
         )
         fake = RecordingBleakClient(services)
@@ -566,6 +637,8 @@ def test_no_notify_characteristic_error_lists_gatt_table() -> None:
         assert "no notify-capable characteristic" in msg, msg
         assert FF02 in msg, msg  # known uuid absence named
         assert FF01 in msg and "['write', 'write-without-response']" in msg, msg
+        # The standard-service notify char is listed but NOT chosen.
+        assert BATT_LEVEL in msg and "['read', 'notify']" in msg, msg
         # The failure happened BEFORE any subscription.
         assert fake.notified_uuids == [], fake.notified_uuids
         assert "start_notify" not in fake.events, fake.events
@@ -672,9 +745,9 @@ def main() -> int:
     tests = [
         test_enumeration_logs_full_gatt_table,
         test_known_uuids_still_win,
-        test_write_fallback_finds_writable_char_when_ff01_absent,
-        test_write_fallback_uses_ff03_when_writable,
-        test_ff03_last_resort_without_write_property,
+        test_write_fallback_finds_writable_char_when_bucket_uuids_absent,
+        test_write_bucket_picks_ff03_when_writable,
+        test_bucket_ff03_without_write_property_is_used_anyway,
         test_no_writable_characteristic_error_lists_gatt_table,
         test_no_notify_characteristic_error_lists_gatt_table,
         test_fallback_write_mode_is_property_gated,

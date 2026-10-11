@@ -150,7 +150,7 @@ class ScriptedClient(aqua_client.AquaTempBleClient):
         self.chunks = list(chunks or [])
         self.sent: list[bytes] = []
 
-    async def _write_frame(self, frame: bytes) -> None:
+    async def _write_frame(self, frame: bytes, *, force_response: bool = False) -> None:
         self.sent.append(bytes(frame))
         for chunk in self.chunks:
             # feed chunks synchronously as if the device just notified us

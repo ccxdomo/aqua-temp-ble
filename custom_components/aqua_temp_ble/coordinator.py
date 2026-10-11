@@ -229,7 +229,15 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
         """Exactly one 45-register FC03 read per cycle; no retry storm."""
         async with self._io_lock:
             if not self.client.is_connected:
-                await self.client.connect()  # lazy reconnect, never a loop
+                # Spec 011 FR-6: the evidence-gated pairing lever. Default
+                # OFF keeps this byte-identical to the pre-011 behaviour;
+                # only an explicit opt-in after the security probe answered
+                # ("answered after pairing") turns it on.
+                await self.client.connect(
+                    pair=self.config_entry.options.get(
+                        "pair_on_connect", const.DEFAULT_PAIR_ON_CONNECT
+                    )
+                )
             try:
                 regs = await self.client.read_registers(
                     registers.BASE_BLOCK_START, registers.BASE_BLOCK_COUNT

@@ -10,17 +10,34 @@ DOMAIN = "aqua_temp_ble"
 # strings are used on purpose (see module docstring).
 PLATFORMS = ["climate", "sensor", "binary_sensor", "button"]
 
-# GATT characteristics recovered from the vendor app (FINDINGS.md §3, §11.3).
-# FIRST choice on every connect; when the unit does not expose them,
-# aqua_client discovers the real characteristics adaptively instead of
-# failing (see aqua_client.py, adaptive GATT discovery).
-UUID_WRITE = "0000ff01-0000-1000-8000-00805f9b34fb"   # [P] handle 2214
-UUID_NOTIFY = "0000ff02-0000-1000-8000-00805f9b34fb"  # [P] handle 2216
-# ff03 (handle 2215): role unknown in the vendor app dump (FINDINGS.md
-# §11.3). LAST-RESORT write candidate for the adaptive discovery — tried
-# only when ff01 is absent and no vendor service exposes a writable
-# characteristic. [V]
-UUID_WRITE_FALLBACK = "0000ff03-0000-1000-8000-00805f9b34fb"
+# GATT characteristics — the vendor app's OWN buckets, read from the
+# disassembled Dart session manager (research 010 §1: the discovery
+# classifier closure 0xa146dc stores the matched characteristic objects
+# into the session state, field 0x2b notify / 0x2f write, by UUID match
+# ALONE — never by advertised properties). The historic ff01 write
+# constant was a DEX misreading: the app never selects a
+# characteristic ff01 (research 010 §1.3, FINDINGS.md §11.3 correction).
+UUID_NOTIFY = "0000ff02-0000-1000-8000-00805f9b34fb"  # [P] app notify bucket {ff02, 2216, 2a00}, disassembly research 010 §1
+UUID_WRITE = "0000ff03-0000-1000-8000-00805f9b34fb"   # [P] app write bucket {ff03, 2215, 2aa6} — research 010 §1; the app never selects a characteristic ff01
+
+# The app's full classification buckets, in its own scan order
+# (the classifier loop compares each characteristic UUID against these
+# triples — research 010 §1.1/§1.3: two vendor GATT generations plus
+# the GAP fallback; on the owner's unit the buckets resolve to
+# notify = ff02, write = ff03). aqua_client walks them FIRST,
+# property-blind; advertised properties are advisory only (spec 010
+# FR-2). Unknown GATT layouts still fall back to the adaptive
+# vendor-service scan (the c8d8260 safety net).
+UUID_NOTIFY_BUCKETS = (
+    UUID_NOTIFY,
+    "00002216-0000-1000-8000-00805f9b34fb",
+    "00002a00-0000-1000-8000-00805f9b34fb",
+)
+UUID_WRITE_BUCKETS = (
+    UUID_WRITE,
+    "00002215-0000-1000-8000-00805f9b34fb",
+    "00002aa6-0000-1000-8000-00805f9b34fb",
+)
 
 # BLE name prefixes the vendor app itself filters on (Dart pool). [P]
 # Operating channel: "BlueNRG-" + "WT-" (research 006 §3); "hiflying-" is
@@ -44,6 +61,28 @@ MAX_RX_BUFFER = 512
 
 DEFAULT_POLL_INTERVAL = 30  # seconds (options: 10..600)
 DEFAULT_TEMPERATURE_UNIT = "C"  # display only; wire is always x10 Celsius [P]
+
+# Spec 011 (the security probe + pairing ladder): the pairing budget and
+# the evidence-gated production lever (research 011 §10 / contract 011
+# §4). D-Bus Pair() can legitimately take seconds — PIN windows, then
+# service discovery after bonding — and bleak's own docs advise
+# generous timeouts when pairing; the config test bounds the WHOLE
+# ladder with it inside the unchanged 70 s flow budget (contract 011
+# §4 arithmetic). Never bounds a poll read (contract 009 §5 untouched).
+PAIR_TIMEOUT = 25.0
+# Evidence-gated option (spec 011 FR-6): OFF until a connection test
+# produced the `security probe: answered after pairing` line (the X2
+# proof, quickstart 011 §2) — enabling it without that evidence is a
+# contract violation (quickstart 011 discipline). With the option ON,
+# every establish requests pairing; with it OFF the production path is
+# byte-for-byte today's behavior (FR-7).
+DEFAULT_PAIR_ON_CONNECT = False
+# The establish kwarg that requests pairing across bleak generations
+# (spec 011 FR-3 rung B / FR-6): bleak-retry-connector's
+# establish_connection(pair=...) and bleak's BleakClient(pair=...)
+# (bleak >= 1.0 moved pairing into the constructor — research 011
+# §10.1); capability-checked with inspect.signature, never assumed.
+PAIR_ENABLE_PROP = "pair"
 
 # Config flow (spec 002) — scanning UX tuning (tasks.md block 1).
 # Flow-facing constants live here, next to the other integration-wide

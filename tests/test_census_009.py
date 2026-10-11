@@ -154,7 +154,7 @@ class ClockfedClient(aqua_client.AquaTempBleClient):
         self.gap = gap
         self.sent: list[bytes] = []
 
-    async def _write_frame(self, frame: bytes) -> None:
+    async def _write_frame(self, frame: bytes, *, force_response: bool = False) -> None:
         self.sent.append(bytes(frame))
         for chunk in self.feed:
             self.clock.value += self.gap

@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """Standalone BLE session probe for the Aqua Temp pool heat pump (spec 009 FR-3).
 
-A raw-bleak MEASUREMENT INSTRUMENT: no Home Assistant, no aqua_client
-import (plan 009 §4.2 — the probe owns its bleak client so it can do
-what the integration forbids: subscribe-all, write-with-response, phase
-timing). It exists to separate the surviving causes of the silent
+A raw-bleak MEASUREMENT INSTRUMENT: no Home Assistant, and no
+aqua_client import for the RAW phases (plan 009 §4.2 — the probe owns
+its bleak client so it can do what the integration forbids:
+subscribe-all, write-with-response, phase timing). Phase S (spec 011
+FR-9) is the one deliberate exception: it imports the integration's
+client so a developer with a terminal reproduces the HA connection
+test EXACTLY — no logic duplication (tasks 011 §14, contract 011 §1).
+It exists to separate the surviving causes of the silent
 first read (research 009 §7: C1 write-never-delivered, C2/C5
 answers-after-repeats, C3 push-only firmware, C6 wrong notify char) in
 ONE run at the panel — the decision matrix of research 009 §11 is
 binding for the follow-up spec.
 
-Phases (plan 009 §4.3; run in canonical order L,B,P,Q,W,E):
+Phases (plan 009 §4.3 + spec 011 FR-9; run in canonical order
+L,B,P,Q,W,E,S):
 
     L  passive listen --listen s after subscribe — NO TX: push onset,
        cadence, per-start counts (E2/E7)
@@ -27,6 +32,11 @@ Phases (plan 009 §4.3; run in canonical order L,B,P,Q,W,E):
        — the unobservable write-command path made observable (E4/C1a)
     E  experimental frames (research 009 §8) — ONLY with
        --experimental AND Phase Q in the same run (contract 009 §4)
+    S  the security twin (spec 011 FR-9): after the raw session
+       closes, reconnect through the integration's OWN client and run
+       the HA connection test exactly — first read, acknowledged
+       probe, pairing ladder, one retry, printing the same
+       `security probe:`/`pairing:` verdict lines (contract 011 §3)
 
 Safety invariants (contract 009 §7): the probe NEVER writes registers
 (FC10 frames in the allowlist are the 8-byte query shape only), never
@@ -91,7 +101,7 @@ FRAME_ALLOWLIST = frozenset(
 )
 
 DEFAULT_PHASES = "L,B,P,Q,W"
-PHASE_ORDER = "LBPQWE"
+PHASE_ORDER = "LBPQWES"  # S — the security twin (spec 011 FR-9) — is always last
 
 E_RISK_STATEMENT = """\
 EXPERIMENTAL — these frames were NEVER sent by the vendor app (research 009 §8):
@@ -174,6 +184,12 @@ def build_phase_plan(
             specs.append(
                 PhaseSpec("E", (EXPERIMENT_QUERY_BASE, EXPERIMENT_FC03_1001), 1, b_window)
             )
+        elif phase == "S":
+            # Spec 011 FR-9 (tasks 011 §14): the security twin — NO raw
+            # frames; run_security_phase builds its own client session
+            # after the raw probe closes (contract 011 §1: import the
+            # client, never copy it).
+            specs.append(PhaseSpec("S", ()))
     return specs
 
 
@@ -458,6 +474,15 @@ def build_dry_run_text(
                 lines.append(
                     f"    frame {frame.hex()} ({_crc_note(frame)}) — {gate}"
                 )
+        elif spec.name == "S":
+            lines.append(
+                "=== PHASE S: security probe + pairing — the HA connection "
+                "test twin (spec 011 FR-9): after the raw session closes, "
+                "reconnect through the integration's own client and run "
+                "first read → acknowledged probe → pairing ladder → one "
+                "retry, printing the same 'security probe:'/'pairing:' "
+                "verdict lines (contract 011 §3) ==="
+            )
     lines.append(
         f"allowlist: every TX frame is one of the {len(FRAME_ALLOWLIST)} "
         "allowlisted probe frames (research 009 §8); TX asserts membership"
@@ -641,11 +666,11 @@ class ProbeSession:
             print(f"GATT table walk failed: {type(exc).__name__}: {exc}")
         if not chars:
             # Enumeration fallback: direct UUID lookups (the client's
-            # best-effort pattern) so ff02/ff03 still resolve.
+            # best-effort pattern) so the app-bucket UUIDs still resolve
+            # (spec 010: ff02/2216/2a00 + ff03/2215/2aa6).
             for uuid in (
-                const.UUID_NOTIFY,
-                const.UUID_WRITE,
-                const.UUID_WRITE_FALLBACK,
+                *const.UUID_NOTIFY_BUCKETS,
+                *const.UUID_WRITE_BUCKETS,
             ):
                 try:
                     char = services_obj.get_characteristic(uuid)
@@ -663,7 +688,9 @@ class ProbeSession:
     def resolve_notify_chars(
         self, chars: list[tuple[str, str, list[str]]]
     ) -> list[tuple[str, list[str]]]:
-        """ff02 first, else the first vendor notify/indicate char;
+        """Mirror of the production resolution (spec 010 FR-2): the
+        app's notify bucket {ff02, 2216, 2a00} first, property-blind
+        (research 010 §1); else the first vendor notify/indicate char;
         --subscribe-all takes EVERY notify/indicate char (C6)."""
         notify_pool = [
             (uuid, props)
@@ -676,10 +703,14 @@ class ProbeSession:
                 "characteristic(s) (C6)"
             )
             return notify_pool
-        for uuid, props in notify_pool:
-            if uuid == const.UUID_NOTIFY:
-                print(f"notify characteristic: {uuid} (properties={props}) — known ff02")
-                return [(uuid, props)]
+        by_props = {uuid: props for _svc, uuid, props in chars}
+        for uuid in const.UUID_NOTIFY_BUCKETS:
+            if uuid in by_props:
+                print(
+                    f"notify characteristic: {uuid} "
+                    f"(properties={by_props[uuid]}) — app bucket (research 010 §1)"
+                )
+                return [(uuid, by_props[uuid])]
         vendor = [
             (uuid, props)
             for (svc, uuid, props) in notify_pool
@@ -688,7 +719,7 @@ class ProbeSession:
         if vendor:
             print(
                 f"notify characteristic: {vendor[0][0]} (properties={vendor[0][1]}) "
-                "— vendor fallback (ff02 absent)"
+                "— vendor fallback (bucket UUIDs absent)"
             )
             return [vendor[0]]
         raise ProbePlanError(
@@ -698,15 +729,18 @@ class ProbeSession:
     def resolve_write_char(
         self, chars: list[tuple[str, str, list[str]]]
     ) -> None:
-        """Mirror of the production resolution (research 009 §2.2):
-        ff01 known -> vendor writable candidate -> ff03 last resort.
-        The chosen path + properties are PRINTED — the E4 second half
+        """Mirror of the production resolution (spec 010 FR-2): the
+        app's write bucket {ff03, 2215, 2aa6} first, property-blind
+        (research 010 §1); else the vendor writable candidate. The
+        chosen path + properties are PRINTED — the E4 second half
         (which write-resolution line the production log shows)."""
         by_uuid = {uuid: props for _svc, uuid, props in chars}
         uuid: str | None = None
         path = ""
-        if const.UUID_WRITE in by_uuid:
-            uuid, path = const.UUID_WRITE, "known ff01"
+        for bucket_uuid in const.UUID_WRITE_BUCKETS:
+            if bucket_uuid in by_uuid:
+                uuid, path = bucket_uuid, "app bucket (research 010 §1)"
+                break
         if uuid is None:
             writable = [
                 (svc, u, props)
@@ -722,8 +756,6 @@ class ProbeSession:
             pool = [c for c in writable if c[0] in notify_svcs] or writable
             if pool:
                 uuid, path = pool[0][1], "vendor writable candidate"
-        if uuid is None and const.UUID_WRITE_FALLBACK in by_uuid:
-            uuid, path = const.UUID_WRITE_FALLBACK, "ff03 last resort"
         if uuid is None:
             raise ProbePlanError(
                 "no usable write characteristic in the enumerated table"
@@ -734,10 +766,11 @@ class ProbeSession:
         elif "write" in props:
             self.write_mode = True
         else:
-            # Production parity (spec 006 FR-2 last resort): no write
-            # property advertised — try without-response anyway and say
-            # it loudly: a write command here may be silently dropped
-            # (research 009 §4 Q4 — the Phase W datum).
+            # App parity (spec 010 FR-3, research 010 §1/§2.3): the app
+            # writes withoutResponse regardless — no write property
+            # advertised still means without-response, said loudly: a
+            # write command here may be silently dropped (research 009
+            # §4 Q4 — the Phase W datum).
             self.write_mode = False
             print(
                 f"!! write characteristic {uuid} advertises NO write property "
@@ -999,6 +1032,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "  E  experimental frames (research 009 §8) — requires\n"
             "     --experimental AND Phase Q in the same run (contract\n"
             "     009 §4)\n"
+            "  S  the security twin (spec 011 FR-9): after the raw session\n"
+            "     closes, reconnect through the integration's own client\n"
+            "     and run the HA connection test exactly — first read,\n"
+            "     acknowledged probe, pairing ladder, one retry, with the\n"
+            "     same 'security probe:'/'pairing:' verdict lines (contract\n"
+            "     011 §3)\n"
             "\n"
             "The probe NEVER writes registers (contract 009 §7); every TX\n"
             "frame is asserted against the allowlist before it goes out.\n"
@@ -1073,7 +1112,11 @@ async def run_probe(args: argparse.Namespace, plan: list[PhaseSpec]) -> int:
     # bleak installed (tests/test_session_probe.py covers them).
     from bleak import BleakClient
 
-    session = ProbeSession(args, plan)
+    # Spec 011 FR-9: Phase S never runs inside the raw session — it
+    # reconnects through the integration's own client AFTER the raw
+    # link closes (the single-connection rule, spec 006 §9).
+    session_plan = [spec for spec in plan if spec.name != "S"]
+    session = ProbeSession(args, session_plan)
     session.t0 = time.monotonic()
 
     def _on_disconnect(_client) -> None:
@@ -1109,7 +1152,7 @@ async def run_probe(args: argparse.Namespace, plan: list[PhaseSpec]) -> int:
         # CCCD write — the app's own Duration, the integration's
         # SETTLE_AFTER_SUBSCRIBE.
         await asyncio.sleep(const.SETTLE_AFTER_SUBSCRIBE)
-        for spec in plan:
+        for spec in session_plan:
             try:
                 decisive = await session.run_phase(spec)
             except Exception as exc:  # noqa: BLE001 — keep the data we have
@@ -1122,7 +1165,6 @@ async def run_probe(args: argparse.Namespace, plan: list[PhaseSpec]) -> int:
                 print(f"--stop-on-answer: stopping after Phase {spec.name}")
                 break
         session.print_summary()
-        return 1 if aborted else 0
     finally:
         for uuid in notify_uuids:
             try:
@@ -1133,6 +1175,81 @@ async def run_probe(args: argparse.Namespace, plan: list[PhaseSpec]) -> int:
             await client.disconnect()
         except Exception:  # noqa: BLE001
             pass
+    # Spec 011 FR-9: the security twin runs after the raw session's
+    # teardown — never two concurrent links against the unit.
+    if any(spec.name == "S" for spec in plan):
+        return await run_security_phase(args)
+    return 1 if aborted else 0
+
+
+async def run_security_phase(args: argparse.Namespace) -> int:
+    """Phase S (spec 011 FR-9, contract 011 §2): the HA connection test
+    reproduced EXACTLY with a terminal.
+
+    The sequence IS the config-flow test's (contract 011 §2):
+    connect (two attempts) → first read (the 2 s re-send bounds) → on
+    timeout the acknowledged probe → the pairing ladder on a
+    security-class verdict → exactly one retry. It runs through the
+    integration's OWN client seams — import aqua_client, never copy
+    it (tasks 011 §14): the classifier, the ladder and the
+    `security probe:`/`pairing:` verdict lines are the shipped code,
+    so a developer's terminal run and the operator's HA run cannot
+    drift. The client's log lines are mirrored to stdout so the
+    quickstart's paste-back captures everything.
+    """
+    import logging
+
+    import aqua_client  # lazy: the live tool runs with bleak installed
+    import registers
+
+    print(
+        "=== PHASE S: security probe + pairing "
+        "(the HA connection test twin, spec 011 FR-9) ==="
+    )
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger = aqua_client._LOGGER
+    old_level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    client = aqua_client.AquaTempBleClient(args.address)
+    try:
+        await client.connect(max_attempts=2)
+        regs = await client.read_registers(
+            registers.BASE_BLOCK_START, registers.BASE_BLOCK_COUNT,
+            resend_every=2.0, resend_max=3,
+        )
+        print(
+            f"PHASE S verdict: answered on the FIRST read "
+            f"({len(regs)} register(s)) — the unit answers this central; "
+            "contract 011 §6 row 6 applies (spec 009's matrix, 011 stops)"
+        )
+        return 0
+    except aqua_client.AquaTempTimeoutError as first_timeout:
+        regs = await aqua_client.run_security_probe(
+            client, retry_resend_every=2.0, retry_resend_max=3
+        )
+        if regs is None:
+            print(
+                "PHASE S verdict: still no answer — paste every "
+                "'security probe:' and 'pairing:' line above into the "
+                "report (quickstart 011 §5); the decision matrix of "
+                "contract 011 §6 is binding for the follow-up"
+            )
+            return 1
+        print(
+            f"PHASE S verdict: ANSWERED AFTER PAIRING ({len(regs)} "
+            "register(s)) — the case-closed line is above; the bond gate "
+            "is proven (enable pair_on_connect per quickstart 011 §3)"
+        )
+        return 0
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:  # noqa: BLE001
+            pass
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
 
 
 def main(argv: list[str] | None = None) -> int:

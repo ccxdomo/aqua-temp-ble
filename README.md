@@ -177,6 +177,25 @@ data:
 - `tests/test_modbus.py`, `tests/test_reassembly.py` — protocol + reassembly
   unit tests (plain python, no extra deps)
 
+## Next steps — make the unit's write refusal visible (spec 011)
+
+The leading theory for the silent first read is a transport-level write
+gate: the unit accepts notifications from anyone but only accepts *writes*
+from a **paired** central — the owner's phone is paired, the Pi is not, and
+the vendor's own write type (Write Command) has no error channel, so the
+refusal is invisible by ATT design (`specs/011-android-vs-linux-ble/research.md`
+§2.1/§3). The connection test therefore re-sends the base read as an
+*acknowledged* write on a timeout (a security gate then surfaces as a named
+ATT error in the log instead of silence), tries to **pair** the Pi when the
+error says so, and re-asks once; the `pair_on_connect` option stays OFF
+until that test proves the bond gate. The full no-terminal procedure —
+the "bLE" pairing gesture on the panel, the persistence retest, the
+optional phone capture — is `specs/011-android-vs-linux-ble/quickstart.md`:
+run the connection test from the HA UI and paste every `security probe:` /
+`pairing:` log line back (the decision matrix of
+`specs/011-android-vs-linux-ble/contracts/security-probe.md` §6 is binding
+for the follow-up).
+
 ## Troubleshooting
 
 | Symptom | Cause / fix |

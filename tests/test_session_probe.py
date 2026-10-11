@@ -235,7 +235,7 @@ def test_dry_run_text_includes_experimental_frames_when_gated() -> None:
 def test_help_documents_every_phase_and_flag() -> None:
     """AC-3: --help documents every phase and every gate flag."""
     help_text = sp.build_arg_parser().format_help()
-    for phase in ("L", "B", "P", "Q", "W", "E"):
+    for phase in ("L", "B", "P", "Q", "W", "E", "S"):
         assert phase in help_text, help_text
     for flag in (
         "--address", "--phases", "--listen", "--b-window",
@@ -373,6 +373,42 @@ def test_cadence_stats() -> None:
     assert mn == 1.0 and med == 2.0 and mx == 3.0
 
 
+def test_phase_s_valid_last_and_frameless() -> None:
+    """Spec 011 FR-9: Phase S — the security twin — is a valid phase
+    that carries NO raw frames: it runs after the raw probe session
+    closes and reconnects through the integration's OWN client (import
+    the client, never copy it — tasks 011 §14, contract 011 §1). The
+    canonical order puts it LAST regardless of input order, and it is
+    never in the default (the operator path is the HA UI, plan 011
+    §Phase-2; the tool twin is for developers with a terminal)."""
+    assert "S" in sp.PHASE_ORDER
+    # reversed input: canonical ordering still yields S last
+    plan = sp.build_phase_plan(
+        "S,B", experimental=False,
+        listen=30.0, b_window=15.0, poll_every=2.0, poll_count=15,
+    )
+    assert [s.name for s in plan] == ["B", "S"], plan
+    s_spec = plan[-1]
+    assert s_spec.frames == (), s_spec  # no raw frames: the client owns them
+    assert "S" not in sp.DEFAULT_PHASES
+
+
+def test_dry_run_text_includes_security_phase() -> None:
+    """The dry run documents the security twin when S is requested —
+    the same verdict machinery the HA connection test runs (spec 011
+    FR-9; a developer reproduces the HA test exactly)."""
+    plan = sp.build_phase_plan(
+        "B,S", experimental=False,
+        listen=30.0, b_window=15.0, poll_every=2.0, poll_count=15,
+    )
+    text = sp.build_dry_run_text(
+        "08:06:A6:C0:94:1C", plan,
+        write_with_response=False, subscribe_all=False,
+    )
+    assert "PHASE S" in text, text
+    assert "security probe" in text.lower(), text
+
+
 def main() -> int:
     tests = [
         test_default_phase_plan,
@@ -384,6 +420,8 @@ def main() -> int:
         test_every_plan_tx_frame_is_allowed,
         test_dry_run_text_names_phases_frames_and_crcs,
         test_dry_run_text_includes_experimental_frames_when_gated,
+        test_phase_s_valid_last_and_frameless,
+        test_dry_run_text_includes_security_phase,
         test_help_documents_every_phase_and_flag,
         test_probe_boundary_block_prefixes,
         test_probe_boundary_known_echoes,

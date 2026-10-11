@@ -37,12 +37,14 @@ Standalone use (outside Home Assistant, e.g. tools/smoke_client.py):
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
+import re
 import struct
 import time
 from collections import Counter, namedtuple
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Sequence
 
 from bleak import BleakClient, BleakScanner
 
@@ -130,6 +132,154 @@ def _now() -> float:
     return time.monotonic()
 
 
+# --------------------------------------------------------------------------
+# Spec 011 — the security-probe seam and the pairing ladder (research 011
+# §2.1/§10, contract 011 §5). An ATT Write Command has NO error channel
+# (Core Spec 5.4 Part F §3.4.9: response "none", ATT_ERROR_RSP "No") — a
+# server that refuses our write cannot say so (research 011 §2.1 [P]). The
+# acknowledged twin (Write Request) MUST be answered, and the answer
+# names the gate: 0x05/0x0F security, 0x03 permission, 0x01 handle.
+# --------------------------------------------------------------------------
+
+# Contract 011 §5.1 string tables (case-insensitive; space-insensitive
+# too — D-Bus error names arrive as 'NotPermitted'/'NotPaired', their
+# messages as 'Not permitted'). Order matters: "insufficient
+# authorization" (ATT 0x08 → permission) is matched BEFORE the security
+# forms, or its "insufficient auth" prefix would mis-route it
+# (research 011 §10.1 taxonomy).
+_ACK_PERMISSION_STRINGS = (
+    "insufficient authorization",  # ATT 0x08 (contract 011 §5.1)
+    "write not permitted",          # ATT 0x03
+    "not permitted",                # BlueZ/D-Bus shape of 0x03
+    "write not allowed",
+)
+_ACK_SECURITY_STRINGS = (
+    "insufficient authentication",  # ATT 0x05
+    "insufficient encryption",      # ATT 0x0F
+    "insufficient auth",            # older stacks' short form (research 011 §10.1)
+    "not paired",                   # BlueZ status 0x06 (btmon table, research 011 §14.8)
+)
+_ACK_HANDLE_STRINGS = (
+    "invalid handle",  # ATT 0x01
+    "invalid offset",  # ATT 0x04
+)
+
+
+def _classify_ack_write_failure(exc_chain_text: str) -> str:
+    """Pure verdict classifier for acknowledged-write failures (spec
+    011 FR-2 rule 2, contract 011 §5.1 — the research 011 §10.1
+    taxonomy).
+
+    Input: the failure chain text (the AquaTempConnectionError message
+    carries it verbatim, the spec 005 discipline). Output: exactly one
+    verdict — att-error-security / att-error-permission /
+    att-error-handle / local-failure. The fifth §5.1 row,
+    att-accepted-silent, is produced by the request-timeout path, not
+    here. Unknown strings fall to local-failure with the chain logged
+    verbatim by the caller — never guessed.
+    """
+    text = str(exc_chain_text).lower()
+    compact = text.replace(" ", "")
+    for needle in _ACK_PERMISSION_STRINGS:
+        if needle in text or needle.replace(" ", "") in compact:
+            return "att-error-permission"
+    for needle in _ACK_SECURITY_STRINGS:
+        if needle in text or needle.replace(" ", "") in compact:
+            return "att-error-security"
+    for needle in _ACK_HANDLE_STRINGS:
+        if needle in text or needle.replace(" ", "") in compact:
+            return "att-error-handle"
+    return "local-failure"
+
+
+def _pairing_already_bonded(chain_lower: str) -> bool:
+    """BlueZ AlreadyExists / already-paired chains (contract 011 §5.2):
+    the X3 fast no-op — a Pair() against an existing bond."""
+    compact = chain_lower.replace(" ", "")
+    return (
+        "alreadyexists" in compact
+        or "alreadypaired" in compact
+        or "already bonded" in chain_lower
+    )
+
+
+def _pairing_agent_signature(chain: str) -> bool:
+    """True for the missing-agent Pair() failure signatures (contract
+    011 §5.2 row 1, research 011 §10.2/§14.6): 'no … agent' chains and
+    the org.bluez.Error.Failed + agent-mention pattern (the documented
+    failure of an agent-less bluetoothd, research 011 §3.3).
+    Authentication* chains are NOT agent signatures — they carry the
+    bLE choreography guidance instead (contract 011 §5.2)."""
+    lowered = chain.lower()
+    if re.search(r"no [a-z0-9_ ]*agent", lowered):
+        return True
+    return "agent" in lowered and "org.bluez.error.failed" in lowered
+
+
+def _pairing_ble_guidance(chain: str) -> str:
+    """The bLE choreography hint for authentication failures (contract
+    011 §5.2 action): the unit likely wants its pairing mode — hold the
+    panel button 5 s until the display shows 'bLE' blinking (quickstart
+    011 §2). Appended to the failure line so the operator's pasted log
+    carries the next step."""
+    lowered = chain.lower()
+    if any(
+        needle in lowered
+        for needle in (
+            "authenticationfailed",
+            "authenticationrejected",
+            "authenticationtimeout",
+            "authentication failed",
+            "authentication rejected",
+            "authentication timeout",
+        )
+    ):
+        return " — retry while the panel shows bLE (hold the panel button 5 s)"
+    return ""
+
+
+def _kwargs_accepts(func: Any, name: str) -> bool:
+    """True when func accepts a `name` parameter (spec 011 FR-3/FR-6
+    capability check, research 011 §10.1: the pair plumbing moved across
+    bleak/brc API generations, so it is detected with
+    inspect.signature, never assumed). An explicit parameter or a
+    **kwargs sink both count; a broken signature is a polite False."""
+    try:
+        parameters = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return False
+    if name in parameters:
+        return True
+    return any(
+        param.kind is inspect.Parameter.VAR_KEYWORD
+        for param in parameters.values()
+    )
+
+
+def _package_version(name: str) -> str:
+    """Installed package version for the ladder's log lines (contract
+    011 §3.3), 'unknown' when absent or unresolvable — guarded, never
+    raises (the version is context, not a gate)."""
+    try:
+        from importlib import metadata
+
+        return metadata.version(name)
+    except Exception:  # noqa: BLE001 — PackageNotFoundError et al.
+        return "unknown"
+
+
+def _dbus_fast_message() -> Any | None:
+    """The dbus_fast Message class, or None when the library is absent
+    (spec 011 FR-3 rung C / the bond-state read — guarded import, never
+    a requirement; AC-8; test seam for the 011 suite)."""
+    try:
+        from dbus_fast import Message
+
+        return Message
+    except ImportError:
+        return None
+
+
 @dataclass(frozen=True)
 class _ResponseMatch:
     """What may complete the in-flight request (contract 008-B §1).
@@ -181,16 +331,23 @@ def _frame_boundary(buf: bytes) -> int | None:
 
 
 # --------------------------------------------------------------------------
-# Adaptive GATT discovery (the fix for the production incident).
+# App-parity characteristic resolution + adaptive GATT discovery.
 #
-# Production evidence: the user's unit establishes the GATT link in
-# ~2.9 s but does NOT expose ff01 — the historic hard-coded lookup died
-# with "write characteristic 0000ff01-... not found on the device". The
-# unit's real table is unknown (its advertisement exposes no service
-# UUIDs either), so the client now ENUMERATES the table after connect
-# (logged at INFO), resolves the write/notify characteristics
-# adaptively with ff01/ff02 as the FIRST choice, and fails with an
-# error whose MESSAGE lists the real table when nothing usable exists.
+# Spec 010 (research 010 §1-§2, the disassembled vendor app): the app
+# classifies characteristics into a notify bucket {ff02, 2216, 2a00}
+# and a write bucket {ff03, 2215, 2aa6} BY UUID, property-blind — on
+# the production unit (service ff01 hosting ff02+ff03) that resolves
+# to notify = ff02, write = ff03, exactly the pair the runtime census
+# log already showed. The historic "ff01 is the write char" reading
+# was a DEX artifact (research 010 §3; FINDINGS.md §11.3 correction).
+#
+# The client therefore resolves BOTH roles by bucket first (the
+# advertised properties are advisory only, never a disqualification),
+# keeps ENUMERATING the real table after connect (logged at INFO —
+# the E4' evidence), falls back to the adaptive vendor-service scan
+# for unknown GATT layouts (the c8d8260 safety net), and fails with
+# an error whose MESSAGE lists the real table when nothing usable
+# exists.
 
 #: One enumerated GATT characteristic (uuid/handle/properties + the
 #: service that hosts it). Built by _enumerate_gatt, consumed by the
@@ -271,6 +428,10 @@ class AquaTempBleClient:
         self._idle_pushes: list[tuple[int, float]] = []
         self._t_subscribe: float | None = None
         self._idle_summary_logged = False  # one idle summary per connection
+        # Spec 011 FR-4: writes sent for the pending request (the initial
+        # write + every re-send) — the `answered after pairing (<n>
+        # attempt of the window)` line reads it (contract 011 §3.4).
+        self._req_writes = 0
         self._silence_timer: asyncio.TimerHandle | None = None
 
     # ------------------------------------------------------------------ state
@@ -281,6 +442,21 @@ class AquaTempBleClient:
     @property
     def is_connected(self) -> bool:
         return self._client is not None and bool(self._client.is_connected)
+
+    @property
+    def write_uuid(self) -> str:
+        """The resolved write characteristic UUID (spec 011: the security
+        probe's log line names the exact pipe it tested — contract 011
+        §3.1)."""
+        return self._write_uuid or const.UUID_WRITE
+
+    @property
+    def last_request_write_count(self) -> int:
+        """Writes sent for the most recent request (spec 011 FR-4): the
+        `security probe: answered after pairing (<n> attempt of the
+        window)` line reads it (contract 011 §3.4) — the initial write
+        plus every re-send that went out before the answer."""
+        return self._req_writes
 
     # ------------------------------------------------------------ connection
     def _load_retry_connector(self) -> Any | None:
@@ -300,7 +476,7 @@ class AquaTempBleClient:
             return None
         return bleak_retry_connector
 
-    async def connect(self, max_attempts: int = 2) -> None:
+    async def connect(self, max_attempts: int = 2, pair: bool = False) -> None:
         """Resolve the device, connect and subscribe to the notify characteristic.
 
         max_attempts is the bleak-retry-connector attempt budget: the
@@ -312,6 +488,14 @@ class AquaTempBleClient:
         (research 005 §3.2) — and connect() now additionally sleeps
         SETTLE_AFTER_SUBSCRIBE after subscribing (spec 006 FR-1), so
         callers' budget math must count both.
+
+        pair (spec 011 FR-6, contract 011 §3.5): requests pairing at the
+        establish call — the pair_on_connect option's threading, OFF by
+        default and earned only by the connection test's X2/X3 evidence
+        (quickstart 011 §2). A backend that cannot pair logs a WARNING
+        and connects WITHOUT pairing: the option must never break the
+        poll path (FR-7); with pair=False the behavior is
+        byte-for-byte today's.
 
         Home Assistant path: bleak_retry_connector.establish_connection() —
         retried connects with per-failure backoff, stale bluez connection
@@ -337,6 +521,12 @@ class AquaTempBleClient:
         """
         if self.is_connected:
             return
+        if pair:
+            # Contract 011 §3.5: the option path's DEBUG marker — the
+            # pair_on_connect evidence-gated lever (spec 011 FR-6).
+            _LOGGER.debug(
+                "connect with pairing requested (option pair_on_connect)"
+            )
         # Stage "resolve" boundaries (spec 007 FR-1, research 007 §8):
         # t0 is connect()'s entry, t_resolve the moment the device was
         # obtained — the summary's first stage duration.
@@ -348,51 +538,14 @@ class AquaTempBleClient:
                 f"no Aqua Temp device found for address {self._address}"
             )
         try:
-            brc = self._load_retry_connector()
-            if brc is not None:
-                # max_attempts is the caller's probe budget (2 for the
-                # coordinator, 2 for the config-flow test since spec 006
-                # FR-3); transient errors (bluez slots, EOF, BrokenPipe)
-                # still get extra retries with backoff inside the library.
-                # timeout=const.CONNECT_TIMEOUT is a CONSTRUCTOR-ONLY
-                # kwarg: brc hardcodes the connect attempt to
-                # BLEAK_TIMEOUT = 20.0 s (research 005 §3.2), so the
-                # constant is dead for connects inside Home Assistant —
-                # it only bounds the standalone raw-client path below.
-                # Attempt-window transparency (spec 007 FR-2, research
-                # 007 §4): max_attempts exhausted 20 s windows are the
-                # arithmetic the production ">40 s" failure is made of —
-                # logged BEFORE the call so a hanging connect is
-                # self-explaining in our own log at INFO (contract 007
-                # §2.1). The 20.0 is brc's hardcoded BLEAK_TIMEOUT,
-                # deliberately not one of our constants.
-                _LOGGER.info(
-                    "connecting to %s: up to %d connect attempt(s) of %.0f s "
-                    "each (bleak-retry-connector BLEAK_TIMEOUT, research 007 §4)",
-                    self._address,
-                    max_attempts,
-                    20.0,
-                )
-                client: BleakClient = await brc.establish_connection(
-                    BleakClient,
-                    device,
-                    name=self._name or getattr(device, "name", "") or self._address,
-                    disconnected_callback=self._on_disconnect,
-                    max_attempts=max_attempts,
-                    timeout=const.CONNECT_TIMEOUT,
-                )
-            else:
-                # Attempt-window line, standalone twin (spec 007 FR-2,
-                # research 007 §4): the raw fallback loops exactly twice,
-                # const.CONNECT_TIMEOUT per attempt (contract 007 §2.1
-                # standalone variant).
-                _LOGGER.info(
-                    "connecting to %s: up to 2 connect attempt(s) of %.0f s "
-                    "each (raw bleak, const.CONNECT_TIMEOUT)",
-                    self._address,
-                    const.CONNECT_TIMEOUT,
-                )
-                client = await self._connect_with_raw_client(device)
+            # Spec 011: the establish half lives in _establish_connection
+            # (capability-checked pair threading, research 011 §10.1);
+            # the brc/raw branches and their attempt-window INFO lines
+            # (contract 007 §2.1) moved there VERBATIM — same code, same
+            # log formats, one extra caller (the pairing ladder's rung B).
+            client: BleakClient = await self._establish_connection(
+                device, max_attempts=max_attempts, pair=pair
+            )
         except Exception as exc:  # noqa: BLE001
             # Connect-stage failure (spec 007 FR-1, contract 007 §3.1,
             # research 007 §8): the elapsed is measured from connect()
@@ -411,6 +564,112 @@ class AquaTempBleClient:
         # Stage "connect" completed (spec 007 FR-1, research 007 §8):
         # link + BlueZ GATT discovery inside bleak's window are done.
         t_connect = _now()
+        # Spec 011 FR-3: the post-connect half lives in _post_connect_setup
+        # (contract 009 §1 order, the 007 stage/summary lines verbatim) —
+        # one more caller needs it: the pairing ladder's rung B, which
+        # re-establishes the link with pairing and must run the SAME
+        # setup (research 011 §10.1).
+        await self._post_connect_setup(
+            client, device, t0=t0, t_resolve=t_resolve, t_connect=t_connect
+        )
+
+    async def _establish_connection(
+        self, device: Any, *, max_attempts: int, pair: bool = False
+    ) -> BleakClient:
+        """The establish half of connect() — brc inside Home Assistant,
+        raw BleakClient standalone (contract 007 §2.1 lines verbatim).
+
+        Spec 011 FR-3 rung B / FR-6: pair=True requests pairing at the
+        establish call when the installed backend accepts the kwarg
+        (capability check with inspect.signature, research 011 §10.1 —
+        never assumed across API generations); a backend that cannot
+        pair logs a WARNING and connects WITHOUT pairing — the option
+        must never break the poll path (contract 011 §7).
+        """
+        brc = self._load_retry_connector()
+        pair_supported = False
+        if pair:
+            target = brc.establish_connection if brc is not None else BleakClient
+            pair_supported = _kwargs_accepts(target, const.PAIR_ENABLE_PROP)
+            if pair_supported:
+                _LOGGER.debug(
+                    "establish path accepts the %s kwarg (research 011 §10.1)",
+                    const.PAIR_ENABLE_PROP,
+                )
+            else:
+                _LOGGER.warning(
+                    "pairing was requested (option pair_on_connect) but the "
+                    "installed %s does not accept the pair parameter — "
+                    "connecting WITHOUT pairing (spec 011 FR-6/FR-7; "
+                    "research 011 §10.1)",
+                    "bleak-retry-connector" if brc is not None else "bleak",
+                )
+        if brc is not None:
+            # max_attempts is the caller's probe budget (2 for the
+            # coordinator, 2 for the config-flow test since spec 006
+            # FR-3); transient errors (bluez slots, EOF, BrokenPipe)
+            # still get extra retries with backoff inside the library.
+            # timeout=const.CONNECT_TIMEOUT is a CONSTRUCTOR-ONLY
+            # kwarg: brc hardcodes the connect attempt to
+            # BLEAK_TIMEOUT = 20.0 s (research 005 §3.2), so the
+            # constant is dead for connects inside Home Assistant —
+            # it only bounds the standalone raw-client path below.
+            # Attempt-window transparency (spec 007 FR-2, research
+            # 007 §4): max_attempts exhausted 20 s windows are the
+            # arithmetic the production ">40 s" failure is made of —
+            # logged BEFORE the call so a hanging connect is
+            # self-explaining in our own log at INFO (contract 007
+            # §2.1). The 20.0 is brc's hardcoded BLEAK_TIMEOUT,
+            # deliberately not one of our constants.
+            _LOGGER.info(
+                "connecting to %s: up to %d connect attempt(s) of %.0f s "
+                "each (bleak-retry-connector BLEAK_TIMEOUT, research 007 §4)",
+                self._address,
+                max_attempts,
+                20.0,
+            )
+            kwargs: dict[str, Any] = dict(
+                name=self._name or getattr(device, "name", "") or self._address,
+                disconnected_callback=self._on_disconnect,
+                max_attempts=max_attempts,
+                timeout=const.CONNECT_TIMEOUT,
+            )
+            if pair and pair_supported:
+                kwargs[const.PAIR_ENABLE_PROP] = True
+            return await brc.establish_connection(BleakClient, device, **kwargs)
+        # Attempt-window line, standalone twin (spec 007 FR-2,
+        # research 007 §4): the raw fallback loops exactly twice,
+        # const.CONNECT_TIMEOUT per attempt (contract 007 §2.1
+        # standalone variant).
+        _LOGGER.info(
+            "connecting to %s: up to 2 connect attempt(s) of %.0f s "
+            "each (raw bleak, const.CONNECT_TIMEOUT)",
+            self._address,
+            const.CONNECT_TIMEOUT,
+        )
+        return await self._connect_with_raw_client(
+            device, pair=pair and pair_supported
+        )
+
+    async def _post_connect_setup(
+        self,
+        client: BleakClient,
+        device: Any,
+        *,
+        t0: float,
+        t_resolve: float,
+        t_connect: float,
+    ) -> None:
+        """The post-connect half of connect(): enumerate → subscribe →
+        write-char resolve → settle (contract 009 §1 order, spec 011 FR-3).
+
+        Factored out so the pairing ladder's rung B can re-run the
+        IDENTICAL setup after a pair-enabled re-establishment — same
+        code, same 007 stage/summary log formats (spec 011 FR-7:
+        byte-identical, still greppable). Raises on failure after
+        tearing the half-open client down, exactly as connect() always
+        did; connect() wraps the establish half, this owns the rest.
+        """
         self._client = client
         # Post-connect stage boundaries (spec 007 FR-1, contract 007
         # §3.2): None until completed, so the failure handler can name
@@ -442,13 +701,16 @@ class AquaTempBleClient:
             self._idle_summary_logged = False
             self._resolve_write_characteristic(client)
             t_write_char = _now()
-            # Vendor parity (research 006 §2 step 4): give the module a
-            # beat to route ff02 notifications after the CCCD write
-            # before the first Modbus frame (spec 006 FR-1). Inside this
-            # try block on purpose — a setup failure here must tear down
-            # the half-open client like any other (a cancelled sleep is
-            # handled by the caller's task teardown, spec 005's
-            # cancellation contract).
+            # Vendor parity (research 006 §2 step 4; proven again by
+            # the app disassembly, research 010 §2): the app order is
+            # subscribe ff02 → 2 s → write ff03 → listen — give the
+            # module a beat to route ff02 notifications after the
+            # CCCD write before the first Modbus frame (spec 006 FR-1;
+            # the proven sequence must not be "fixed" later). Inside
+            # this try block on purpose — a setup failure here must
+            # tear down the half-open client like any other (a
+            # cancelled sleep is handled by the caller's task teardown,
+            # spec 005's cancellation contract).
             await asyncio.sleep(const.SETTLE_AFTER_SUBSCRIBE)
             t_settle = _now()
         except AquaTempError as exc:
@@ -515,18 +777,26 @@ class AquaTempBleClient:
             self._name or getattr(device, "name", "") or "",
         )
 
-    async def _connect_with_raw_client(self, device: Any) -> BleakClient:
+    async def _connect_with_raw_client(
+        self, device: Any, pair: bool = False
+    ) -> BleakClient:
         """Standalone fallback: raw BleakClient with the historic 2-attempt
         loop. Used only when bleak_retry_connector is not installed
         (standalone tools / tests, no Home Assistant).
+
+        Spec 011 FR-3 rung B / FR-6: pair=True flows into the bleak
+        constructor when this bleak generation accepts it (the caller
+        capability-checked — research 011 §10.1).
         """
         last_exc: Exception | None = None
         for attempt in (1, 2):
-            client = BleakClient(
-                device,
+            ctor_kwargs: dict[str, Any] = dict(
                 disconnected_callback=self._on_disconnect,
                 timeout=const.CONNECT_TIMEOUT,
             )
+            if pair:
+                ctor_kwargs[const.PAIR_ENABLE_PROP] = True
+            client = BleakClient(device, **ctor_kwargs)
             try:
                 # Constructor timeout is the canonical path in bleak
                 # >= 0.21; the kwarg is kept for older bleak, which reads
@@ -598,6 +868,230 @@ class AquaTempBleClient:
         _LOGGER.warning("BLE connection to %s lost", self._address)
         self._cancel_silence_timer()
         self._fail_pending(AquaTempConnectionError(f"connection to {self._address} lost"))
+
+    # -------------------------------------------- pairing ladder (spec 011)
+    async def pair(self) -> str:
+        """The pairing ladder (spec 011 FR-3, contract 011 §3).
+
+        Rungs, least intrusive first, each logged (research 011 §10.1):
+          A — the bleak client's pair() method (the bleak < 1.0 shape);
+          B — re-establish the connection with pairing requested
+              (brc establish_connection(pair=True) / BleakClient(pair=True),
+              the bleak >= 1.0 shape) + the normal post-connect setup;
+          C — register the minimal NoInputNoOutput BlueZ agent (module
+              agent.py over dbus_fast, bleak's own D-Bus dependency) and
+              retry the taken rung exactly once — the documented fix for
+              the agent-less bluetoothd Pair() failure (research 011
+              §10.2/§3.3).
+
+        Returns one of "succeeded" | "skipped" (already bonded) |
+        "failed" | "unavailable" and NEVER raises: a pairing failure
+        must not break the caller (contract 011 §2/§7 — the config test
+        routes on the status and the retry read follows success/skipped
+        only, FR-4). The bond state is logged before/after (best-effort,
+        contract 011 §3.6). Only ever called from the config-test stages
+        or behind the pair_on_connect option — never from a poll loop
+        (contract 011 §1.5).
+        """
+        bleak_version = _package_version("bleak")
+        brc = self._load_retry_connector()
+        brc_version = (
+            _package_version("bleak-retry-connector") if brc is not None else None
+        )
+        _LOGGER.info("pairing: bond state before: %s", await self._read_bond_state())
+        pair_method = None
+        if self._client is not None:
+            candidate = getattr(self._client, "pair", None)
+            pair_method = candidate if callable(candidate) else None
+        chain = ""
+        if pair_method is not None:
+            _LOGGER.info(
+                "pairing: attempting via rung A (bleak pair method) "
+                "(bleak=%s, brc=%s)",
+                bleak_version,
+                brc_version or "absent",
+            )
+            result, chain = await self._call_pair_method_once(pair_method)
+        else:
+            _LOGGER.info(
+                "pairing: attempting via rung B (reconnect with pair=True) "
+                "(bleak=%s, brc=%s)",
+                bleak_version,
+                brc_version or "absent",
+            )
+            result, chain = await self._pair_via_reconnect()
+        if result == "failed" and _pairing_agent_signature(chain):
+            result, chain = await self._rung_c_retry(
+                pair_method,
+                bleak_version=bleak_version,
+                brc_version=brc_version,
+            )
+        _LOGGER.info("pairing: bond state after: %s", await self._read_bond_state())
+        return result
+
+    async def _call_pair_method_once(self, pair_method: Any) -> tuple[str, str]:
+        """Rung A: ONE bounded bleak pair() call (const.PAIR_TIMEOUT — a
+        D-Bus Pair() can legitimately take seconds, research 011 §10.1).
+        The failure chain is logged verbatim (the §5.2 signatures are
+        read from it); AlreadyExists-class outcomes are the X3 no-op.
+        """
+        try:
+            await asyncio.wait_for(pair_method(), const.PAIR_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001 — the chain IS the datum
+            chain = exc_chain(exc)
+            if _pairing_already_bonded(chain.lower()):
+                _LOGGER.info("pairing: skipped: already bonded")
+                return "skipped", chain
+            _LOGGER.info(
+                "pairing: failed: %s%s", chain, _pairing_ble_guidance(chain)
+            )
+            return "failed", chain
+        _LOGGER.info("pairing: succeeded")
+        return "succeeded", ""
+
+    async def _pair_via_reconnect(self) -> tuple[str, str]:
+        """Rung B: tear down, re-establish with pairing requested, then
+        re-run the normal post-connect setup (spec 011 FR-3 rung 2,
+        research 011 §10.1 — bleak >= 1.0 moved pairing into the
+        establish call). The capability check runs BEFORE any teardown:
+        an incapable backend is 'unavailable', never a broken link.
+        """
+        brc = self._load_retry_connector()
+        supported = _kwargs_accepts(
+            brc.establish_connection if brc is not None else BleakClient,
+            const.PAIR_ENABLE_PROP,
+        )
+        if not supported:
+            reason = (
+                "the installed bleak-retry-connector does not accept the "
+                "pair parameter"
+                if brc is not None
+                else "this bleak build exposes neither a pair method nor "
+                "a pair constructor parameter"
+            )
+            _LOGGER.info(
+                "pairing: unavailable: %s (research 011 §10.1)", reason
+            )
+            return "unavailable", ""
+        try:
+            await self.disconnect()
+            t_b = _now()
+            device = await self._resolve_device()
+            t_resolve = _now()
+            if device is None:
+                raise AquaTempDeviceNotFoundError(
+                    f"no Aqua Temp device found for address {self._address}"
+                )
+            client = await self._establish_connection(device, max_attempts=2, pair=True)
+            t_connect = _now()
+            await self._post_connect_setup(
+                client, device, t0=t_b, t_resolve=t_resolve, t_connect=t_connect
+            )
+        except Exception as exc:  # noqa: BLE001 — the chain stays verbatim
+            chain = exc_chain(exc)
+            if _pairing_already_bonded(chain.lower()):
+                _LOGGER.info("pairing: skipped: already bonded")
+                return "skipped", chain
+            _LOGGER.info(
+                "pairing: failed: %s%s", chain, _pairing_ble_guidance(chain)
+            )
+            return "failed", chain
+        _LOGGER.info("pairing: succeeded")
+        return "succeeded", ""
+
+    async def _rung_c_retry(
+        self, pair_method: Any, *, bleak_version: str, brc_version: str | None
+    ) -> tuple[str, str]:
+        """Rung C: register the minimal BlueZ agent, retry the taken rung
+        exactly once, always release the agent in the finally (contract
+        011 §3/§7). Import and registration are guarded — an ImportError
+        or a failed registration is 'unavailable', never an exception
+        (AC-8; research 011 §10.2).
+        """
+        _LOGGER.info(
+            "pairing: attempting via rung C (minimal BlueZ agent, "
+            "NoInputNoOutput, then one rung retry) (bleak=%s, brc=%s)",
+            bleak_version,
+            brc_version or "absent",
+        )
+        bluez_agent = None
+        try:
+            try:
+                from . import agent as bluez_agent  # package (Home Assistant)
+            except ImportError:
+                import agent as bluez_agent  # standalone (tools/tests)
+        except ImportError:  # pragma: no cover — agent.py is stdlib-only
+            bluez_agent = None
+        if bluez_agent is None or not getattr(
+            bluez_agent, "DBUS_FAST_AVAILABLE", False
+        ):
+            _LOGGER.debug(
+                "rung C unavailable: the agent module/dbus_fast import "
+                "failed (spec 011 FR-3)"
+            )
+            _LOGGER.info(
+                "pairing: unavailable: no pairing agent could be "
+                "registered (dbus_fast not available)"
+            )
+            return "unavailable", ""
+        bus = await bluez_agent.register_agent()
+        if bus is None:
+            _LOGGER.info(
+                "pairing: unavailable: agent registration failed on this "
+                "bluetoothd"
+            )
+            return "unavailable", ""
+        try:
+            if pair_method is not None:
+                return await self._call_pair_method_once(pair_method)
+            return await self._pair_via_reconnect()
+        finally:
+            await bluez_agent.unregister_agent(bus)
+
+    async def _read_bond_state(self) -> str:
+        """Best-effort BlueZ Paired property read (contract 011 §3.6,
+        research 011 §10.1): 'paired', 'not paired', or 'unknown'.
+
+        Reaches through the bleak backend's device path and D-Bus bus
+        (both introspected, never assumed); any failure — no backend,
+        no path, no bus, dbus_fast absent, a D-Bus error — degrades to
+        'unknown' with a DEBUG line: the bond check is diagnostics,
+        never a gate (contract 011 §7)."""
+        client = self._client
+        if client is None:
+            return "unknown"
+        try:
+            backend = getattr(client, "_backend", None) or client
+            path = getattr(backend, "_device_path", None)
+            bus = getattr(backend, "_bus", None)
+            if not path or bus is None:
+                return "unknown"
+            message_cls = _dbus_fast_message()
+            if message_cls is None:
+                return "unknown"
+            reply = await bus.call(
+                message_cls(
+                    destination="org.bluez",
+                    path=path,
+                    interface="org.freedesktop.DBus.Properties",
+                    member="Get",
+                    signature="ss",
+                    body=["org.bluez.Device1", "Paired"],
+                )
+            )
+            value = (
+                reply.body[0]
+                if reply and getattr(reply, "body", None)
+                else None
+            )
+            if hasattr(value, "value"):  # dbus-fast Variant shape
+                value = value.value
+            return "paired" if value else "not paired"
+        except Exception as exc:  # noqa: BLE001 — diagnostics only
+            _LOGGER.debug(
+                "bond state read failed: %s: %s", type(exc).__name__, exc
+            )
+            return "unknown"
 
     # --------------------------------------------- adaptive GATT discovery
     @staticmethod
@@ -789,29 +1283,103 @@ class AquaTempBleClient:
         return None
 
     def _set_write_mode_from_properties(self, uuid: str, props: list[str]) -> None:
-        """Property-gated write mode (spec 006 FR-2), unchanged rule.
+        """App-parity write mode (spec 010 FR-3, research 010 §2.3).
 
-        Vendor parity (research 006 §2.1): the app writes WITHOUT
-        response. write-without-response first, write (with response)
-        fallback, hard error when the characteristic offers neither —
-        never guess a mode the GATT table does not advertise.
+        The vendor app's write wrapper is the ONLY write path in its
+        whole Dart binary and uses exactly ONE WriteType instance:
+        withoutResponse (no withResponse exists in the object pool at
+        all). So without-response is the default, and the only legal
+        divergence is the ATT-layer constraint: a characteristic
+        advertising ONLY 'write' forbids Write Commands, so it must be
+        written with response. A characteristic with NO write property
+        at all is still written without response — the app,
+        property-blind (research 010 §1), would do exactly that — with
+        a WARNING naming the anomaly. Properties are advisory: never a
+        refusal, never a re-pick (FR-2 item 2).
         """
         if "write-without-response" in props:
-            # Vendor parity: the app writes WITHOUT response
-            # (WriteType.withoutResponse in its write path, research 006 §2.1).
+            # App parity: the app always writes WITHOUT response
+            # (WriteType.withoutResponse, research 006 §2.1 / 010 §2.3).
             self._write_with_response = False
         elif "write" in props:
+            # ATT constraint (FR-3): a 'write'-only characteristic
+            # cannot take Write Commands — with-response is the only
+            # legal mode; the WARNING makes the divergence visible.
+            _LOGGER.warning(
+                "write characteristic %s forbids write-without-response "
+                "(properties=%s); using write-with-response",
+                uuid,
+                props,
+            )
             self._write_with_response = True
         else:
-            raise AquaTempConnectionError(
-                f"write characteristic {uuid} has no usable write property"
+            # App parity (FR-2 item 2 / FR-3): write anyway — the app
+            # picks by UUID and never reads properties first; a GATT
+            # refusal would belong to the write itself, on the wire.
+            _LOGGER.warning(
+                "write characteristic %s advertises no write property "
+                "(properties=%s) — app parity: writing anyway",
+                uuid,
+                props,
             )
+            self._write_with_response = False
+
+    def _log_property_advisory(self, role: str, uuid: str, props: list[str]) -> None:
+        """FR-2 item 2 advisory for the NOTIFY bucket pass (spec 010).
+
+        The app is property-blind: when a bucket characteristic lacks
+        the role's property, WARN — never refuse, never re-pick. The
+        WRITE role's advisories are emitted by
+        _set_write_mode_from_properties together with the mode
+        decision (single authority, never logged twice).
+        """
+        if role != "notify":
+            return  # write advisories live in _set_write_mode_from_properties
+        if "notify" in props or "indicate" in props:
+            return
+        _LOGGER.warning(
+            "notify characteristic %s advertises no notify property "
+            "(properties=%s) — app parity: subscribing anyway",
+            uuid,
+            props,
+        )
+
+    def _resolve_from_buckets(
+        self, client: BleakClient, buckets: Sequence[str], role: str
+    ) -> tuple[str, list[str]] | None:
+        """App-parity bucket pass (spec 010 FR-2 item 1, research 010 §1).
+
+        Walks the role's UUID bucket tuple in order and returns the
+        first UUID the device exposes as a characteristic, with its
+        advertised properties — the vendor app's own rule: its
+        discovery classifier (closure 0xa146dc) stores the matched
+        characteristic objects (state fields 0x2b notify / 0x2f write)
+        from the UUID match alone, never reading the properties first.
+        Works through direct UUID lookups, so it needs no enumerable
+        services object. Properties are ADVISORY only (the advisory
+        WARNING fires here for notify; the write mode + its advisories
+        are decided by _set_write_mode_from_properties).
+        """
+        for uuid in buckets:
+            char = self._lookup_char(client, uuid)
+            if char is not None:
+                props = self._char_props(char)
+                self._log_property_advisory(role, uuid, props)
+                return uuid, props
+        return None
 
     def _resolve_notify_characteristic(self, client: BleakClient) -> None:
-        """Pick the notify characteristic: ff02 first, then fallback.
+        """Pick the notify characteristic: the app's UUID bucket first,
+        then the adaptive fallbacks (spec 010 FR-2).
 
         Strategy, in order:
-          a. the known UUID_NOTIFY (ff02) when the device exposes it;
+          a. the app's notify bucket (UUID_NOTIFY_BUCKETS = ff02, 2216,
+             2a00 — research 010 §1.1/§1.3), property-BLIND: the first
+             UUID the device exposes wins, exactly as the vendor app's
+             discovery classifier stores its notify char (state field
+             0x2b). A bucket char advertising no notify property is
+             subscribed ANYWAY with a WARNING (FR-2 item 2) — the app
+             never reads properties here;
           b. a notify/indicate characteristic of the SAME service as
              the write candidate (the vendor data service), else of any
              vendor-specific service — standard SIG services (battery
@@ -819,13 +1387,22 @@ class AquaTempBleClient:
              would deliver non-Modbus chunks forever;
           c. explicit AquaTempConnectionError whose MESSAGE lists the
              real table.
-        An alternative choice is announced at INFO: 'using notify
-        characteristic <uuid> (properties=...)'. Runs BEFORE start_notify
-        so a resolution failure precedes any subscription.
+        The classic ff02 pick is silent (byte-identical to the historic
+        behaviour); any other choice is announced at INFO: 'using
+        notify characteristic <uuid> (properties=...)'. Runs BEFORE
+        start_notify so a resolution failure precedes any subscription.
         """
-        char = self._lookup_char(client, const.UUID_NOTIFY)
-        if char is not None:
-            self._notify_uuid = const.UUID_NOTIFY
+        bucket = self._resolve_from_buckets(client, const.UUID_NOTIFY_BUCKETS, "notify")
+        if bucket is not None:
+            uuid, _props = bucket
+            self._notify_uuid = uuid
+            if uuid != const.UUID_NOTIFY:
+                _LOGGER.info(
+                    "using notify characteristic %s (properties=%s) on %s",
+                    uuid,
+                    _props,
+                    self._address,
+                )
             return
         chars = self._gatt_chars or []
         candidates = [
@@ -854,38 +1431,47 @@ class AquaTempBleClient:
         )
 
     def _resolve_write_characteristic(self, client: BleakClient) -> None:
-        """Pick the write characteristic: ff01 first, then fallbacks.
+        """Pick the write characteristic: the app's UUID bucket first,
+        then the adaptive fallbacks (spec 010 FR-2/FR-3).
 
         Strategy, in order:
-          a. the known UUID_WRITE (ff01) when the device exposes it —
-             the mode stays property-gated (spec 006 FR-2), including
-             the loud error when ff01 advertises no write property
-             (spec 006 AC-2 pins that behaviour);
+          a. the app's write bucket (UUID_WRITE_BUCKETS = ff03, 2215,
+             2aa6 — research 010 §1.1/§1.3), property-BLIND, first
+             match wins: the vendor app's discovery classifier stores
+             its write char (state field 0x2f) from the UUID match
+             alone, and its sender REFUSES to run without it (research
+             010 §2.2). The write mode then follows FR-3
+             (without-response unless the char advertises only
+             'write'); a bucket char with no write property at all is
+             written anyway, with a WARNING — the app would do the same;
           b. a vendor-service writable characteristic
-             (_find_write_candidate);
-          c. ff03 (UUID_WRITE_FALLBACK, handle 2215 — role unknown,
-             FINDINGS §11.3) as the last-resort candidate, even when it
-             advertises no write property: a refused GATT write fails
-             loudly at the first request instead of the integration
-             dying at connect;
-          d. explicit AquaTempConnectionError whose MESSAGE lists the
+             (_find_write_candidate) — the unchanged c8d8260 adaptive
+             safety net for GATT layouts outside the app's buckets: a
+             characteristic ff01 can only ever be picked HERE (the app
+             never selects it, research 010 §1.3);
+          c. explicit AquaTempConnectionError whose MESSAGE lists the
              real table.
-        An alternative choice is announced at INFO: 'using write
-        characteristic <uuid> (properties=...)'.
+        The choice is ALWAYS announced at INFO: 'using write
+        characteristic <uuid> (properties=...)' — the E4' evidence
+        line (quickstart 010 §0); on the production unit it reads
+        byte-identical to the ce41aa5 census line.
         """
-        # (a) Known UUID — unchanged historic behaviour.
-        char = self._lookup_char(client, const.UUID_WRITE)
-        if char is not None:
-            props = self._char_props(char)
-            self._set_write_mode_from_properties(const.UUID_WRITE, props)
-            self._write_uuid = const.UUID_WRITE
-            _LOGGER.debug(
-                "ff01 properties %s -> write_with_response=%s",
+        # (a) App-parity bucket pass — direct UUID lookups, so it works
+        # even when the table cannot be enumerated.
+        bucket = self._resolve_from_buckets(client, const.UUID_WRITE_BUCKETS, "write")
+        if bucket is not None:
+            uuid, props = bucket
+            self._set_write_mode_from_properties(uuid, props)
+            self._write_uuid = uuid
+            _LOGGER.info(
+                "using write characteristic %s (properties=%s) on %s",
+                uuid,
                 props,
-                self._write_with_response,
+                self._address,
             )
             return
-        # (b) Vendor-service writable characteristic.
+        # (b) Vendor-service writable characteristic (the adaptive
+        # safety net for unknown layouts — unchanged).
         candidate = self._find_write_candidate()
         if candidate is not None:
             self._set_write_mode_from_properties(candidate.uuid, candidate.properties)
@@ -897,37 +1483,7 @@ class AquaTempBleClient:
                 self._address,
             )
             return
-        # (c) ff03 last resort (works even without an enumerable table).
-        char = self._lookup_char(client, const.UUID_WRITE_FALLBACK)
-        if char is not None:
-            props = self._char_props(char)
-            self._write_uuid = const.UUID_WRITE_FALLBACK
-            if "write-without-response" in props:
-                self._write_with_response = False
-            elif "write" in props:
-                self._write_with_response = True
-            else:
-                # Last resort: ff03 exists but advertises no write
-                # property — its role was never confirmed (FINDINGS
-                # §11.3). Try it anyway (a refused GATT write fails
-                # loudly at the first request) with the vendor-parity
-                # mode: without response (research 006 §2.1).
-                self._write_with_response = False
-                _LOGGER.warning(
-                    "write characteristic %s (properties=%s) does not "
-                    "advertise a write property; using it as the "
-                    "last-resort candidate",
-                    const.UUID_WRITE_FALLBACK,
-                    props,
-                )
-            _LOGGER.info(
-                "using write characteristic %s (properties=%s) on %s",
-                const.UUID_WRITE_FALLBACK,
-                props,
-                self._address,
-            )
-            return
-        # (d) Nothing usable: explicit error carrying the real table.
+        # (c) Nothing usable: explicit error carrying the real table.
         raise AquaTempConnectionError(
             "no usable write characteristic on the device "
             f"(known UUID {const.UUID_WRITE} absent; {self._format_gatt_table()})"
@@ -1066,14 +1622,26 @@ class AquaTempBleClient:
         return chosen
 
     # -------------------------------------------------------- request/response
-    async def _write_frame(self, frame: bytes) -> None:
+    async def _write_frame(
+        self, frame: bytes, *, force_response: bool = False
+    ) -> None:
         """Transport seam — send a raw frame on the resolved write
-        characteristic (ff01 on documented units; an adaptively
-        discovered UUID otherwise). (Overridden in tests.)"""
+        characteristic (ff03 on the documented units — the app's write
+        bucket head, research 010 §1; an adaptively discovered UUID
+        otherwise). (Overridden in tests; the overrides accept the
+        force_response kwarg since spec 011 — tasks 011 §3.)
+
+        Spec 011 FR-1: force_response=True writes the SAME bytes as an
+        ATT Write Request (response=True) — the acknowledged twin that
+        turns the unit's silent refusal into an ATT error (research 011
+        §2.1: a Write Command has no error channel by Core-Spec design;
+        the probe is the X1 experiment, research 011 §12). The byte
+        payload is NEVER touched by this flag (AC-2: the frame
+        allowlist and the vendor parity stand)."""
         await self._client.write_gatt_char(
             self._write_uuid or const.UUID_WRITE,
             bytes(frame),
-            response=self._write_with_response,
+            response=True if force_response else self._write_with_response,
         )
 
     async def _request(
@@ -1084,6 +1652,7 @@ class AquaTempBleClient:
         *,
         resend_every: float | None = None,
         resend_max: int = 0,
+        force_response: bool = False,
     ) -> bytes:
         """Send one frame and await the complete, matching response.
 
@@ -1098,6 +1667,15 @@ class AquaTempBleClient:
         inside the SAME timeout window (single-flight untouched: one
         pending request; the loop only re-writes). Used only by the
         config-flow connection test (NFR-3).
+
+        Spec 011 FR-1: force_response=True writes the frame as an
+        acknowledged ATT Write Request — the security probe's seam
+        (research 011 §2.1). A failure of the acknowledged write raises
+        AquaTempConnectionError("acknowledged write failed: <chain>") —
+        a NEW, distinguishable message carrying the chain verbatim so
+        the ATT error text survives to the log and the verdict
+        classifier (contract 011 §5.1); the without-response wrapper
+        below stays byte-identical (spec 005).
         """
         if self._pending is not None and not self._pending.done():
             raise AquaTempError("another request is already in flight")
@@ -1109,6 +1687,7 @@ class AquaTempBleClient:
         self._req_rx_bytes = 0
         self._req_frame_count = 0
         self._req_block_starts = []
+        self._req_writes = 0  # spec 011 FR-4: the request's write counter
         # Spec 009 FR-1 (plan 009 §2.2): stamp the request start and
         # reset the per-request census timing — _census_frame renders
         # its t+ offsets relative to _req_t0 and updates
@@ -1124,19 +1703,33 @@ class AquaTempBleClient:
         done: asyncio.Event | None = None
         try:
             try:
-                await self._write_frame(frame)
+                await self._write_frame(frame, force_response=force_response)
+                self._req_writes = 1
             except AquaTempError:
                 raise
             except Exception as exc:  # noqa: BLE001
+                if force_response:
+                    # Spec 011 FR-1 (contract 011 §5.1): the acknowledged
+                    # write's failure chain must survive verbatim — it
+                    # carries the ATT error text the verdict classifier
+                    # reads; the distinct message keeps the two write
+                    # types diagnosable apart.
+                    raise AquaTempConnectionError(
+                        f"acknowledged write failed: {exc_chain(exc)}"
+                    ) from exc
                 raise AquaTempConnectionError(f"GATT write failed: {exc}") from exc
             if resend_every is not None and resend_max > 0:
                 # Spec 009 FR-2 (contract 009 §5): the bounded re-send loop
                 # — spawned AFTER the initial write so a failed initial
                 # write never re-sends; cancelled in the finally so it
-                # never leaks past the request.
+                # never leaks past the request. Spec 011 FR-1: the loop
+                # re-sends with the SAME ATT write type (force_response
+                # threads through — one request, one write type).
                 done = asyncio.Event()
                 resend_task = asyncio.create_task(
-                    self._resend_loop(frame, resend_every, resend_max, done)
+                    self._resend_loop(
+                        frame, resend_every, resend_max, done, force_response
+                    )
                 )
             try:
                 async with asyncio.timeout(timeout):
@@ -1193,7 +1786,12 @@ class AquaTempBleClient:
             self._rx.clear()
 
     async def _resend_loop(
-        self, frame: bytes, every: float, max_sends: int, done: asyncio.Event
+        self,
+        frame: bytes,
+        every: float,
+        max_sends: int,
+        done: asyncio.Event,
+        force_response: bool = False,
     ) -> None:
         """Re-send the identical frame on a fixed cadence (spec 009 FR-2,
         contract 009 §5).
@@ -1207,6 +1805,11 @@ class AquaTempBleClient:
         client disconnects, or a re-send write fails; a failed re-send
         never fails the request — the deadline and the census stay in
         charge (plan 009 §3.2).
+
+        Spec 011 FR-1: force_response threads through so a re-sent
+        request keeps ONE ATT write type; each successful re-send
+        bumps _req_writes (the `answered after pairing (<n> attempt of
+        the window)` line reads it, contract 011 §3.4).
         """
         for n in range(1, max_sends + 1):
             try:
@@ -1219,7 +1822,7 @@ class AquaTempBleClient:
                 "first-read re-send %d/%d: %s", n, max_sends, frame.hex()
             )
             try:
-                await self._write_frame(frame)
+                await self._write_frame(frame, force_response=force_response)
             except asyncio.CancelledError:
                 return
             except Exception as exc:  # noqa: BLE001
@@ -1231,6 +1834,7 @@ class AquaTempBleClient:
                     exc,
                 )
                 return
+            self._req_writes += 1
 
     def _log_idle_summary_once(self) -> None:
         """Emit the idle-window summary at the FIRST request of a
@@ -1567,6 +2171,7 @@ class AquaTempBleClient:
         *,
         resend_every: float | None = None,
         resend_max: int = 0,
+        force_response: bool = False,
     ) -> dict[int, int]:
         """FC03 read; returns {register: raw signed int16}.
 
@@ -1581,6 +2186,14 @@ class AquaTempBleClient:
         (resend_every=2.0, resend_max=3 → sends at t+0/2/4/6 s). The
         coordinator's polling path keeps the single-shot default until a
         follow-up spec cites evidence (NFR-3).
+
+        Spec 011 FR-1: force_response=True writes the SAME frame as an
+        acknowledged ATT Write Request — the security probe's read
+        (contract 011 §1.2/§2: the only probe bytes ever sent are the
+        vendor's own base read, re-sent with the opposite ack policy;
+        the match spec, census and timeout semantics of 008/009 are
+        reused unchanged). No other request kind exposes the flag
+        (FC10 writes and query_blocks keep today's signatures).
         """
         frame = modbus.build_read_holding_registers(start, count)
         resp = await self._request(
@@ -1589,6 +2202,7 @@ class AquaTempBleClient:
             const.REQUEST_TIMEOUT,
             resend_every=resend_every,
             resend_max=resend_max,
+            force_response=force_response,
         )
         try:
             if resp[1] == modbus.FC_BLOCK:
@@ -1646,3 +2260,161 @@ class AquaTempBleClient:
         except modbus.ModbusError as exc:
             raise AquaTempResponseError(exc) from exc
         _LOGGER.debug("write echo OK: %s", echo.hex())
+
+
+# --------------------------------------------------------------------------
+# Spec 011 — the probe/pair/retry sequence (contract 011 §2). ONE
+# implementation, two consumers: the config-flow connection test
+# (config_flow._async_test) and the developer tool's --phase security
+# (tools/session_probe.py, FR-9 — import the client, never copy it).
+# --------------------------------------------------------------------------
+
+
+async def run_security_probe(
+    client: "AquaTempBleClient",
+    *,
+    retry_resend_every: float | None = None,
+    retry_resend_max: int = 0,
+    on_stage: Any = None,
+) -> dict[int, int] | None:
+    """Run the security-probe / pair / first-read-retry stages on a
+    CONNECTED client (spec 011 FR-2/FR-4, contract 011 §2).
+
+    Called strictly AFTER the caller's first read timed out, on the
+    SAME live session (contract 011 §3 — the session order is
+    untouched, the probe never reconnects):
+
+      security-probe   ONE acknowledged base read — the SAME vendor
+                       frame with response=True (the X1 experiment:
+                       research 011 §2.1/§12); no re-send on the probe;
+      [pair]           the pairing ladder, ONLY on an att-error-security
+                       verdict (contract 011 §2) — bounded by its own
+                       PAIR_TIMEOUT (contract 011 §4) so a wedged D-Bus
+                       Pair cannot eat the remaining budget;
+      first-read-retry ONE plain base read, ONLY after a pair attempt
+                       that returned succeeded/skipped-already-bonded
+                       (FR-4), with the caller's re-send bounds.
+
+    Returns the answered register dict, or None when no answer arrived
+    — the caller then re-raises its ORIGINAL first-read timeout so the
+    UI keys stay unchanged (FR-2.5: no_response keeps its meaning and
+    advice). Never raises AquaTempTimeoutError; propagates the retry
+    read's other AquaTempErrors for the caller's existing routing
+    (contract 011 §2). A pairing failure is logged, never raised
+    (contract 011 §7: the test must stay runnable).
+
+    Stage labels are reported through on_stage BEFORE each stage runs
+    (contract 011 §2: failure lines report the running stage, never a
+    later one — the 007 conventions extended to the probe stages).
+    """
+    stage = on_stage or (lambda _name: None)
+    address = getattr(client, "address", "?")
+    write_uuid = getattr(client, "write_uuid", None) or const.UUID_WRITE
+
+    # Stage security-probe (contract 011 §3.1): the entry line names the
+    # exact pipe and address it is about to test.
+    stage("security-probe")
+    _LOGGER.info(
+        "security probe: re-sending base read as acknowledged write "
+        "(response=True) on %s to %s",
+        write_uuid,
+        address,
+    )
+    verdict = "att-accepted-silent"
+    chain = ""
+    regs: dict[int, int] | None = None
+    try:
+        regs = await client.read_registers(
+            registers.BASE_BLOCK_START,
+            registers.BASE_BLOCK_COUNT,
+            force_response=True,
+        )
+    except AquaTempConnectionError as exc:
+        # The acknowledged write was refused — classify the chain
+        # (contract 011 §5.1) and log exactly one verdict line.
+        chain = str(exc)  # carries the ATT error chain verbatim (FR-1)
+        verdict = _classify_ack_write_failure(chain)
+        _LOGGER.info("security probe: verdict %s: %s", verdict, chain)
+    except AquaTempTimeoutError as exc:
+        # The write was accepted but the engine stayed silent — the
+        # H-APP-GATE branch (research 011 §11 rank 2); the census rides
+        # in the exception message (contract 009 §3).
+        _LOGGER.info(
+            "security probe: verdict att-accepted-silent "
+            "(ack ok, no Modbus answer within %.1fs; census: %s)",
+            const.REQUEST_TIMEOUT,
+            exc,
+        )
+        return None
+    except AquaTempResponseError as exc:
+        # The acknowledged write REACHED the engine — the unit answered
+        # with a Modbus exception frame: the write pipe is open at the
+        # ATT layer (research 011 §2.2 row 2). No regs to route; the
+        # original timeout keeps the UI key (FR-2.5).
+        _LOGGER.info(
+            "security probe: acknowledged write answered by a Modbus "
+            "exception frame (%s) — the write pipe is open at the ATT "
+            "layer (research 011 §2.2)",
+            exc_chain(exc),
+        )
+        return None
+    else:
+        # The acknowledged write itself woke the engine — itself
+        # decisive evidence (contract 011 §2 row 3 / §6 row 4): the
+        # gate is the write TYPE, not the bond.
+        _LOGGER.info(
+            "security probe: acknowledged write answered — the Write "
+            "Request woke the Modbus engine (contract 011 §2; research "
+            "011 §2.2)"
+        )
+        return regs
+    if verdict != "att-error-security":
+        # Contract 011 §2: the ladder runs ONLY after a security-class
+        # verdict; other verdicts log and route — never pair.
+        return None
+
+    # Stage pair (contract 011 §3.3): bounded by PAIR_TIMEOUT with
+    # asyncio.wait_for on purpose — an OUTER budget cancellation
+    # (the flow's TEST_TIMEOUT) surfaces as CancelledError and passes
+    # through untouched, while OUR expiry becomes this TimeoutError
+    # (contract 011 §4's inner bound without asyncio.timeout's nested
+    # ambiguity).
+    stage("pair")
+    pair_result = "failed"
+    try:
+        pair_result = await asyncio.wait_for(client.pair(), const.PAIR_TIMEOUT)
+    except TimeoutError:
+        _LOGGER.warning(
+            "security probe: pair stage exceeded the %.0f s pairing "
+            "budget (contract 011 §4)",
+            const.PAIR_TIMEOUT,
+        )
+    except Exception as exc:  # noqa: BLE001 — a pairing failure never breaks the test
+        _LOGGER.info("pairing: failed: %s", exc_chain(exc))
+        pair_result = "failed"
+    if pair_result not in ("succeeded", "skipped"):
+        # FR-4: the retry follows a successful/skipped pair only — a
+        # failed, wedged or unavailable pairing never burns the
+        # remaining budget on another read.
+        return None
+
+    # Stage first-read-retry (FR-4): exactly ONE more base read with
+    # the caller's re-send bounds (contract 011 §2).
+    stage("first-read-retry")
+    try:
+        regs = await client.read_registers(
+            registers.BASE_BLOCK_START,
+            registers.BASE_BLOCK_COUNT,
+            resend_every=retry_resend_every,
+            resend_max=retry_resend_max,
+        )
+    except AquaTempTimeoutError as exc:
+        _LOGGER.info(
+            "security probe: still silent after pairing (census: %s)", exc
+        )
+        return None
+    _LOGGER.info(
+        "security probe: answered after pairing (%d attempt of the window)",
+        getattr(client, "last_request_write_count", 1),
+    )
+    return regs

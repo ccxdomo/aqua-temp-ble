@@ -283,7 +283,7 @@ class TimingClient(aqua_client.AquaTempBleClient):
     def _load_retry_connector(self):
         return self._brc  # None -> raw standalone path
 
-    async def _connect_with_raw_client(self, _device):
+    async def _connect_with_raw_client(self, _device, pair: bool = False):
         self._recorder.events.append(("raw_connect", ""))
         return self._raw_client
 

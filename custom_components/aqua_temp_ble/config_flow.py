@@ -35,8 +35,10 @@ from .aqua_client import (
     AquaTempResponseError,
     AquaTempTimeoutError,
     exc_chain,
+    run_security_probe,
 )
 from .const import (
+    DEFAULT_PAIR_ON_CONNECT,
     DEFAULT_POLL_INTERVAL,
     DEFAULT_TEMPERATURE_UNIT,
     DOMAIN,
@@ -183,6 +185,11 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
         self._name: str | None = None
         self._regs: dict[int, int] | None = None
         self._test_error: str | None = None
+        # Spec 011 FR-2 (contract 011 §2): the running test stage —
+        # stamped BEFORE each stage runs (the 007 conventions extended
+        # to the probe stages); failure lines report the running stage,
+        # never a later one.
+        self._stage = "connect"
         # Progress-step state (specs/004): the asyncio task itself is the
         # done-flag (.done() is authoritative — a stale boolean could be
         # set by a previous attempt's task). Created once per attempt,
@@ -191,6 +198,14 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
         self._scan_task: asyncio.Task[None] | None = None
         self._origin = "user"  # step to return to on a failed test
         self._device_labels: dict[str, str] = {}
+
+    def _set_test_stage(self, stage: str) -> None:
+        """Stage stamp callback for the security-probe helper (spec 011
+        FR-2, contract 011 §2): the helper reports `security-probe`,
+        `pair` and `first-read-retry` before each stage runs so the
+        test-level failure lines name the stage the cancellation hit
+        (contract 011 §4's pathological budget case)."""
+        self._stage = stage
 
     async def _async_menu_labels(
         self, step_id: str, keys: tuple[str, ...]
@@ -435,15 +450,27 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
         and the elapsed since entry, against the TEST_TIMEOUT budget
         (contract 007 §3.3) — log-only, the UI keys and their mapping
         are unchanged (spec 007 NFR-2).
+
+        Spec 011 FR-2/FR-4 (contract 011 §2): on a first-read timeout the
+        test runs the evidence-driven stages — the security-probe (the
+        SAME base read re-sent as an ATT Write Request, so the unit's
+        silent refusal becomes an ATT error: research 011 §2.1/§12 X1),
+        the pairing ladder ONLY on an att-error-security verdict, then
+        exactly ONE first-read retry after a succeeded/skipped pair.
+        All inside the UNCHANGED TEST_TIMEOUT envelope (contract 011
+        §4); the verdicts live in the log and the UI keys stay
+        untouched (FR-2.5).
         """
         # Test-level stage label + elapsed (spec 007 FR-3, research 007
         # §8): the label advances as the body progresses — "connect"
-        # while connect() runs, "first-read" for the base read. The
-        # "disconnect" label is set only after the teardown completes,
-        # so a failure raised by the READ still reports "first-read"
-        # (the failure site, not the subsequent cleanup).
+        # while connect() runs, "first-read" for the base read, and the
+        # spec-011 probe stages (security-probe / pair / first-read-
+        # retry) stamped BEFORE each runs via self._stage (contract 011
+        # §2). The "disconnect" label is set only after the teardown
+        # completes, so a failure raised by the READ still reports the
+        # read's stage (the failure site, not the subsequent cleanup).
         t_test = time.monotonic()
-        stage = "connect"
+        self._stage = "connect"
         try:
             async with asyncio.timeout(TEST_TIMEOUT):
                 # hass is passed so device resolution reads the HA
@@ -459,20 +486,39 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
                 # single BLE link mid-attempt, or stale bluez state cleared
                 # by the first attempt's cleanup.
                 await client.connect(max_attempts=2)
-                stage = "first-read"
+                self._stage = "first-read"
+                regs: dict[int, int] | None = None
                 try:
                     # Spec 009 FR-2 (contract 009 §5): the bounded
                     # app-parity re-send — the identical vendor frame,
                     # 2 s apart, up to 3 extra sends, all inside the
                     # unchanged 8.0 s request window (the app's 2 s
                     # Duration may be a poll cadence, research 009 §1.3).
-                    self._regs = await client.read_registers(
+                    regs = await client.read_registers(
                         registers.BASE_BLOCK_START, registers.BASE_BLOCK_COUNT,
                         resend_every=2.0, resend_max=3,
                     )
+                except AquaTempTimeoutError as first_timeout:
+                    # Spec 011 FR-2 (contract 011 §2): the first-read
+                    # timeout triggers the probe stages on the SAME live
+                    # session (strictly after the read's deadline, before
+                    # the disconnect in the finally below). The helper
+                    # never raises AquaTempTimeoutError and returns the
+                    # answered regs or None; None re-raises the ORIGINAL
+                    # timeout so the UI keeps its no_response key and its
+                    # advice (FR-2.5: UI keys unchanged).
+                    regs = await run_security_probe(
+                        client,
+                        retry_resend_every=2.0,
+                        retry_resend_max=3,
+                        on_stage=self._set_test_stage,
+                    )
+                    if regs is None:
+                        raise first_timeout
                 finally:
                     await client.disconnect()
-                stage = "disconnect"
+                self._regs = regs
+                self._stage = "disconnect"
         except AquaTempDeviceNotFoundError as exc:
             # Order matters: an AquaTempError but NOT an AquaTempConnectionError
             # — catching it first keeps the mapping exact (plan 005 §2).
@@ -494,13 +540,15 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
             # connect() call as a whole reports "connect"; the precise
             # sub-stage of a post-setup failure is carried by the
             # aqua_client ERROR line (contract 007 §3.2, research 007
-            # §8) — this line is the test-level view.
+            # §8) — this line is the test-level view. Spec 011: a
+            # first-read-retry failure reports its own stage via
+            # self._stage (contract 011 §2).
             _LOGGER.warning(
                 "connection test to %s failed: %s "
                 "at stage %s after %.1f s (budget %.0f s)",
                 self._address,
                 exc_chain(exc),
-                stage,
+                self._stage,
                 time.monotonic() - t_test,
                 TEST_TIMEOUT,
             )
@@ -536,8 +584,11 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
             # cannot_connect (its advice is the correct action).
             self._test_error = "cannot_connect"
             # Stage = the phase the cancellation hit (contract 007
-            # §3.3): "connect" or "first-read" — the label was current
-            # when asyncio.timeout fired (research 007 §8).
+            # §3.3): "connect" or "first-read" — or, since spec 011,
+            # a probe stage (security-probe / pair / first-read-retry:
+            # contract 011 §4's accepted pathological expiry mid-probe
+            # — the label was current when asyncio.timeout fired,
+            # research 007 §8).
             _LOGGER.warning(
                 "connection test to %s exceeded the %.0f s budget — two "
                 "connect attempts and the read did not complete in time. "
@@ -546,7 +597,7 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
                 "at stage %s after %.1f s (budget %.0f s)",
                 self._address,
                 TEST_TIMEOUT,
-                stage,
+                self._stage,
                 time.monotonic() - t_test,
                 TEST_TIMEOUT,
             )
@@ -593,10 +644,21 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 class AquaTempOptionsFlowHandler(OptionsFlow):
-    """Options: poll interval (10..600 s) and display temperature unit.
+    """Options: poll interval (10..600 s), display temperature unit and
+    the evidence-gated pair_on_connect toggle (spec 011 FR-6).
 
     Changes apply without an entry reload (see __init__ listener); the unit
     is read dynamically by the climate entity.
+
+    pair_on_connect (spec 011 FR-6, default OFF): when enabled, every
+    establish requests pairing (the client's connect(pair=True)
+    threading). It ships OFF and is to be enabled ONLY after a
+    connection test produced the `security probe: answered after
+    pairing` evidence (quickstart 011 §2) — enabling it without that
+    proof is a contract violation (the option exists to be earned,
+    contract 011 §1.5). A backend that cannot pair degrades to a plain
+    connect with a WARNING — the option never breaks the poll path
+    (FR-7).
     """
 
     async def async_step_init(
@@ -615,6 +677,13 @@ class AquaTempOptionsFlowHandler(OptionsFlow):
                     "temperature_unit",
                     default=current.get("temperature_unit", DEFAULT_TEMPERATURE_UNIT),
                 ): vol.In({"C": "Celsius (°C)", "F": "Fahrenheit (°F)"}),
+                # Spec 011 FR-6: the evidence-gated pairing lever — OFF
+                # until the connection test proved the bond gate (the
+                # `security probe: answered after pairing` line).
+                vol.Required(
+                    "pair_on_connect",
+                    default=current.get("pair_on_connect", DEFAULT_PAIR_ON_CONNECT),
+                ): bool,
             }
         )
         return self.async_show_form(step_id="init", data_schema=schema)
