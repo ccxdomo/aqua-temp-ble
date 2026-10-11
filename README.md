@@ -204,14 +204,16 @@ directly (the decision matrix of
 binding for the follow-up; the "bLE" choreography and the persistence
 retest remain documented in the 011 quickstart).
 
-## Push mode — reading the unit's own data stream (spec 013)
+## Push mode — reading the unit's own data stream (specs 013-014)
 
 Three production runs proved this unit **never answers** the byte-perfect
 base read (the connection test's `security probe: verdict
 att-accepted-silent` line): the GATT layer accepts our writes, the
-Modbus engine stays silent. The unit, however, **pushes** four
-CRC-valid 45-register blocks spontaneously on the notify
-characteristic (~2 frames/s): `1001-1045`, `1046-1090`,
+Modbus engine stays silent. The unit, however, **answers every read
+request**: each valid read triggers a burst of four CRC-valid
+45-register blocks on the notify characteristic (0.2-5 s after the
+request, ~2 frames/s — and a request-free window is silent,
+research 014 §0.2): `1001-1045`, `1046-1090`,
 `2001-2045`, `2046-2090`. These are two different data **planes**
 with no register offset between them (research 013 §3):
 
@@ -225,22 +227,29 @@ with no register offset between them (research 013 §3):
   R-family thresholds at 1046-1060. The block `2001-2045` is still
   **undecoded** — its capture is this spec's main open evidence.
 
-**What build 0.9.0 ships** (`specs/013-pushed-blocks-coverage/`): the
-connection test ends with a **push-harvest stage** — after the read
-timeout and the silent probe, it listens for the pushes for 30 s
-while sending **zero frames** (nothing the firmware's gate could
-drop). Seeing the T-family block (start 2046) makes the test
-**succeed** with mode `push` — the integration stops dead-ending
-`no_response` against a unit that talks constantly. A `push` entry
-never sends the doomed 8-second request per poll cycle: it reads the
-push stream (freshness-gated; a silent stream goes honestly
-`unavailable` and the link recycles), updates arrive at push cadence
-(observed ≤ ~4 s — faster than the 30 s poll). The first push of each
-block is logged at WARNING with its **full hex** (`block push
-captured: start=… hex=…`, ≤ 4 lines per connection) — that
-`start=2001` line is the never-decoded block's capture; paste it back
-for analysis. A `push_stream` diagnostic sensor reports the per-start
-push counts and ages.
+**What build 0.10.0 ships** (`specs/013-pushed-blocks-coverage/` +
+`specs/014-query-high-blocks/`): the connection test ends with a
+**push-harvest stage** — after the read timeout and the silent
+probe, it listens for the pushes for 30 s while sending **zero
+frames** (nothing the firmware's gate could drop). Seeing the
+T-family block (start 2046) makes the test **succeed** with mode
+`push` — the integration stops dead-ending `no_response` against a
+unit that talks constantly. A `push` entry polls with **one read
+request per cycle** — the trigger (the vendor's own base read
+`63030007002d3c54`, the frame the unit demonstrably answers with its
+block burst): the request goes out, its 8-second window logs the
+burst census at INFO, and the cycle reads the unit's block answer
+from the store (freshness-gated; the burst lands 0.2-5 s after the
+trigger — within the cycle). **`push stream silent after trigger`**
+means the proven trigger did not wake the unit within 8 + 30 s — a
+real, diagnosable condition, distinct from 0.9.0's listen-only
+`push stream silent`; the link recycles and the next cycle retries
+with a fresh trigger. The first push of each block is logged at
+WARNING with its **full hex** (`block push captured: start=… hex=…`,
+≤ 4 lines per connection) — that `start=2001` line is the
+never-decoded block's capture; paste it back for analysis. A
+`push_stream` diagnostic sensor reports the per-start push counts
+and ages.
 
 **Honesty rules in push mode:** only monitoring entities exist. The
 temperature sensors appear **only after the one-run calibration

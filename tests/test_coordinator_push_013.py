@@ -1,30 +1,36 @@
 #!/usr/bin/env python3
 """Coordinator push-mode tests (spec 013 FR-4/FR-6 / AC-4, contract 013
-§1/§4/§6).
+§1/§4/§6 — re-pinned by spec 014 FR-3, contract 014 §1/§4).
 
-The coordinator grows a mode branch: entries with mode == "push" NEVER
-send a request — their cycle reads the client's pushed-block store and
-builds the snapshot from it (US-5: no doomed 8-second base read per
-cycle; push latency <= ~4 s observed). The freshness rule (contract
-013 §6.1): a store entry is used only while its last-seen age stays
-inside max(2 x poll interval, 60 s); stale => UpdateFailed("push
-stream silent") and the link is recycled on the next cycle (U-3's
-defensive stance — the long-run push cadence is unproven).
+The coordinator's mode branch, re-pinned to the 014 query cycle: a
+"push" entry sends exactly ONE base read per cycle — the TRIGGER
+(contract 014 §1.1, amending contract 013 §1's zero-TX poll
+invariant) — then listens with the harvest and applies the unchanged
+freshness rule (contract 013 §6.1): a store entry is used only while
+its last-seen age stays inside max(2 x poll interval, 60 s); stale =>
+UpdateFailed("push stream silent after trigger") (the 014 literal,
+contract 014 §4.2) and the link is recycled on the next cycle (U-3's
+defensive stance — the long-run push cadence is unproven). On this
+unit the trigger read always times out (research 014 §0.2 — the store
+carries the burst), which the fake models by default.
 
 Pinned by this file:
-- a fresh store => a snapshot with ZERO read_registers calls, values
-  from the T-block raws (only when confirmed — the honesty gate,
-  contract 013 §4.3);
-- a stale store => the re-harvest rung (zero-TX), then
-  UpdateFailed("push stream silent") + disconnect (never a request
-  fallback — contract 013 §6.2);
+- a fresh store => a snapshot with exactly ONE read_registers(7, 45)
+  call per cycle — the trigger (contract 014 §1.1 re-pin), values from
+  the T-block raws (only when confirmed — the honesty gate, contract
+  013 §4.3);
+- a stale store => the re-harvest rung (zero-TX listen), then
+  UpdateFailed("push stream silent after trigger") + disconnect
+  (never a request beyond the single trigger — contract 013 §6.2 as
+  amended by contract 014 §4.1);
 - the re-harvest recovering a fresh T-block => the cycle succeeds;
 - classic mode: the single-read cycle byte-identical (US-6);
 - a base-plane capture in push mode => ONE WARNING anomaly line, the
   data otherwise ignored (contract 013 §4.2).
 
 Red-first on 1ac276d: no mode branch, no from_pushes, no freshness
-gate — every test below fails until FR-4 lands.
+gate — every test below failed until FR-4 landed. Spec 014 re-pins the
+two AC-4 assertions above (contract 014 §4, a cited deviation).
 
 Run standalone:
 
@@ -168,6 +174,10 @@ def _import_coordinator():
 
 coordinator = _import_coordinator()
 UpdateFailed = sys.modules["homeassistant.helpers.update_coordinator"].UpdateFailed
+# The REAL exception classes from the synthetic package (the 013
+# lessons): the fake must raise the AquaTempTimeoutError the
+# coordinator's except clause actually catches (contract 014 §2.2).
+aqua_client = sys.modules[f"{PKGC}.aqua_client"]
 
 
 class _ClockPatch:
@@ -189,15 +199,21 @@ class _ClockPatch:
 class FakePushClient:
     """Duck-typed AquaTempBleClient for the push-mode cycle: connected,
     a scripted pushed-block store, a scripted (instant) harvest, and a
-    recorder for every read/connect/harvest call — the ZERO-read and
-    ZERO-TX gates assert through it."""
+    recorder for every read/connect/harvest call — the ONE-trigger and
+    zero-write gates assert through it (the spec 014 re-pin)."""
 
     def __init__(self, captures: dict | None = None,
                  harvest_result: dict | None = None,
-                 connected: bool = True) -> None:
+                 connected: bool = True,
+                 read_result: dict | None = None) -> None:
         self.is_connected = connected
         self.pushed_blocks = dict(captures or {})
         self.harvest_result = dict(harvest_result or {})
+        # Spec 014 (contract 014 §2.2): the cycle's TRIGGER read — on
+        # this unit it always times out (the expected world; the store
+        # fills during the window). read_result scripts an ANSWERED
+        # trigger (the classic vector's world).
+        self.read_result = read_result
         self.read_calls: list[tuple] = []
         self.harvest_calls: list[tuple] = []
         self.connect_kwargs: list[dict] = []
@@ -205,7 +221,14 @@ class FakePushClient:
 
     async def read_registers(self, start, count, **_kwargs):
         self.read_calls.append((start, count))
-        return dict(BASE_REGS)
+        if self.read_result is None:
+            # The production push-mode world (contract 014 §2.2): the
+            # trigger read times out with the census in the message.
+            raise aqua_client.AquaTempTimeoutError(
+                "no matching response within 8.0s (received 0 frame(s) / "
+                "0 bytes; blocks seen: none; none for start 7)"
+            )
+        return dict(self.read_result)
 
     async def connect(self, **kwargs):
         self.connect_kwargs.append(dict(kwargs))
@@ -249,9 +272,11 @@ def _capture_logs():
 
 
 # --------------------------------------------------------------------- tests
-def test_push_cycle_zero_reads_builds_snapshot() -> None:
+def test_push_cycle_single_trigger_builds_snapshot() -> None:
     """AC-4: a fresh store (confirmed) => a snapshot built from the
-    pushes with ZERO read_registers calls (US-5) and NO harvest."""
+    pushes with exactly ONE read_registers(7, 45) call per cycle — the
+    TRIGGER (contract 014 §1.1 re-pin of the 013 zero-read vector) —
+    and NO harvest."""
     client = FakePushClient(captures={2046: _capture(2046, T_WINDOW_RAWS, count=2)})
     coord = _make_coordinator(
         client,
@@ -260,7 +285,9 @@ def test_push_cycle_zero_reads_builds_snapshot() -> None:
     )
     with _ClockPatch(1000.0):
         data = asyncio.run(coord._async_update_data())
-    assert client.read_calls == [], client.read_calls  # ZERO reads
+    # Spec 014 re-pin (contract 014 §1.1/§4): the cycle now TRIGGERS —
+    # exactly ONE read_registers(7, 45) per cycle, single-shot.
+    assert client.read_calls == [(7, 45)], client.read_calls
     assert client.harvest_calls == [], client.harvest_calls  # fresh: no harvest
     assert data.mode == "push"
     assert data.registers[2047] == 145
@@ -288,7 +315,7 @@ def test_push_cycle_unconfirmed_withholds_raws() -> None:
     )
     with _ClockPatch(1000.0):
         data = asyncio.run(coord._async_update_data())
-    assert client.read_calls == []
+    assert client.read_calls == [(7, 45)]  # the one trigger (contract 014 §1.1)
     assert data.mode == "push"
     assert data.registers == {}, data.registers  # the honesty gate
     assert data.push_confirmed is False
@@ -308,13 +335,18 @@ def test_push_cycle_stale_store_update_failed() -> None:
         try:
             asyncio.run(coord._async_update_data())
         except UpdateFailed as err:
-            assert str(err) == "push stream silent", str(err)
+            # Spec 014 re-pin (contract 014 §4.2): the new verdict —
+            # silence AFTER the proven trigger, never 0.9.0's
+            # listen-only silence.
+            assert str(err) == "push stream silent after trigger", str(err)
         else:
             raise AssertionError("stale store did not raise UpdateFailed")
     # the re-harvest rung ran (zero-TX), then the honest failure
     assert len(client.harvest_calls) == 1, client.harvest_calls
     assert client.harvest_calls[0][0] == {2046}
-    assert client.read_calls == [], "push mode must never fall back to requests"
+    # Spec 014 re-pin (contract 014 §4.1): one trigger per cycle, never
+    # re-sent, never a request fallback beyond the single trigger.
+    assert client.read_calls == [(7, 45)], client.read_calls
     assert client.disconnect_calls == 1  # the link is recycled (U-3 guard)
 
 
@@ -332,7 +364,8 @@ def test_push_cycle_reharvest_recovers() -> None:
     with _ClockPatch(1000.0):
         data = asyncio.run(coord._async_update_data())
     assert len(client.harvest_calls) == 1
-    assert client.read_calls == []
+    # Spec 014 re-pin (contract 014 §1.1): the trigger fired once.
+    assert client.read_calls == [(7, 45)], client.read_calls
     assert data.registers[2047] == 145
     assert data.push_counts == {2046: 3}
 
@@ -353,14 +386,15 @@ def test_push_cycle_connects_with_pair_option() -> None:
     with _ClockPatch(1000.0):
         data = asyncio.run(coord._async_update_data())
     assert client.connect_kwargs == [{"pair": True}], client.connect_kwargs
-    assert client.read_calls == []
+    # Spec 014 re-pin (contract 014 §2.1): the trigger follows connect.
+    assert client.read_calls == [(7, 45)], client.read_calls
     assert data.mode == "push"
 
 
 def test_classic_mode_single_read_cycle_unchanged() -> None:
     """AC-4 / US-6: without the push mode the cycle is byte-identical —
     exactly ONE FC03 base read, the classic snapshot, mode classic."""
-    client = FakePushClient()
+    client = FakePushClient(read_result=BASE_REGS)  # an ANSWERED read (classic world)
     coord = _make_coordinator(client, options={"poll_interval": 30})
     with _ClockPatch(1000.0):
         data = asyncio.run(coord._async_update_data())
@@ -411,7 +445,7 @@ def test_push_mode_base_capture_is_anomaly_logged_once_and_ignored() -> None:
 
 def main() -> int:
     tests = [
-        test_push_cycle_zero_reads_builds_snapshot,
+        test_push_cycle_single_trigger_builds_snapshot,
         test_push_cycle_unconfirmed_withholds_raws,
         test_push_cycle_stale_store_update_failed,
         test_push_cycle_reharvest_recovers,

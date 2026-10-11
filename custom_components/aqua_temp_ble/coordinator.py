@@ -24,7 +24,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from . import const, modbus, registers
-from .aqua_client import AquaTempBleClient, AquaTempError
+from .aqua_client import AquaTempBleClient, AquaTempError, AquaTempTimeoutError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -73,6 +73,12 @@ _logged_implausible: set[int] = set()
 # is an anomaly — logged ONCE per HA session, otherwise ignored. The
 # module-set pattern of _logged_implausible (mutable without a global).
 _logged_push_mode_base: set[str] = set()
+
+# Spec 014 (contract 014 §5.1): the revival WARNING — the trigger read
+# ANSWERED (never observed; the post-pairing/E5 world) — logged ONCE
+# per HA session so the future spec that re-evaluates the mode has its
+# evidence. The module-set pattern of _logged_implausible.
+_logged_trigger_answered: set[str] = set()
 
 
 def decode_temp_logged(address: int, raw: int | None) -> float | None:
@@ -253,6 +259,52 @@ class AquaTempData:
             push_last_seen=t_cap.last_seen if t_cap is not None else None,
         )
 
+    @classmethod
+    def from_merged(
+        cls, regs: dict[int, int], captures: dict[int, Any], confirmed: bool
+    ) -> AquaTempData:
+        """Base-plane answer + pushed overlay (spec 014 FR-2, contract
+        014 §5.2 — used ONLY when the trigger read completes: the
+        revival world, never observed yet).
+
+        Typed fields come from the base answer (`from_regs` semantics —
+        contract 013 §4.2: the base plane wins for shared quantities);
+        the `registers` dict is the base regs merged with the CONFIRMED
+        T-block raws — the windows are disjoint by construction (7-51 vs
+        2046-2090 [P], data-model 014 §4), so the union is
+        collision-free. The honesty gate applies to pushed raws ONLY
+        (contract 013 §4.3 unchanged — base values are base-pinned
+        registers, not unconfirmed pushes); mode stays "push" (the
+        re-evaluation is a future spec's decision, contract 014 §5.3).
+        """
+        base = cls.from_regs(regs)
+        t_cap = captures.get(registers.PUSH_TEMP_BLOCK_START)
+        pushed_regs = (
+            dict(t_cap.registers) if (t_cap is not None and confirmed) else {}
+        )
+        counts = {int(start): cap.count for start, cap in captures.items()}
+        return cls(
+            registers={**regs, **pushed_regs},
+            power=base.power,
+            boost=base.boost,
+            mode_value=base.mode_value,
+            hvac_mode=base.hvac_mode,
+            target_temp=base.target_temp,
+            min_target=base.min_target,
+            max_target=base.max_target,
+            inlet_temp=base.inlet_temp,
+            outlet_temp=base.outlet_temp,
+            ambient_temp=base.ambient_temp,
+            fault_code=base.fault_code,
+            firmware=base.firmware,
+            binaries=base.binaries,
+            mode="push",
+            push_confirmed=confirmed,
+            push_counts=counts,
+            push_first_seen=t_cap.first_seen if t_cap is not None else None,
+            push_last_seen=t_cap.last_seen if t_cap is not None else None,
+        )
+
 
 class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
     """One FC03 read per cycle. Writes are serialized against reads."""
@@ -291,11 +343,12 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
     async def _async_update_data(self) -> AquaTempData:
         """Exactly one 45-register FC03 read per cycle; no retry storm.
 
-        Spec 013 FR-4: entries with mode == "push" NEVER send a request —
-        their cycle reads the pushed-block store instead (contract 013
-        §1: zero TX; this unit ignores our reads but pushes continuously
-        [P], and each never-answered read costs 8 s of the cycle,
-        research 013 §5.6)."""
+        Spec 014 FR-1: entries with mode == "push" run the query cycle —
+        ONE vendor read per cycle (the TRIGGER the unit answers with its
+        block burst, contract 014 §1), then the pushed-block store. The
+        0.9.0 zero-TX cycle starved: the unit pushes nothing
+        spontaneously and answers every request with its block burst
+        (research 014 §0.2) — the store fills during the trigger window."""
         if str(self.config_entry.data.get("mode", "classic")) == "push":
             return await self._async_update_push()
         async with self._io_lock:
@@ -364,19 +417,42 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
             registers.BASE_BLOCK_START,
         )
 
-    async def _async_update_push(self) -> AquaTempData:
-        """The push-mode cycle (spec 013 FR-4, contract 013 §1/§6.2): ZERO
-        request frames — read the store, not the link.
+    def _log_trigger_answered_once(self) -> None:
+        """Contract 014 §5.1: the trigger read ANSWERED — the request
+        path revived (never observed; the post-pairing/E5 world). ONE
+        WARNING per HA session (the module-set pattern of
+        _logged_implausible) — the decisive evidence the future spec
+        that re-evaluates the mode reads; the mode stays "push" (§5.3).
+        """
+        if "trigger" in _logged_trigger_answered:
+            return
+        _logged_trigger_answered.add("trigger")
+        _LOGGER.warning(
+            "push mode: trigger read answered — the request path "
+            "revived; using base data (mode stays push; a future spec "
+            "re-evaluates)"
+        )
 
-        The ladder (contract 013 §6.2): connect (the CCCD subscription
-        connect() already performs — the only ATT operation allowed,
-        §1.1) -> read the store -> re-harvest when the T-block entry is
-        missing or stale (the zero-TX listen window, FR-2's API) -> fail
-        honestly with UpdateFailed("push stream silent") and recycle the
-        link (the next cycle's connect starts fresh — U-3's defensive
-        stance). Push-mode failures NEVER fall back to sending requests
-        (§6.2): the request path is dead for this unit [P] and nothing
-        this spec adds can be refused (§1.2)."""
+    async def _async_update_push(self) -> AquaTempData:
+        """The push-mode cycle: TRIGGER + LISTEN (spec 014 FR-1,
+        contract 014 §1/§2/§3/§4 — amends contract 013 §1's zero-TX
+        poll invariant).
+
+        The ladder: connect (the CCCD subscription connect() already
+        performs — the only ATT operation besides the trigger, §1.1) ->
+        TRIGGER: ONE vendor base read `63030007002d3c54`, the frame the
+        unit demonstrably answers with its parameter-dataset block
+        burst (research 014 §0.2/§6, six runs [P]); on this unit the
+        call raises AquaTempTimeoutError after the 8.0 s window — the
+        EXPECTED world, logged at INFO with the census, while the store
+        fills on the notify path (contract 014 §2) -> REVIVAL check: an
+        ANSWERED trigger is decisive evidence, logged once, snapshot
+        from_merged (contract 014 §5) -> LISTEN: the presence-based
+        harvest, instant when the burst already landed (contract 014
+        §3) -> freshness gate (contract 013 §6.1, unchanged) -> fail
+        honestly with UpdateFailed("push stream silent after trigger")
+        and recycle the link (contract 014 §4.2/§4.3). One trigger per
+        cycle, never re-sent, never re-triggered mid-cycle (§4.1)."""
         async with self._io_lock:
             if not self.client.is_connected:
                 await self.client.connect(
@@ -384,14 +460,54 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
                         "pair_on_connect", const.DEFAULT_PAIR_ON_CONNECT
                     )
                 )
+            # 1. TRIGGER (contract 014 §2): ONE vendor read — the
+            #    frame the unit demonstrably answers with its block
+            #    burst (research 014 §6). Single shot, no re-sends;
+            #    write type = the client's resolved default
+            #    (without-response, app parity). On this unit:
+            #    AquaTempTimeoutError after 8.0 s — EXPECTED.
+            try:
+                regs = await self.client.read_registers(
+                    registers.BASE_BLOCK_START, registers.BASE_BLOCK_COUNT
+                )
+            except AquaTempTimeoutError as exc:
+                # Contract 014 §2.2: the expected world — never an
+                # UpdateFailed by itself; the census (frames/bytes/
+                # blocks/first/last) rides verbatim in the exception
+                # message (contract 009 §3 format, unchanged).
+                _LOGGER.info(
+                    "push cycle: trigger read timed out as expected (census: %s)",
+                    exc,
+                )
+                regs = None
+            except AquaTempError as err:
+                # Contract 014 §2.3: a transport failure during the
+                # trigger (link lost, write refused) — an honest read
+                # failure, never conflated with stream silence.
+                await self.client.disconnect()
+                raise UpdateFailed(f"trigger read failed: {err}") from err
             captures = dict(self.client.pushed_blocks)
+            # 2. REVIVAL (contract 014 §5): the trigger ANSWERED — the
+            #    base plane is back (never observed; the post-pairing/
+            #    E5 world). Log once per session, use the base data; a
+            #    completed trigger must never fail the cycle for
+            #    lacking pushes (the base answer IS the data) — this
+            #    branch runs BEFORE the freshness failure.
+            if regs is not None:
+                self._log_trigger_answered_once()
+                return AquaTempData.from_merged(
+                    regs, captures, self.push_temp_confirmed
+                )
+            # 3. LISTEN (contract 014 §3): presence-based harvest on
+            #    the already-subscribed pipe — instant when the burst
+            #    already landed during the trigger window (the typical
+            #    case), otherwise a bounded zero-TX listen (observed:
+            #    all four starts within ~16 s, research 013 §5.4 —
+            #    wide margin).
             window = self.push_freshness_window()
             t_cap = captures.get(registers.PUSH_TEMP_BLOCK_START)
             now = _now()
             if t_cap is None or now - t_cap.last_seen > window:
-                # Rung 2 — re-harvest: a bounded zero-TX listen on the
-                # already-subscribed pipe (observed: all four starts
-                # within ~16 s, research 013 §5.4 — wide margin).
                 caps = await self.client.harvest_pushes(
                     {registers.PUSH_TEMP_BLOCK_START},
                     const.PUSH_HARVEST_TIMEOUT,
@@ -400,11 +516,14 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
                     captures.update(caps)
                     t_cap = captures.get(registers.PUSH_TEMP_BLOCK_START)
                 now = _now()
+            # 4. FRESHNESS (contract 013 §6.1, unchanged) + the new
+            #    verdict (contract 014 §4.2): the proven trigger did
+            #    not wake the unit — a strictly stronger statement
+            #    than the 0.9.0 listen-only silence. The disconnect
+            #    recycles the link for the next cycle's fresh trigger.
             if t_cap is None or now - t_cap.last_seen > window:
-                # Rung 3 — fail honestly; the disconnect recycles the
-                # link for the next cycle (U-3).
                 await self.client.disconnect()
-                raise UpdateFailed("push stream silent")
+                raise UpdateFailed("push stream silent after trigger")
             if registers.BASE_BLOCK_START in captures:
                 # Contract 013 §4.2: a base-plane frame in the store
                 # while in push mode — anomaly, logged once, ignored.
