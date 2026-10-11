@@ -268,6 +268,32 @@ def test_tier3_name_prefix_match_and_different_address():
     print("PASS  test_tier3_name_prefix_match_and_different_address")
 
 
+def test_tier3_wt_prefix_match():
+    """Spec 006 FR-4/AC-4: "WT-" is part of the vendor operating filter
+    (research 006 §3) — a WT-AB12 advertiser resolves via the tier-3
+    name-prefix walk.
+
+    Red-first: on the pre-006 NAME_PREFIXES the tier-3 walk misses the
+    WT- name and _resolve_device() returns None.
+    """
+    new_address = "08:06:A6:C0:94:77"
+    dev = FakeBLEDevice(new_address, "WT-AB12")
+    hass = FakeHass(infos=[FakeServiceInfo("WT-AB12", new_address, dev)])
+    client = make_client(hass=hass)  # configured address in no history tier
+
+    async def scenario():
+        with _LogCapture(ac._LOGGER) as log:
+            resolved = await client._resolve_device()
+        assert resolved is dev, resolved
+        # Tier-3 entry warning fired on the way (provenance intact).
+        assert any(
+            ADDRESS in m and "name-prefix match" in m for m in log.messages
+        ), log.messages
+
+    asyncio.run(scenario())
+    print("PASS  test_tier3_wt_prefix_match")
+
+
 def test_tier3_multiple_matches_warn_and_first_wins():
     """E-11/FR-7: several BlueNRG candidates -> the existing multi-match
     WARNING; the first match (insertion order) wins."""
@@ -414,6 +440,7 @@ def main() -> None:
         test_tier1_connectable_cache_hit,
         test_tier2_non_connectable_fallback,
         test_tier3_name_prefix_match_and_different_address,
+        test_tier3_wt_prefix_match,
         test_tier3_multiple_matches_warn_and_first_wins,
         test_all_tiers_miss_raises_device_not_found,
         test_standalone_find_by_address_passthrough,

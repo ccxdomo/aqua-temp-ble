@@ -192,19 +192,26 @@ def test_unnamed_and_missing_rssi():
 
 
 def test_prefix_matching_rules():
-    """E-2: exact startswith (case-insensitive) on all NAME_PREFIXES; near-miss -> tier 2."""
+    """E-2: exact startswith (case-insensitive) on all NAME_PREFIXES; near-miss -> tier 2.
+
+    Spec 006 FR-4/AC-4: "wt-" is part of the vendor's operating-channel
+    filter (research 006 §3) — a WT-AB12 advertiser must be recognized.
+    Red-first: on the pre-006 NAME_PREFIXES the WT- entry lands in tier 2.
+    """
     infos = [
         FakeInfo("AA:00:00:00:00:01", "blueNRg-7", -50),        # case variant
         FakeInfo("AA:00:00:00:00:02", "HIFLYING-2", -60),
+        FakeInfo("AA:00:00:00:00:06", "WT-AB12", -65),          # spec 006 WT- prefix
         FakeInfo("AA:00:00:00:00:03", "prov_x", -70),
         FakeInfo("AA:00:00:00:00:04", "bluenrg_", -80),         # near-miss, no UUIDs
         FakeInfo("AA:00:00:00:00:05", "XBlueNRG-9", -90),       # prefix not at start
     ]
     labels, counts = _build_device_list(infos, set(), cf.UNNAMED_LABEL)
-    assert counts == {"recognized": 3, "total": 5}, counts
-    assert list(labels)[:3] == [
+    assert counts == {"recognized": 4, "total": 6}, counts
+    assert list(labels)[:4] == [
         "AA:00:00:00:00:01",
         "AA:00:00:00:00:02",
+        "AA:00:00:00:00:06",
         "AA:00:00:00:00:03",
     ], list(labels)
     print("PASS  test_prefix_matching_rules")

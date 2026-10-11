@@ -49,13 +49,16 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
-# Budget for the whole connection test, seconds (spec 005 FR-5). One
-# honest attempt needs up to ~30 s: bleak-retry-connector hardcodes the
-# per-attempt connect timeout to 20.0 s (research 005 §3.2), notify setup
-# takes ~2 s and the register read up to 8 s — 40 s adds margin while
-# max_attempts=1 keeps the probe bounded. Supersedes spec 004 AC-4's 20 s
-# value (the cannot_connect routing key for budget expiry is unchanged).
-TEST_TIMEOUT = 40.0
+# Budget for the whole connection test, seconds (spec 006 FR-3 supersedes
+# spec 005 §3). The arithmetic: 2 x 20 s bleak-retry-connector-hardcoded
+# connect attempts (brc's BLEAK_TIMEOUT, research 005 §3.2) + brc
+# inter-attempt backoff + 2 s settle after subscribe (spec 006 FR-1) +
+# 8 s REQUEST_TIMEOUT for the base read + margin. The vendor app itself
+# retries connects before giving up (research 006 §2.2) — attempt 2
+# catches transient refusals (phone releasing the single BLE link,
+# stale bluez state). The cannot_connect routing key for budget expiry
+# is unchanged (spec 005).
+TEST_TIMEOUT = 70.0
 DEFAULT_NAME = "Aqua Temp heat pump"
 
 # English fallbacks for the runtime-translated menu option labels (spec
@@ -434,10 +437,13 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
                 client = AquaTempBleClient(
                     self._address, name=self._name, hass=self.hass
                 )
-                # max_attempts=1: a bounded probe — one honest attempt
-                # must fit inside the budget above; a second 20 s connect
-                # attempt never could (plan 005 §3).
-                await client.connect(max_attempts=1)
+                # max_attempts=2 (spec 006 FR-3): the vendor app itself
+                # retries connects before giving up (research 006 §2.2);
+                # inside the 70 s budget a second 20 s attempt now fits and
+                # catches transient refusals — the phone releasing the
+                # single BLE link mid-attempt, or stale bluez state cleared
+                # by the first attempt's cleanup.
+                await client.connect(max_attempts=2)
                 try:
                     self._regs = await client.read_registers(
                         registers.BASE_BLOCK_START, registers.BASE_BLOCK_COUNT
@@ -482,10 +488,10 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
             # cannot_connect (its advice is the correct action).
             self._test_error = "cannot_connect"
             _LOGGER.warning(
-                "connection test to %s exceeded the %.0f s budget — the "
-                "connect or read did not complete in time. The unit is "
-                "likely not accepting the connection (single BLE link "
-                "held by the vendor app?) or is out of range.",
+                "connection test to %s exceeded the %.0f s budget — two "
+                "connect attempts and the read did not complete in time. "
+                "The unit is likely not accepting the connection (single "
+                "BLE link held by the vendor app?) or is out of range.",
                 self._address,
                 TEST_TIMEOUT,
             )

@@ -148,11 +148,14 @@ class AquaTempBleClient:
         """Resolve the device, connect and subscribe to ff02.
 
         max_attempts is the bleak-retry-connector attempt budget: the
-        coordinator keeps the historic default of 2; the config-flow
-        connection test passes 1 — a bounded probe that must fit inside
-        the flow's own TEST_TIMEOUT budget (plan 005 §3). Note that ONE
-        attempt can itself take up to 20 s: bleak-retry-connector hardcodes
-        the per-attempt connect timeout (research 005 §3.2).
+        coordinator keeps the historic default of 2; since spec 006 FR-3
+        the config-flow connection test also passes 2 — two 20 s attempts
+        plus the settle and the read fit inside the flow's 70 s budget.
+        Note that ONE attempt can itself take up to 20 s:
+        bleak-retry-connector hardcodes the per-attempt connect timeout
+        (research 005 §3.2) — and connect() now additionally sleeps
+        SETTLE_AFTER_SUBSCRIBE after subscribing (spec 006 FR-1), so
+        callers' budget math must count both.
 
         Home Assistant path: bleak_retry_connector.establish_connection() —
         retried connects with per-failure backoff, stale bluez connection
@@ -181,9 +184,9 @@ class AquaTempBleClient:
             brc = self._load_retry_connector()
             if brc is not None:
                 # max_attempts is the caller's probe budget (2 for the
-                # coordinator, 1 for the config-flow test); transient
-                # errors (bluez slots, EOF, BrokenPipe) still get extra
-                # retries with backoff inside the library.
+                # coordinator, 2 for the config-flow test since spec 006
+                # FR-3); transient errors (bluez slots, EOF, BrokenPipe)
+                # still get extra retries with backoff inside the library.
                 # timeout=const.CONNECT_TIMEOUT is a CONSTRUCTOR-ONLY
                 # kwarg: brc hardcodes the connect attempt to
                 # BLEAK_TIMEOUT = 20.0 s (research 005 §3.2), so the
@@ -210,6 +213,14 @@ class AquaTempBleClient:
         try:
             await client.start_notify(const.UUID_NOTIFY, self._on_notify)
             self._resolve_write_characteristic(client)
+            # Vendor parity (research 006 §2 step 4): give the module a
+            # beat to route ff02 notifications after the CCCD write
+            # before the first Modbus frame (spec 006 FR-1). Inside this
+            # try block on purpose — a setup failure here must tear down
+            # the half-open client like any other (a cancelled sleep is
+            # handled by the caller's task teardown, spec 005's
+            # cancellation contract).
+            await asyncio.sleep(const.SETTLE_AFTER_SUBSCRIBE)
         except AquaTempError:
             # Link is up but ff02/ff01 setup failed: tear down so the next
             # connect() starts from a clean state.
@@ -302,8 +313,11 @@ class AquaTempBleClient:
     def _resolve_write_characteristic(self, client: BleakClient) -> None:
         """Pick the write mode from the ff01 characteristic properties.
 
-        The app's Dart call hints at Android WRITE_TYPE_DEFAULT (write with
-        response); detection makes us robust either way. [V]
+        Vendor parity (research 006 §2.1): the app writes WITHOUT response
+        (WriteType.withoutResponse in its write path). Rule, in order:
+        write-without-response first, write (with response) fallback, hard
+        error when the characteristic offers neither — never guess a mode
+        the GATT table does not advertise (property-gated, spec 006 FR-2).
         """
         try:
             char = client.services.get_characteristic(const.UUID_WRITE)
@@ -314,7 +328,16 @@ class AquaTempBleClient:
                 f"write characteristic {const.UUID_WRITE} not found on the device"
             )
         props = list(getattr(char, "properties", []) or [])
-        self._write_with_response = "write" in props
+        if "write-without-response" in props:
+            # Vendor parity: the app writes WITHOUT response
+            # (WriteType.withoutResponse in its write path, research 006 §2.1).
+            self._write_with_response = False
+        elif "write" in props:
+            self._write_with_response = True
+        else:
+            raise AquaTempConnectionError(
+                f"write characteristic {const.UUID_WRITE} has no usable write property"
+            )
         _LOGGER.debug(
             "ff01 properties %s -> write_with_response=%s",
             props,

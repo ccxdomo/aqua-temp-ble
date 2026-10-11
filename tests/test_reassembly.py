@@ -105,6 +105,84 @@ def _connected(chunks: list[bytes] | None = None) -> ScriptedClient:
     return client
 
 
+class FakeBLEDevice:
+    """Stand-in for a bleak BLEDevice (address + name only)."""
+
+    def __init__(self, address, name):
+        self.address = address
+        self.name = name
+
+
+class _FakeChar:
+    """GATT characteristic stand-in with scriptable properties."""
+
+    def __init__(self, props):
+        self.properties = list(props)
+
+
+class _FakeServices:
+    """Services collection stand-in exposing one characteristic."""
+
+    def __init__(self, props):
+        self._char = _FakeChar(props)
+
+    def get_characteristic(self, _uuid):
+        return self._char
+
+
+class ConnectableFakeBleakClient:
+    """Fake connected bleak client for driving the REAL connect() body.
+
+    Spec 006 A4/plan §4.1: connect() now sleeps SETTLE_AFTER_SUBSCRIBE
+    after start_notify (FR-1); this fake implements every method the
+    connect path touches (start_notify stores the handler, write_gatt_char
+    replays the scripted chunks as notifications), so the shipped connect()
+    can run over it while the fixture zeroes the settle constant — no
+    wall-clock cost.
+    """
+
+    is_connected = True
+
+    def __init__(self, chunks: list[bytes] | None = None) -> None:
+        self.chunks = list(chunks or [])
+        self._handler = None
+        self.services = _FakeServices(["write-without-response", "write"])
+
+    async def start_notify(self, _uuid, handler) -> None:
+        self._handler = handler
+
+    async def write_gatt_char(self, _uuid, _data, response=True) -> None:
+        for chunk in self.chunks:
+            self._handler(bytearray(chunk))
+
+    async def disconnect(self) -> None:
+        pass
+
+
+class ConnectableScriptedClient(aqua_client.AquaTempBleClient):
+    """ScriptedClient + patched connect() seams, so the REAL connect()
+    body (start_notify, write-char resolution, the settle sleep) runs over
+    ConnectableFakeBleakClient (spec 006 A4)."""
+
+    def __init__(self, chunks: list[bytes] | None = None) -> None:
+        super().__init__(ADDRESS)
+        self.bleak = ConnectableFakeBleakClient(chunks)
+        self.sent: list[bytes] = []
+
+    async def _resolve_device(self):
+        return FakeBLEDevice(ADDRESS, "BlueNRG-C0941C")
+
+    def _load_retry_connector(self):
+        return None  # force the standalone raw-client path
+
+    async def _connect_with_raw_client(self, _device):
+        return self.bleak
+
+    async def _write_frame(self, frame: bytes) -> None:
+        self.sent.append(bytes(frame))
+        await self.bleak.write_gatt_char(None, frame, response=self._write_with_response)
+
+
 # --------------------------------------------------------------------- tests
 def test_reassembly_20_byte_chunks() -> None:
     """95-byte response in 5 chunks of <=20 bytes (default-MTU case)."""
@@ -317,6 +395,35 @@ def test_stale_notification_dropped() -> None:
     asyncio.run(run())
 
 
+def test_connect_settle_zeroed_for_fakes() -> None:
+    """Spec 006 A4/plan §4.1: fixtures zero the post-subscribe settle.
+
+    connect() sleeps SETTLE_AFTER_SUBSCRIBE after start_notify (spec 006
+    FR-1); this fixture monkeypatches the constant to 0 so driving the
+    real connect() body costs no wall-clock. Regression guard: proves the
+    reassembly fakes keep working once the sleep is part of connect().
+    """
+
+    async def run() -> None:
+        resp = _build_response(SYNTHETIC_VALUES)
+        client = ConnectableScriptedClient(_chunks(resp, 20))
+        had_settle = hasattr(const, "SETTLE_AFTER_SUBSCRIBE")
+        settle = getattr(const, "SETTLE_AFTER_SUBSCRIBE", 2.0)
+        const.SETTLE_AFTER_SUBSCRIBE = 0  # zeroed in the fixture (A4)
+        try:
+            await client.connect()
+            assert client.is_connected
+            regs = await client.read_registers(7, 45)
+            assert regs[26] == 243
+        finally:
+            const.SETTLE_AFTER_SUBSCRIBE = settle
+            if not had_settle:
+                # leave the pre-006 module exactly as we found it
+                del const.SETTLE_AFTER_SUBSCRIBE
+
+    asyncio.run(run())
+
+
 def test_single_flight_guard() -> None:
     """A second concurrent request is refused (PAC protection)."""
 
@@ -357,6 +464,7 @@ def main() -> int:
         test_write_echo_timeout_raises,
         test_exception_response_raises,
         test_stale_notification_dropped,
+        test_connect_settle_zeroed_for_fakes,
         test_single_flight_guard,
     ]
     failures = 0

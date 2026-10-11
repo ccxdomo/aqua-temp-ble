@@ -12,6 +12,10 @@ key — no failure may be silent (AC-1) — plus the two new routing cases:
 not_found (device resolution miss, FR-12) and budget expiry (still keyed
 cannot_connect, but logged, FR-5/AC-3).
 
+Extended by spec 006: the connection test gets the vendor app's own
+retry persistence — a 70 s budget (two 20 s connect attempts + settle +
+read, research 006 §2.2) and max_attempts=2 (FR-3/AC-3).
+
 Unlike test_config_flow_list.py (the pure list builder), this file drives
 the ACTUAL flow steps end to end — user menu -> device list -> live test
 -> confirm -> entry — plus every branch: rescan, no-devices menu,
@@ -30,7 +34,8 @@ Run standalone:
 
     python3 tests/test_config_flow_walkthrough.py
 
-No pytest API is used, so plain python works.
+No pytest API is used beyond an optional module-level asyncio mark
+(below), so plain python works.
 """
 
 from __future__ import annotations
@@ -42,6 +47,19 @@ import logging
 import sys
 import types
 from pathlib import Path
+
+# Pytest glue (optional): this suite's cases are bare async functions
+# driven by main() below; under plain pytest, pytest-asyncio's strict
+# mode only runs coroutine tests that carry the asyncio marker. The
+# module-level mark makes `pytest tests/ -q` green too; the standalone
+# runner never reads it, and the guarded import keeps pytest-less hosts
+# working (spec 006 gate D1).
+try:
+    import pytest
+
+    pytestmark = pytest.mark.asyncio
+except ImportError:  # pragma: no cover — pytest-less standalone host
+    pass
 
 COMPONENT_DIR = Path(__file__).resolve().parents[1] / "custom_components" / "aqua_temp_ble"
 PKG = "_aqua_flow_e2e"  # synthetic package name (distinct from the list test)
@@ -314,12 +332,14 @@ class FakeClient:
         self.hass = hass
         self.connected = False
         self.disconnected = False
+        self.connect_kwargs = None  # recorded by connect() (spec 006 AC-3)
         type(self).instances.append(self)
 
     async def connect(self, max_attempts=None):
         # max_attempts kwarg (spec 005): the flow test calls
-        # connect(max_attempts=1) as a bounded probe; the pre-005 flow
+        # connect(max_attempts=2) since spec 006 FR-3; the pre-005 flow
         # called connect() bare — both shapes must work.
+        self.connect_kwargs = {"max_attempts": max_attempts}
         if type(self).fault is not None:
             raise type(self).fault
         self.connected = True
@@ -727,6 +747,29 @@ async def test_budget_expiry_routes_cannot_connect_with_log():
     ), log.messages
 
 
+async def test_connection_test_budget_and_attempts():
+    """Spec 006 FR-3/AC-3: 70 s budget, two connect attempts.
+
+    Red-first: the spec-005 flow passed max_attempts=1 inside a 40 s
+    budget (a second 20 s attempt never fitted); spec 006 gives the probe
+    the vendor app's own persistence — two attempts inside 70 s
+    (2 x 20 s connects + backoff + 2 s settle + 8 s read + margin,
+    plan 006 §3.1; the vendor app retries connects, research 006 §2.2).
+    """
+    assert cf.TEST_TIMEOUT == 70.0, cf.TEST_TIMEOUT
+    hass = FakeHass(infos=[FakeInfo("AA:BB:CC:DD:EE:10", "BlueNRG-7A", -50)])
+    flow = make_flow(hass)
+    result = await flow.async_step_device(
+        user_input={"address": "AA:BB:CC:DD:EE:10"}
+    )
+    assert result["type"] == "progress" and result["step_id"] == "test", result
+    result = await _drive_progress(flow, result)
+    assert result["type"] == "form" and result["step_id"] == "confirm", result
+    client = FakeClient.instances[-1]
+    # The fake client records the kwargs _async_test passed (spec 006 FR-3).
+    assert client.connect_kwargs == {"max_attempts": 2}, client.connect_kwargs
+
+
 async def test_scan_branch_returns_to_user_menu():
     """Menu pick "scan": bounded progress, then the user menu with fresh counts."""
     hass = FakeHass(infos=[FakeInfo("AA:BB:CC:DD:EE:10", "BlueNRG-7A", -50)])
@@ -940,6 +983,7 @@ def main() -> None:
         test_crc_error_failure_routes_to_device_form,
         test_not_found_routes_to_device_form_with_log,
         test_budget_expiry_routes_cannot_connect_with_log,
+        test_connection_test_budget_and_attempts,
         test_scan_branch_returns_to_user_menu,
         test_no_devices_menu_and_configured_exclusion,
         test_no_bluetooth_adapter_aborts,
