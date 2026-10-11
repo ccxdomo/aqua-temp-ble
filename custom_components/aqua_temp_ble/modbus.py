@@ -21,6 +21,12 @@ import struct
 SLAVE_ID = 0x63
 FC_READ_HOLDING = 0x03
 FC_WRITE_MULTI = 0x10
+# The unit's block-frame responses reuse the query-block request byte
+# (research 008 §2.1) — NOT a write echo. A block frame is
+#   63 10 start:2 qty:2 bytecount data:bytecount crc:2LE
+# and bytecount == 2*qty discriminates it from the 8-byte echo whose
+# offset-6 byte is a CRC byte (research 008 §5 Q6).
+FC_BLOCK = 0x10
 
 
 class ModbusError(Exception):
@@ -103,6 +109,22 @@ def validate_crc(frame: bytes) -> bool:
     return len(frame) >= 4 and crc16_modbus(frame[:-2]) == struct.unpack("<H", frame[-2:])[0]
 
 
+def _decode_registers(
+    body: bytes, start: int, count: int, little_endian: bool
+) -> dict[int, int]:
+    """Decode count int16 registers from body -> {register: signed int16}.
+
+    Shared by parse_read_response and parse_block_response (plan 008
+    §1.1 refactor); byte-identical behaviour for FC03 — the self-test
+    round-trip vectors pin it.
+    """
+    regs: dict[int, int] = {}
+    fmt = "<h" if little_endian else ">h"
+    for i in range(count):
+        regs[start + i] = struct.unpack(fmt, body[2 * i : 2 * i + 2])[0]
+    return regs
+
+
 def parse_read_response(
     frame: bytes, start: int, count: int, little_endian: bool = False
 ) -> dict[int, int]:
@@ -117,11 +139,50 @@ def parse_read_response(
         raise ModbusExceptionError(frame[2])
     if frame[1] != FC_READ_HOLDING or frame[2] != 2 * count or len(frame) != 2 * count + 5:
         raise ModbusError(f"malformed response: {frame.hex()}")
-    regs: dict[int, int] = {}
-    fmt = "<h" if little_endian else ">h"
-    for i in range(count):
-        regs[start + i] = struct.unpack(fmt, frame[3 + 2 * i : 5 + 2 * i])[0]
-    return regs
+    return _decode_registers(frame[3 : 3 + 2 * count], start, count, little_endian)
+
+
+def parse_block_response(
+    frame: bytes, start: int, count: int, little_endian: bool = False
+) -> dict[int, int]:
+    """Validate + decode the unit's block frame to {register: signed int16}.
+
+    Shape [P, CRC-verified on 4 live frames — research 008 §2.1]:
+      63 10 start:2 qty:2 bytecount data:bytecount crc16:2 (LE)
+    Length = bytecount + 9 (99 for qty=45). Raises ModbusCRCError (bad
+    CRC), ModbusExceptionError (fc|0x80), ModbusError (shape/start/qty/
+    bytecount mismatch). The same little_endian calibration switch as the
+    base decode (registers.REG_DATA_LITTLE_ENDIAN).
+    """
+    if len(frame) < 9 or not validate_crc(frame):
+        raise ModbusCRCError(f"bad CRC: {frame.hex()}")
+    if frame[1] == FC_BLOCK | 0x80:
+        raise ModbusExceptionError(frame[2])
+    if (
+        frame[0] != SLAVE_ID
+        or frame[1] != FC_BLOCK
+        or struct.unpack(">HH", frame[2:6]) != (start, count)
+        or frame[6] != 2 * count
+        or len(frame) != frame[6] + 9
+    ):
+        raise ModbusError(f"malformed block response: {frame.hex()}")
+    return _decode_registers(frame[7 : 7 + frame[6]], start, count, little_endian)
+
+
+def block_response_length(buf: bytes) -> int | None:
+    """Length of a 63 10 start:2 qty:2 bytecount data crc frame, or None.
+
+    None below 7 bytes (bytecount byte not visible yet) and when
+    buf[6] != 2*qty(buf[4:6]) — the discriminator against the 8-byte
+    write echo, whose offset-6 byte is a CRC byte (research 008 §5 Q6:
+    the two known echoes carry 0x88/0x68 there — no false positive).
+    """
+    if len(buf) < 7 or buf[0] != SLAVE_ID or buf[1] != FC_BLOCK:
+        return None
+    qty = struct.unpack(">H", buf[4:6])[0]
+    if buf[6] != 2 * qty:
+        return None
+    return buf[6] + 9
 
 
 def parse_write_echo(frame: bytes, start: int, qty: int) -> None:
@@ -300,6 +361,121 @@ if __name__ == "__main__":
     ]
     for ok, name in checks:
         _check(f"expected_response_length: {name}", ok, failures)
+
+    # 10. Block frames (spec 008) — the four proven production frames the
+    #     c8d8260 reassembler dropped 12 times (research 008 §1/§2).
+    block_vectors = [
+        # (name, full hex, start, calc CRC, {reg: value} spot checks)
+        (
+            "1001-1045",
+            "631003e9002d5a00000000000000000000000000000000000000000000000100000000000000000000000100000000041a0001000200000000000000000000000000000000000000000000000000000002001e0003000100000000000000000000563a",
+            1001,
+            0x3A56,
+            {1001: 0, 1012: 1, 1021: 1050, 1038: 30, 1045: 0},
+        ),
+        (
+            "1046-1090",
+            "63100416002d5a01220005000500960190010e000500050064015effba00820028000800030000000000000000000000000000010e00000000000000000000000000000000000000000000000000000000000000000000000000000000000000008576",
+            1046,
+            0x7685,
+            {1046: 290, 1056: -70, 1068: 270, 1090: 0},
+        ),
+        (
+            "2046-2090 push 1",
+            "631007fe002d5a7ffd008c008c008c00870096" + "00" * 78 + "f49b",
+            2046,
+            0x9BF4,
+            {2046: 32765, 2047: 140, 2051: 150, 2090: 0},
+        ),
+        (
+            "2046-2090 push 2",
+            "631007fe002d5a7ffd0091008c008c00870096" + "00" * 78 + "a565",
+            2046,
+            0x65A5,
+            {2046: 32765, 2047: 145, 2051: 150},
+        ),
+    ]
+    for name, hexstr, start, crc_val, spot in block_vectors:
+        frame = bytes.fromhex(hexstr)
+        ok = (
+            len(frame) == 99
+            and validate_crc(frame)
+            and crc16_modbus(frame[:-2]) == crc_val
+            and struct.unpack("<H", frame[-2:])[0] == crc_val
+        )
+        _check(f"block frame {name}: 99 B, CRC 0x{crc_val:04X}", ok, failures)
+        try:
+            regs = parse_block_response(frame, start, 45)
+            ok = len(regs) == 45 and all(regs.get(r) == v for r, v in spot.items())
+        except ModbusError:
+            ok = False
+        _check(f"parse_block_response({name}) decode", ok, failures)
+
+    # 11. block_response_length — the boundary rule + the echo
+    #     discriminator (research 008 §5 Q6, contract 008-A §3).
+    frame1001 = bytes.fromhex(block_vectors[0][1])
+    ok = all(block_response_length(frame1001[:p]) == 99 for p in range(7, 100))
+    _check("block_response_length: 99 from every prefix >= 7", ok, failures)
+    ok = all(block_response_length(frame1001[:p]) is None for p in range(0, 7))
+    _check("block_response_length: None below 7 bytes (never guess)", ok, failures)
+    echo8 = _frame(FC_WRITE_MULTI, struct.pack(">HH", 8, 1))
+    echo14 = _frame(FC_WRITE_MULTI, struct.pack(">HH", 14, 1))
+    ok = (
+        echo8[6] == 0x88
+        and echo14[6] == 0x68
+        and block_response_length(echo8) is None
+        and block_response_length(echo14) is None
+    )
+    _check("block_response_length: write echoes (offset-6 0x88/0x68) rejected", ok, failures)
+    # Pathological synthetic echo whose CRC low byte == 2*qty: the length
+    # rule reads it as a block frame (the documented ambiguity — the
+    # reassembler's silence/deadline match check self-heals it, contract
+    # 008-B §4.3).
+    patho = bytes.fromhex("631020000001024b")
+    ok = patho[6] == 0x02 and block_response_length(patho) == 11
+    _check("block_response_length: pathological echo (CRC_lo == 2*qty) -> 11", ok, failures)
+
+    # 12. parse_block_response error paths (plan 008 §1.1 validation order)
+    corrupt_block = bytearray(frame1001)
+    corrupt_block[10] ^= 0xFF
+    try:
+        parse_block_response(bytes(corrupt_block), 1001, 45)
+        ok = False
+    except ModbusCRCError:
+        ok = True
+    _check("block CRC-corrupt raises ModbusCRCError", ok, failures)
+    try:
+        parse_block_response(frame1001[:50], 1001, 45)
+        ok = False
+    except ModbusCRCError:
+        ok = True
+    _check("block truncated raises ModbusCRCError", ok, failures)
+    try:
+        parse_block_response(frame1001, 1091, 45)
+        ok = False
+    except ModbusError as err:
+        ok = type(err) is ModbusError
+    _check("block wrong start raises ModbusError", ok, failures)
+    try:
+        parse_block_response(frame1001, 1001, 44)
+        ok = False
+    except ModbusError as err:
+        ok = type(err) is ModbusError
+    _check("block wrong qty raises ModbusError", ok, failures)
+    exc_head = bytes([SLAVE_ID, FC_BLOCK | 0x80, 0x02]) + b"\x00" * 4
+    exc_frame = exc_head + crc16_modbus(exc_head).to_bytes(2, "little")
+    try:
+        parse_block_response(exc_frame, 1001, 45)
+        ok = False
+    except ModbusExceptionError as err:
+        ok = err.code == 2 and len(exc_frame) == 9
+    _check("block exception fc raises ModbusExceptionError(2)", ok, failures)
+    le_block = parse_block_response(frame1001, 1001, 45, little_endian=True)
+    _check(
+        "block little-endian flip",
+        le_block[1021] == 0x1A04,
+        failures,
+    )
 
     print()
     if failures:

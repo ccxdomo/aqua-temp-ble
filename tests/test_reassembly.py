@@ -5,6 +5,11 @@ Gate (BLUEPRINT §7 step 4): a 95-byte FC03 response split into 20-byte
 chunks, into 2 chunks, and into 1 chunk must all complete correctly; garbage
 prefix and CRC-corrupt paths must raise; silence/delay fallbacks must work.
 
+Spec 008 revised the reassembly rules: silence/deadline complete ONLY
+frames that MATCH the pending request (FR-4), and a CRC-invalid or
+non-matching frame never fails a request (FR-2) — the four updated tests
+below pin that contract (contracts/reassembly-matching.md §4).
+
 Run standalone:
 
     python3 tests/test_reassembly.py
@@ -235,17 +240,34 @@ def test_garbage_prefix_dropped() -> None:
     asyncio.run(run())
 
 
-def test_crc_corrupt_response_raises() -> None:
+def test_crc_corrupt_response_censused_request_keeps_waiting() -> None:
+    """Spec 008 FR-2: a CRC-corrupt response is census-logged at DEBUG and
+    discarded WITHOUT failing the request — it keeps waiting for its own
+    frame, so the deadline raises AquaTempTimeoutError with the honest
+    counters ('received 0 frame(s) / 95 bytes': the bytes arrived, no
+    complete CRC-valid frame was seen).
+
+    History: c8d8260 failed fast with AquaTempResponseError("bad CRC").
+    The spec-008 contract (reassembly-matching.md §2 step 9) removed the
+    fast-fail: a corrupt frame may be a corrupted instance of the expected
+    answer, so the request waits instead of dying.
+    """
+
     async def run() -> None:
         resp = bytearray(_build_response(SYNTHETIC_VALUES))
         resp[10] ^= 0xFF
         client = _connected([bytes(resp)])
+        old = const.REQUEST_TIMEOUT
+        const.REQUEST_TIMEOUT = 0.25  # speed the wait up
         try:
             await client.read_registers(7, 45)
-        except aqua_client.AquaTempResponseError:
-            pass
+        except aqua_client.AquaTempTimeoutError as err:
+            msg = str(err)
         else:
-            raise AssertionError("CRC-corrupt response did not raise")
+            raise AssertionError("corrupt-only response did not time out")
+        finally:
+            const.REQUEST_TIMEOUT = old
+        assert "received 0 frame(s) / 95 bytes" in msg, msg
 
     asyncio.run(run())
 
@@ -268,39 +290,68 @@ def test_no_response_times_out() -> None:
     asyncio.run(run())
 
 
-def test_silence_completion_unknown_shape() -> None:
-    """Rule 2: CRC-valid frame with an unknown fc completes via silence."""
+def test_silence_never_completes_unknown_shape() -> None:
+    """Spec 008 FR-4: the silence timer completes ONLY a CRC-valid frame
+    that MATCHES the pending request — an unknown-shape frame is left to
+    the request deadline, which raises the census AquaTempTimeoutError.
+
+    History: c8d8260 completed any CRC-valid buffer at silence (the
+    fallback for unknown response shapes, written when the high-block
+    answer was [V]). Spec 008 closed that hole: all real shapes are now
+    known [P — research 008 §2.1] and a non-matching buffer must never
+    resolve a request (contract reassembly-matching.md §4.2). The
+    silence self-heal that REMAINS (the pathological write echo) is
+    pinned in test_reassembly_matching.py.
+    """
 
     async def run() -> None:
         head = bytes([modbus.SLAVE_ID, 0x63, 5, 1, 2, 3, 4])  # unknown fc 0x63
         frame = head + modbus.crc16_modbus(head).to_bytes(2, "little")
         client = _connected(_chunks(frame, 4))
-        old_silence = const.SILENCE_TIMEOUT
-        const.SILENCE_TIMEOUT = 0.05  # speed the test up
+        old_silence, old_request = const.SILENCE_TIMEOUT, const.REQUEST_TIMEOUT
+        const.SILENCE_TIMEOUT = 0.05
+        const.REQUEST_TIMEOUT = 0.25
         try:
-            raw = await client.query_block(1001, 45)
+            await client.query_block(1001, 45)
+        except aqua_client.AquaTempTimeoutError as err:
+            assert "received 0 frame(s) / 9 bytes" in str(err)
+            ok = True
+        else:
+            ok = False
         finally:
-            const.SILENCE_TIMEOUT = old_silence
-        assert raw == frame
+            const.SILENCE_TIMEOUT, const.REQUEST_TIMEOUT = old_silence, old_request
+        assert ok, "unknown-shape frame completed a request at silence"
 
     asyncio.run(run())
 
 
-def test_deadline_accepts_crc_valid_frame() -> None:
-    """Rule 3: at the request deadline a CRC-valid buffer is accepted."""
+def test_deadline_requires_matching_frame() -> None:
+    """Spec 008 FR-4 / contract 008-B §4.3: the deadline accepts ONLY a
+    complete CRC-valid frame that MATCHES the request — an unknown-shape
+    CRC-valid buffer is refused and raises the census timeout.
+
+    History: c8d8260 accepted ANY CRC-valid buffer at the deadline. The
+    matching self-heal that REMAINS at the deadline (the pathological
+    echo) is pinned in test_reassembly_matching.py.
+    """
 
     async def run() -> None:
-        head = bytes([modbus.SLAVE_ID, 0x63, 5, 1, 2, 3, 4])  # unknown fc
+        head = bytes([modbus.SLAVE_ID, 0x63, 5, 1, 2, 3, 4])  # unknown fc 0x63
         frame = head + modbus.crc16_modbus(head).to_bytes(2, "little")
         client = _connected(_chunks(frame, 4))
         old_silence, old_request = const.SILENCE_TIMEOUT, const.REQUEST_TIMEOUT
         const.SILENCE_TIMEOUT = 5.0  # silence must NOT fire before the deadline
         const.REQUEST_TIMEOUT = 0.25
         try:
-            raw = await client.query_block(1001, 45)
+            await client.query_block(1001, 45)
+        except aqua_client.AquaTempTimeoutError as err:
+            assert "received 0 frame(s) / 9 bytes" in str(err)
+            ok = True
+        else:
+            ok = False
         finally:
             const.SILENCE_TIMEOUT, const.REQUEST_TIMEOUT = old_silence, old_request
-        assert raw == frame
+        assert ok, "non-matching CRC-valid buffer was accepted at the deadline"
 
     asyncio.run(run())
 
@@ -316,15 +367,32 @@ def test_write_with_echo() -> None:
     asyncio.run(run())
 
 
-def test_write_echo_mismatch_raises() -> None:
+def test_write_echo_mismatch_censused() -> None:
+    """Spec 008 FR-2: an echo for a DIFFERENT register does not match the
+    write request — it is census-logged (1 frame / 8 bytes) and discarded
+    without failing the request; the echo wait ends at its deadline with
+    AquaTempTimeoutError.
+
+    History: c8d8260 completed on any FC10 frame, then parse_write_echo
+    raised AquaTempResponseError("echo mismatch"). Spec 008 moved the
+    start/qty check INTO the match (contract 008-B §3) — a wrong echo
+    can no longer resolve the request.
+    """
+
     async def run() -> None:
         client = _connected([_build_echo(9, 1)])  # echo for a different register
+        old = const.WRITE_ECHO_TIMEOUT
+        const.WRITE_ECHO_TIMEOUT = 0.25
         try:
             await client.write_registers(8, [1])
-        except aqua_client.AquaTempResponseError:
-            pass
+        except aqua_client.AquaTempTimeoutError as err:
+            assert "received 1 frame(s) / 8 bytes" in str(err)
+            ok = True
         else:
-            raise AssertionError("echo mismatch did not raise")
+            ok = False
+        finally:
+            const.WRITE_ECHO_TIMEOUT = old
+        assert ok, "mismatched echo completed the request"
 
     asyncio.run(run())
 
@@ -454,12 +522,12 @@ def main() -> int:
         test_reassembly_two_chunks,
         test_reassembly_single_chunk,
         test_garbage_prefix_dropped,
-        test_crc_corrupt_response_raises,
+        test_crc_corrupt_response_censused_request_keeps_waiting,
         test_no_response_times_out,
-        test_silence_completion_unknown_shape,
-        test_deadline_accepts_crc_valid_frame,
+        test_silence_never_completes_unknown_shape,
+        test_deadline_requires_matching_frame,
         test_write_with_echo,
-        test_write_echo_mismatch_raises,
+        test_write_echo_mismatch_censused,
         test_write_fire_and_forget,
         test_write_echo_timeout_raises,
         test_exception_response_raises,

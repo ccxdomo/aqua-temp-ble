@@ -5,19 +5,29 @@ request/response cycle. Responses to a Modbus request arrive as GATT
 notifications on the notify characteristic (ff02 on the documented
 units; adaptively discovered otherwise — see
 _resolve_notify_characteristic) and MAY be fragmented (typical chunks
-of 20 bytes at
-default MTU; a single 95-byte notification is possible when the MTU is
-negotiated higher; actual chunking is [V]). Reassembly rules, in order
-(BLUEPRINT §2.2d):
+of 20 bytes at default MTU; one whole 99-byte block frame per
+notification was observed in production — research 008 §5 Q4).
 
-1. expected length (primary completion),
-2. silence timeout (SILENCE_TIMEOUT without a new chunk) — covers unknown
-   response shapes, e.g. high-block queries [V],
-3. request timeout (REQUEST_TIMEOUT, overall deadline) — accepts a
-   CRC-valid buffer if one arrived, else raises AquaTempTimeoutError.
+Reassembly rules (BLUEPRINT §2.2d, revised by spec 008 — research 008
+§4, contracts/reassembly-matching.md):
 
-Every completed frame is CRC-validated and function-code-validated before
-the awaiting caller resumes.
+1. boundary completion (primary): accumulate chunks, compute the frame
+   boundary from the accumulated head (_frame_boundary), complete at
+   the boundary;
+2. silence timeout (SILENCE_TIMEOUT without a new chunk) — completes a
+   CRC-valid frame that MATCHES the pending request (the self-heal for
+   boundary-rule misreads, e.g. the pathological write echo — contract
+   008-B §4.2/§4.3);
+3. request timeout (REQUEST_TIMEOUT, overall deadline) — the same match
+   check, else raises AquaTempTimeoutError with the received-frame
+   census (contract 008-B §6).
+
+Every completed frame is CRC-validated and matched against the pending
+request before the awaiting caller resumes: a frame completes a request
+only when its shape — and, for block frames and echoes, its start/qty —
+matches the request (contract 008-B §3). The c8d8260 FC drop-gate
+(research 008 §3) is gone: nothing is ever dropped for its function
+code alone, and non-matching frames are census-logged, never fatal.
 
 Standalone use (outside Home Assistant, e.g. tools/smoke_client.py):
     sys.path.insert(0, "<repo>/custom_components/aqua_temp_ble")
@@ -28,8 +38,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import struct
 import time
 from collections import namedtuple
+from dataclasses import dataclass
 from typing import Any
 
 from bleak import BleakClient, BleakScanner
@@ -118,6 +130,56 @@ def _now() -> float:
     return time.monotonic()
 
 
+@dataclass(frozen=True)
+class _ResponseMatch:
+    """What may complete the in-flight request (contract 008-B §1).
+
+    Each request kind names the response shapes it accepts plus the
+    start/count a frame must echo; _matches() is the single authority on
+    completion — nothing is ever dropped for its function code alone
+    (research 008 §3: the c8d8260 FC gate deleted twelve 99-byte
+    CRC-valid block frames and the read died with 'got 0 bytes').
+    """
+
+    accept_fc03: bool = False   # 63 03 bytecount data crc (95 B for 45 regs)
+    accept_block: bool = False  # 63 10 start qty bytecount data crc (99 B)
+    accept_echo: bool = False   # 63 10 start qty crc (8 B write echo)
+    start: int | None = None    # register start a block/echo frame must echo
+    count: int | None = None    # register count a block/echo frame must echo
+
+
+def _frame_boundary(buf: bytes) -> int | None:
+    """Total length of the frame at the head of buf, or None if unknown.
+
+    Order (contract 008-A §3 — the block rule FIRST for fc 0x10):
+    1. buf[0] != SLAVE_ID -> None (caller already dropped non-Modbus)
+    2. fc & 0x80 -> 5 (exception)
+    3. fc == FC_READ_HOLDING (0x03) -> bytecount+5 (needs len >= 3)
+    4. fc == FC_BLOCK (0x10):
+         len < 7 -> None (bytecount byte not visible — WAIT, never guess:
+           cutting a 99-byte block frame at byte 8 was the second
+           production bug, research 008 §3)
+         block_response_length(buf) -> bytecount+9 (block shape wins)
+         else -> 8 (write echo)
+    5. anything else -> None (silence timer governs)
+    """
+    if len(buf) < 2 or buf[0] != modbus.SLAVE_ID:
+        return None
+    fc = buf[1]
+    if fc & 0x80:
+        return 5
+    if fc == modbus.FC_READ_HOLDING:
+        return buf[2] + 5 if len(buf) >= 3 else None
+    if fc == modbus.FC_BLOCK:
+        if len(buf) < 7:
+            return None
+        block_len = modbus.block_response_length(buf)
+        if block_len is not None:
+            return block_len
+        return 8
+    return None
+
+
 # --------------------------------------------------------------------------
 # Adaptive GATT discovery (the fix for the production incident).
 #
@@ -189,7 +251,13 @@ class AquaTempBleClient:
         self._gatt_chars: list[GattCharInfo] | None = None
         self._rx = bytearray()
         self._pending: asyncio.Future[bytes] | None = None
-        self._expected_fc: int | None = None
+        # Spec 008: the match spec replaces the c8d8260 expected-fc gate
+        # (research 008 §3) — plus the per-request census counters (FR-4).
+        self._match: _ResponseMatch | None = None
+        self._req_rx_bytes = 0        # TOTAL bytes received during the request
+        self._req_frame_count = 0     # complete CRC-valid frames seen
+        self._req_block_starts: list[int] = []  # block starts seen (census)
+        self._idle_census_logged = False  # one INFO census per connect while idle
         self._silence_timer: asyncio.TimerHandle | None = None
 
     # ------------------------------------------------------------------ state
@@ -466,6 +534,14 @@ class AquaTempBleClient:
         client = self._client
         self._client = None
         self._rx.clear()
+        # Spec 008 census state (contract 008-B §7 invariant 4): teardown
+        # clears the match spec, the counters and the once-per-connect
+        # idle census flag.
+        self._match = None
+        self._req_rx_bytes = 0
+        self._req_frame_count = 0
+        self._req_block_starts = []
+        self._idle_census_logged = False
         if client is not None:
             try:
                 await client.disconnect()
@@ -969,11 +1045,13 @@ class AquaTempBleClient:
             response=self._write_with_response,
         )
 
-    async def _request(self, frame: bytes, expected_fc: int | None, timeout: float) -> bytes:
-        """Send one frame and await its complete, validated response.
+    async def _request(self, frame: bytes, match: _ResponseMatch, timeout: float) -> bytes:
+        """Send one frame and await the complete, matching response.
 
-        expected_fc=None accepts any function code (used for the experimental
-        high-block queries whose response shape is unknown [V]).
+        The match spec (contract 008-B §1) is the ONLY authority on what
+        may complete the request — the c8d8260 expected-fc gate is gone
+        (research 008 §3). Non-matching frames are census-logged and
+        never fatal (FR-2).
         """
         if self._pending is not None and not self._pending.done():
             raise AquaTempError("another request is already in flight")
@@ -981,7 +1059,10 @@ class AquaTempBleClient:
             raise AquaTempConnectionError("not connected")
         loop = asyncio.get_running_loop()
         self._pending = loop.create_future()
-        self._expected_fc = expected_fc
+        self._match = match
+        self._req_rx_bytes = 0
+        self._req_frame_count = 0
+        self._req_block_starts = []
         self._rx.clear()
         _LOGGER.debug("TX (%d bytes): %s", len(frame), frame.hex())
         try:
@@ -995,37 +1076,60 @@ class AquaTempBleClient:
                 async with asyncio.timeout(timeout):
                     return await self._pending
             except TimeoutError:
-                # Rule 3: overall deadline — accept a CRC-valid buffer if any.
-                if len(self._rx) >= 5 and modbus.validate_crc(bytes(self._rx)):
+                # Rule 3 (contract 008-B §4.3): overall deadline — accept a
+                # complete CRC-valid frame that MATCHES the request (the
+                # deadline self-heal for boundary-rule misreads), else raise
+                # with the honest census. 'got 0 bytes' reported bytes
+                # REMAINING after the c8d8260 drops, not bytes received
+                # (research 008 §5 Q3); the counters fix that (FR-4).
+                buf = bytes(self._rx)
+                if len(buf) >= 5 and modbus.validate_crc(buf) and self._matches(buf):
                     _LOGGER.debug(
-                        "deadline accepts CRC-valid frame (%d bytes): %s",
-                        len(self._rx),
-                        bytes(self._rx).hex(),
+                        "deadline accepts matching frame (%d bytes): %s",
+                        len(buf),
+                        buf.hex(),
                     )
-                    return bytes(self._rx)
+                    return buf
+                starts_seen = (
+                    ", ".join(str(s) for s in sorted(set(self._req_block_starts)))
+                    or "none"
+                )
                 raise AquaTempTimeoutError(
-                    f"no complete response within {timeout:.1f}s "
-                    f"(got {len(self._rx)} bytes)"
+                    f"no matching response within {timeout:.1f}s "
+                    f"(received {self._req_frame_count} frame(s) / "
+                    f"{self._req_rx_bytes} bytes; blocks seen: {starts_seen}; "
+                    f"none for start {match.start})"
                 ) from None
         finally:
             self._cancel_silence_timer()
             self._pending = None
-            self._expected_fc = None
+            self._match = None
             self._rx.clear()
 
     def _on_notify(self, *args: Any) -> None:
         """Handle one GATT notification chunk.
 
         bleak < 0.22 calls (sender, data); newer bleak calls (data). [V]
+
+        Spec 008 flow (contract 008-B §2): accumulate, boundary-detect,
+        then per complete frame: CRC-validate, census, MATCH against the
+        pending request. A frame is never dropped for its function code
+        alone — the c8d8260 FC gate is the production root cause
+        (research 008 §3).
         """
         data = args[-1] if args else b""
         if const.DEBUG_RAW:
             _LOGGER.debug("ff02 chunk (%d): %s", len(data), bytes(data).hex())
         pending = self._pending
         if pending is None or pending.done():
-            self._rx.clear()  # stale push: drop
+            # No request in flight (settle/idle): census, never
+            # accumulate — a stale push must not poison the next
+            # request's buffer (the c8d8260 'stale push: drop' rule,
+            # now observable — contract 008-B §5).
+            self._idle_census(bytes(data))
             return
         self._rx.extend(data)
+        self._req_rx_bytes += len(data)  # TOTAL received, never reset on discard
         if self._rx and self._rx[0] != modbus.SLAVE_ID:
             _LOGGER.warning(
                 "dropping non-Modbus notify: %s", bytes(self._rx).hex()
@@ -1036,23 +1140,176 @@ class AquaTempBleClient:
             self._rx.clear()
             self._fail_pending(AquaTempResponseError("response too long"))
             return
-        if len(self._rx) >= 2 and self._expected_fc is not None:
-            fc = self._rx[1]
-            if fc not in (self._expected_fc, self._expected_fc | 0x80):
-                _LOGGER.warning(
-                    "dropping unexpected function code 0x%02X: %s",
-                    fc,
-                    bytes(self._rx).hex(),
-                )
-                self._rx.clear()
+        while True:
+            expected = _frame_boundary(bytes(self._rx))
+            if expected is None or len(self._rx) < expected:
+                break
+            frame = bytes(self._rx[:expected])
+            del self._rx[:expected]
+            if not modbus.validate_crc(frame):
+                # CRC-invalid frame: census at DEBUG, keep waiting — a
+                # corrupt frame never fails the request (FR-2, contract
+                # 008-B §2 step 9).
+                self._census_frame(frame, crc_ok=False)
+                continue
+            if frame[1] & 0x80 or self._matches(frame):
+                # Exception frames fail fast, matching frames complete —
+                # the unchanged c8d8260 error semantics, reached via
+                # matching (contract 008-B §3).
+                self._complete(frame)
                 return
-        expected = modbus.expected_response_length(bytes(self._rx))
-        if expected is not None and len(self._rx) >= expected:
-            # Rule 1: expected length reached — complete (remainder dropped).
-            self._complete(bytes(self._rx[:expected]))
-            return
+            # CRC-valid non-matching frame: census (INFO) + counters,
+            # then keep waiting for the request's own frame (contract
+            # 008-B §2 step 12 — never fatal, never completing).
+            self._census_frame(frame, crc_ok=True)
+            break
         # More (or unknown-shape) data may follow: arm the silence timer.
         self._arm_silence_timer()
+
+    def _matches(self, frame: bytes) -> bool:
+        """True when frame may complete the pending request (contract
+        008-B §3).
+
+        The predicates carry their own completeness rules, so a truncated
+        or partial buffer can never match (FR-4): FC03 needs
+        len == bytecount+5, a block frame needs
+        block_response_length(frame) == len(frame), an echo needs exactly
+        8 bytes.
+        """
+        match = self._match
+        if match is None or match.count is None or len(frame) < 3:
+            return False
+        fc = frame[1]
+        if fc == modbus.FC_READ_HOLDING:
+            # An FC03 response carries no start echo — the request supplies
+            # it (unchanged c8d8260 semantics).
+            return (
+                match.accept_fc03
+                and frame[2] == 2 * match.count
+                and len(frame) == frame[2] + 5
+            )
+        if fc == modbus.FC_BLOCK:
+            if modbus.block_response_length(frame) == len(frame):
+                # block frame: start/qty must echo the request
+                return (
+                    match.accept_block
+                    and struct.unpack(">HH", frame[2:6]) == (match.start, match.count)
+                )
+            # 8-byte echo shape — including the pathological echo whose
+            # CRC low byte equals 2*qty (contract 008-B §4.3 self-heals it)
+            return (
+                match.accept_echo
+                and len(frame) == 8
+                and struct.unpack(">HH", frame[2:6]) == (match.start, match.count)
+            )
+        return False
+
+    def _census_frame(self, frame: bytes, crc_ok: bool) -> None:
+        """Census one complete frame seen while a request is pending
+        (FR-4, contract 008-B §5).
+
+        Block pushes are the E1/E2 decision data (research 008 §7): one
+        INFO line each; other shapes log a generic line; CRC-invalid
+        frames at DEBUG. The counters feed the honest timeout message
+        (research 008 §5 Q3).
+        """
+        verdict = "OK" if crc_ok else "FAIL"
+        level = logging.INFO if crc_ok else logging.DEBUG
+        is_block = (
+            len(frame) >= 7
+            and frame[1] == modbus.FC_BLOCK
+            and modbus.block_response_length(frame) == len(frame)
+        )
+        if crc_ok:
+            self._req_frame_count += 1
+        if is_block:
+            start, qty = struct.unpack(">HH", frame[2:6])
+            if crc_ok:
+                self._req_block_starts.append(start)
+                _LOGGER.log(
+                    level,
+                    "block push observed: start=%d qty=%d len=%d crc=%s "
+                    "(waiting for start %s)",
+                    start,
+                    qty,
+                    len(frame),
+                    verdict,
+                    self._match.start if self._match is not None else None,
+                )
+            else:
+                _LOGGER.log(
+                    level,
+                    "block push observed: start=%d qty=%d len=%d crc=%s",
+                    start,
+                    qty,
+                    len(frame),
+                    verdict,
+                )
+        else:
+            _LOGGER.log(
+                level,
+                "frame observed: fc=0x%02X len=%d crc=%s (non-matching; "
+                "request keeps waiting)",
+                frame[1],
+                len(frame),
+                verdict,
+            )
+
+    def _idle_census(self, data: bytes) -> None:
+        """Census frames arriving with no request pending (FR-4, contract
+        008-B §5).
+
+        Settle-time pushes are the periodic-vs-triggered evidence
+        (research 008 §7 E2): one INFO line per connect for the first
+        block push, DEBUG afterwards. Nothing is ever accumulated — a
+        stale push must not poison the next request's buffer (unchanged
+        c8d8260 'stale push: drop' semantics, now observable).
+        """
+        if not data:
+            return
+        if data[0] != modbus.SLAVE_ID:
+            _LOGGER.debug(
+                "dropping non-Modbus notify while idle: %s", data.hex()
+            )
+            return
+        expected = _frame_boundary(data)
+        if expected is not None and len(data) >= expected:
+            frame = data[:expected]
+            crc_ok = modbus.validate_crc(frame)
+            is_block = (
+                crc_ok
+                and len(frame) >= 7
+                and frame[1] == modbus.FC_BLOCK
+                and modbus.block_response_length(frame) == len(frame)
+            )
+            if is_block:
+                start, qty = struct.unpack(">HH", frame[2:6])
+                if not self._idle_census_logged:
+                    self._idle_census_logged = True
+                    _LOGGER.info(
+                        "block push observed while idle: start=%d qty=%d len=%d crc=OK",
+                        start,
+                        qty,
+                        len(frame),
+                    )
+                else:
+                    _LOGGER.debug(
+                        "block push observed while idle: start=%d qty=%d len=%d crc=OK",
+                        start,
+                        qty,
+                        len(frame),
+                    )
+            else:
+                _LOGGER.debug(
+                    "frame observed while idle: fc=0x%02X len=%d crc=%s",
+                    frame[1],
+                    len(frame),
+                    "OK" if crc_ok else "FAIL",
+                )
+        else:
+            _LOGGER.debug(
+                "stale notification chunk while idle (%d bytes)", len(data)
+            )
 
     def _arm_silence_timer(self) -> None:
         """(Re)arm the silence timer after every chunk (rule 2)."""
@@ -1066,7 +1323,14 @@ class AquaTempBleClient:
         if pending is None or pending.done():
             return
         buf = bytes(self._rx)
-        if len(buf) >= 5 and modbus.validate_crc(buf):
+        # Rule 2 (contract 008-B §4.2): complete ONLY a CRC-valid frame
+        # that MATCHES the pending request — a truncated or non-matching
+        # buffer never resolves a request (FR-4). This is the self-heal
+        # path for the pathological echo whose CRC low byte equals 2*qty:
+        # the boundary rule misreads it as a block frame, but the 8-byte
+        # buffer is CRC-valid and matches the echo spec (contract 008-B
+        # §4.3).
+        if len(buf) >= 5 and modbus.validate_crc(buf) and self._matches(buf):
             _LOGGER.debug(
                 "silence timer completes frame (%d bytes): %s", len(buf), buf.hex()
             )
@@ -1074,7 +1338,8 @@ class AquaTempBleClient:
         else:
             # Chunks may still arrive; the request timeout is the final deadline.
             _LOGGER.debug(
-                "silence after %d bytes (no valid CRC yet); waiting for the request timeout",
+                "silence after %d bytes (no matching frame yet); "
+                "waiting for the request timeout",
                 len(buf),
             )
 
@@ -1114,10 +1379,28 @@ class AquaTempBleClient:
 
     # ----------------------------------------------------------- high level
     async def read_registers(self, start: int, count: int) -> dict[int, int]:
-        """FC03 read; returns {register: raw signed int16}."""
+        """FC03 read; returns {register: raw signed int16}.
+
+        Spec 008 FR-3: the request completes on EITHER the FC03 answer OR
+        the unit's block frame echoing (start, count) — the production
+        first-read fix (research 008 §1). The request bytes are unchanged
+        (the vendor-proven base read, research 008 §5 Q5).
+        """
         frame = modbus.build_read_holding_registers(start, count)
-        resp = await self._request(frame, modbus.FC_READ_HOLDING, const.REQUEST_TIMEOUT)
+        resp = await self._request(
+            frame,
+            _ResponseMatch(accept_fc03=True, accept_block=True, start=start, count=count),
+            const.REQUEST_TIMEOUT,
+        )
         try:
+            if resp[1] == modbus.FC_BLOCK:
+                # the pushed block frame (research 008 §2.1)
+                return modbus.parse_block_response(
+                    resp,
+                    start,
+                    count,
+                    little_endian=registers.REG_DATA_LITTLE_ENDIAN,
+                )
             return modbus.parse_read_response(
                 resp,
                 start,
@@ -1128,12 +1411,17 @@ class AquaTempBleClient:
             raise AquaTempResponseError(exc) from exc
 
     async def query_block(self, start: int, count: int) -> bytes:
-        """Experimental 8-byte block query; response shape is unknown [V].
+        """8-byte block query; the unit answers with a block frame [P]
+        (research 008 §2.1): 63 10 start qty bytecount data crc.
 
         Returns the raw CRC-validated response bytes. Never used by polling.
         """
         frame = modbus.build_query_block(start, count)
-        return await self._request(frame, None, const.REQUEST_TIMEOUT)
+        return await self._request(
+            frame,
+            _ResponseMatch(accept_block=True, start=start, count=count),
+            const.REQUEST_TIMEOUT,
+        )
 
     async def write_registers(self, start: int, values: list[int]) -> None:
         """FC10 write (H1 layout) + optional echo wait (registers.WRITE_ECHO_EXPECTED)."""
@@ -1150,7 +1438,11 @@ class AquaTempBleClient:
             except Exception as exc:  # noqa: BLE001
                 raise AquaTempConnectionError(f"GATT write failed: {exc}") from exc
             return
-        echo = await self._request(frame, modbus.FC_WRITE_MULTI, const.WRITE_ECHO_TIMEOUT)
+        echo = await self._request(
+            frame,
+            _ResponseMatch(accept_echo=True, start=start, count=len(values)),
+            const.WRITE_ECHO_TIMEOUT,
+        )
         try:
             modbus.parse_write_echo(echo, start, len(values))
         except modbus.ModbusError as exc:

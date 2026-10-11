@@ -312,7 +312,14 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
     def _log_raw_probe(
         self, block: str, start: int, raw: bytes
     ) -> dict[str, Any]:
-        """Best-effort log of an unknown-shape high-block response. [V]"""
+        """Log a high-block response (spec 008 FR-5: decode block frames).
+
+        The unit's answer to a query block is the block frame proven in
+        research 008 §2.1 — decode it into the per-register probe format
+        (shared with _log_base_probe); a ModbusError falls back to the raw
+        hex dump (plan 008 §3), so the bytes always stay visible. The
+        result dict gains start/qty so the probe output is self-describing.
+        """
         address = self.config_entry.data["address"]
         crc = "OK" if len(raw) >= 4 and modbus.validate_crc(raw) else "FAIL"
         _LOGGER.info(
@@ -324,23 +331,22 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
             len(raw),
             crc,
         )
-        response: dict[str, Any] = {"block": block, "crc": crc}
-        regs: dict[int, int] | None = None
-        if (
-            len(raw) >= 5
-            and raw[0] == modbus.SLAVE_ID
-            and raw[1] == modbus.FC_READ_HOLDING
-            and len(raw) >= raw[2] + 5
-        ):
-            try:
-                regs = modbus.parse_read_response(
-                    bytes(raw[: raw[2] + 5]),
-                    start,
-                    raw[2] // 2,
-                    little_endian=registers.REG_DATA_LITTLE_ENDIAN,
-                )
-            except modbus.ModbusError as exc:
-                _LOGGER.warning("could not parse %s response as FC03: %s", block, exc)
+        response: dict[str, Any] = {
+            "block": block,
+            "crc": crc,
+            "start": start,
+            "qty": registers.BASE_BLOCK_COUNT,
+        }
+        try:
+            regs = modbus.parse_block_response(
+                bytes(raw),
+                start,
+                registers.BASE_BLOCK_COUNT,
+                little_endian=registers.REG_DATA_LITTLE_ENDIAN,
+            )
+        except modbus.ModbusError as exc:
+            _LOGGER.warning("could not parse %s response as a block frame: %s", block, exc)
+            regs = {}
         if regs:
             out: dict[str, Any] = {}
             for addr, value in regs.items():
