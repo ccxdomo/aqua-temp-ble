@@ -1285,6 +1285,7 @@ class FakeProbeClient:
         self.hass = hass
         self.reads: list[dict] = []
         self.pair_calls = 0
+        self.harvest_calls = 0  # spec 013: the push-harvest stage seam
         self.disconnected = False
         self.connect_kwargs = None
         type(self).instances.append(self)
@@ -1319,6 +1320,14 @@ class FakeProbeClient:
         if type(self).pair_error is not None:
             raise type(self).pair_error
         return type(self).pair_result
+
+    async def harvest_pushes(self, wanted_starts=None, timeout=None):
+        # Spec 013 (contract 013 §2): the push-harvest stage after a
+        # probe-None verdict — none of the 011 worlds script pushes, so
+        # the fake returns partials (empty) and the ORIGINAL
+        # no_response path stays exercised byte-identically.
+        self.harvest_calls += 1
+        return {}
 
     async def disconnect(self):
         self.disconnected = True
@@ -1616,7 +1625,9 @@ async def test_options_flow_pair_on_connect_toggle() -> None:
     """FR-6: the options flow gains the boolean toggle, default
     DEFAULT_PAIR_ON_CONNECT (OFF), and submits it into the options."""
     flow = cf.AquaTempOptionsFlowHandler()
-    flow.config_entry = types.SimpleNamespace(options={})
+    # data={} — the real ConfigEntry always carries .data; the options
+    # flow reads the entry mode from it (spec 013 FR-5 push gate).
+    flow.config_entry = types.SimpleNamespace(options={}, data={})
     result = await flow.async_step_init(None)
     assert result["type"] == "form" and result["step_id"] == "init", result
     schema = result["data_schema"]
@@ -1626,7 +1637,9 @@ async def test_options_flow_pair_on_connect_toggle() -> None:
     assert pair_entry.kwargs.get("default") is cf.DEFAULT_PAIR_ON_CONNECT
     assert cf.DEFAULT_PAIR_ON_CONNECT is False  # ships OFF (FR-6)
     # an already-ON entry keeps its value as the default
-    flow.config_entry = types.SimpleNamespace(options={"pair_on_connect": True})
+    flow.config_entry = types.SimpleNamespace(
+        options={"pair_on_connect": True}, data={}
+    )
     result = await flow.async_step_init(None)
     pair_entry = next(
         entry for entry in result["data_schema"]

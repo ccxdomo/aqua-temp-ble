@@ -280,6 +280,30 @@ def _dbus_fast_message() -> Any | None:
         return None
 
 
+@dataclass
+class PushCapture:
+    """One pushed block's latest capture (spec 013 FR-1, contract 013 §3.1).
+
+    The per-connect pushed-block store maps {start: PushCapture}: the
+    LATEST decoded register window (latest-frame-wins — contract 013
+    §3.3: a re-push with one changed register replaces the window
+    atomically), the first/last-seen monotonic timestamps and the
+    per-start push count. Partial windows (CRC-invalid or
+    fragmented-incomplete) never enter the store. The consumer applies
+    the decode rules (contract 013 §3.2 — sentinels, plausibility) and
+    the confirmation gate (contract 013 §5); the store itself only
+    keeps raw signed int16 values.
+    """
+
+    start: int                      # the block's start register (echoed by the frame)
+    qty: int                        # registers per frame (echoed by the frame)
+    length: int                     # frame length in bytes (99 for qty=45)
+    registers: dict[int, int]       # {register: raw signed int16} — latest window
+    first_seen: float               # monotonic ts of the first push of this start
+    last_seen: float                # monotonic ts of the latest push
+    count: int                      # pushes of this start seen this connect
+
+
 @dataclass(frozen=True)
 class _ResponseMatch:
     """What may complete the in-flight request (contract 008-B §1).
@@ -432,6 +456,17 @@ class AquaTempBleClient:
         # write + every re-send) — the `answered after pairing (<n>
         # attempt of the window)` line reads it (contract 011 §3.4).
         self._req_writes = 0
+        # Spec 013 FR-1 (contract 013 §3.1): the per-connect pushed-block
+        # store — every CRC-valid block frame (idle or in-flight) is
+        # decoded and kept here; nothing is discarded unread anymore
+        # (research 013 §5.2: today the 90 data bytes are counted, then
+        # thrown away). Reset with the census state on every connect.
+        self._pushed: dict[int, PushCapture] = {}
+        # Spec 013 FR-2 (contract 013 §3.3): the idle-path accumulate
+        # buffer — a fragmented push arriving while idle must assemble
+        # (the harvest's invariant, research 013 §5.1; the pending path
+        # already has this loop via self._rx).
+        self._idle_rx: bytearray = bytearray()
         self._silence_timer: asyncio.TimerHandle | None = None
 
     # ------------------------------------------------------------------ state
@@ -457,6 +492,16 @@ class AquaTempBleClient:
         window)` line reads it (contract 011 §3.4) — the initial write
         plus every re-send that went out before the answer."""
         return self._req_writes
+
+    @property
+    def pushed_blocks(self) -> dict[int, PushCapture]:
+        """A snapshot of the per-connect pushed-block store (spec 013
+        FR-1/FR-4, contract 013 §3.1): {start: PushCapture} for every
+        CRC-valid block frame received while connected — idle or
+        in-flight, latest-window-wins. Read-only view for the harvest
+        callers and the coordinator's push mode; the store itself is
+        fed by the notify path only (zero TX — contract 013 §1)."""
+        return dict(self._pushed)
 
     # ------------------------------------------------------------ connection
     def _load_retry_connector(self) -> Any | None:
@@ -699,6 +744,11 @@ class AquaTempBleClient:
             self._t_subscribe = t_notify
             self._idle_pushes = []
             self._idle_summary_logged = False
+            # Spec 013 FR-1 (contract 013 §3.1): a fresh connect starts
+            # a fresh pushed-block store — the same reset point as the
+            # 009 idle-window state above.
+            self._pushed = {}
+            self._idle_rx.clear()
             self._resolve_write_characteristic(client)
             t_write_char = _now()
             # Vendor parity (research 006 §2 step 4; proven again by
@@ -843,6 +893,11 @@ class AquaTempBleClient:
         self._idle_pushes = []
         self._t_subscribe = None
         self._idle_summary_logged = False
+        # Spec 013 FR-1 (contract 013 §3.1): the pushed-block store is
+        # per-connect state — cleared with the census state so a stale
+        # capture never survives into the next connection.
+        self._pushed = {}
+        self._idle_rx.clear()
         if client is not None:
             try:
                 await client.disconnect()
@@ -1728,6 +1783,11 @@ class AquaTempBleClient:
         self._req_first_seen = None
         self._req_last_seen = None
         self._rx.clear()
+        # Spec 013 FR-2 (contract 013 §3.3): an idle accumulate fragment
+        # must not leak into the next request's window — a fresh request
+        # starts from an empty idle buffer (a frame split across the
+        # request start is lost, exactly as today).
+        self._idle_rx.clear()
         self._log_idle_summary_once()
         _LOGGER.debug("TX (%d bytes): %s", len(frame), frame.hex())
         resend_task: asyncio.Task[None] | None = None
@@ -1887,7 +1947,12 @@ class AquaTempBleClient:
                 str(start) for start in sorted({s for s, _ in self._idle_pushes})
             )
             first = self._idle_pushes[0][1]
-            _LOGGER.info(
+            # WARNING (contract 013 §2.2 — the only level amendment to
+            # an older contract): the idle summary is the push-onset
+            # evidence (E2, research 009 §1.1) and the operator's panel
+            # keeps WARNING+ only (contract 012 §2). Message byte-identical
+            # to contract 009 §3.
+            _LOGGER.warning(
                 "idle window before first request: %d block push(es), "
                 "starts seen: %s, first at t+%.2fs after subscribe",
                 len(self._idle_pushes),
@@ -1895,7 +1960,7 @@ class AquaTempBleClient:
                 first,
             )
         else:
-            _LOGGER.info("idle window before first request: 0 block push(es)")
+            _LOGGER.warning("idle window before first request: 0 block push(es)")
 
     def _on_notify(self, *args: Any) -> None:
         """Handle one GATT notification chunk.
@@ -1943,6 +2008,13 @@ class AquaTempBleClient:
                 # 008-B §2 step 9).
                 self._census_frame(frame, crc_ok=False)
                 continue
+            # Spec 013 FR-1 (contract 013 §3.1): every CRC-valid BLOCK
+            # frame feeds the pushed-block store BEFORE the census/match
+            # step — even a frame that completes this request, even a
+            # non-matching push (research 013 §5.2: nothing is discarded
+            # unread anymore).
+            if modbus.block_response_length(frame) == len(frame):
+                self._store_push(frame)
             if frame[1] & 0x80 or self._matches(frame):
                 # Exception frames fail fast, matching frames complete —
                 # the unchanged c8d8260 error semantics, reached via
@@ -1994,6 +2066,59 @@ class AquaTempBleClient:
                 and struct.unpack(">HH", frame[2:6]) == (match.start, match.count)
             )
         return False
+
+    def _store_push(self, frame: bytes) -> None:
+        """Feed one CRC-valid block frame into the pushed-block store
+        (spec 013 FR-1, contract 013 §3.1/§3.3).
+
+        Decode via parse_block_response with the start/qty echoed BY THE
+        FRAME (the one decoder — contract 013 §7.2); latest-frame-wins
+        per start (a re-push with one changed register replaces the
+        window atomically, contract 013 §3.3); the FIRST push of each
+        distinct start per connect logs the complete hex at WARNING
+        (contract 013 §2.1 — the U-1 2001-2045 capture mechanism; <= 4
+        lines per connect on the observed unit, bounded). Never raises
+        into the notify path.
+        """
+        start, qty = struct.unpack(">HH", frame[2:6])
+        try:
+            regs = modbus.parse_block_response(
+                bytes(frame),
+                start,
+                qty,
+                little_endian=registers.REG_DATA_LITTLE_ENDIAN,
+            )
+        except modbus.ModbusError as exc:  # defensive: shape+CRC already validated
+            _LOGGER.debug("push store decode failed for start=%d: %s", start, exc)
+            return
+        now = _now()
+        cap = self._pushed.get(start)
+        if cap is None:
+            self._pushed[start] = PushCapture(
+                start=start,
+                qty=qty,
+                length=len(frame),
+                registers=regs,
+                first_seen=now,
+                last_seen=now,
+                count=1,
+            )
+            # WARNING (contract 013 §2.1): the operator's HA log panel
+            # stores WARNING+ only (contract 012 §2) — this line IS the
+            # never-decoded block 2001-2045 capture (research 013 §2.3).
+            _LOGGER.warning(
+                "block push captured: start=%d qty=%d len=%d crc=OK hex=%s",
+                start,
+                qty,
+                len(frame),
+                frame.hex(),
+            )
+        else:
+            # Latest-frame-wins (contract 013 §3.3): the changed window
+            # replaces the previous one (2047: 140 -> 145 [P]).
+            cap.registers = regs
+            cap.last_seen = now
+            cap.count += 1
 
     def _census_frame(self, frame: bytes, crc_ok: bool) -> None:
         """Census one complete frame seen while a request is pending
@@ -2067,20 +2192,46 @@ class AquaTempBleClient:
 
         Settle-time pushes are the periodic-vs-triggered evidence
         (research 008 §7 E2): one INFO line per connect for the first
-        block push, DEBUG afterwards. Nothing is ever accumulated — a
-        stale push must not poison the next request's buffer (unchanged
-        c8d8260 'stale push: drop' semantics, now observable).
+        block push, DEBUG afterwards. Nothing is ever fed into the
+        pending-request buffer — a stale push must not poison the next
+        request's buffer (unchanged c8d8260 'stale push: drop'
+        semantics, now observable).
+
+        Spec 013 FR-1/FR-2 (contract 013 §3.3): the idle path now runs
+        the SAME accumulate/boundary loop as the pending path — a
+        fragmented push (5×20-byte chunks) assembles here and lands in
+        the store; the harvest's zero-TX invariant depends on it
+        (research 013 §5.1: today's per-chunk idle path would lose the
+        fragmented frames).
         """
         if not data:
             return
-        if data[0] != modbus.SLAVE_ID:
+        self._idle_rx.extend(data)
+        if self._idle_rx and self._idle_rx[0] != modbus.SLAVE_ID:
             _LOGGER.debug(
-                "dropping non-Modbus notify while idle: %s", data.hex()
+                "dropping non-Modbus notify while idle: %s", bytes(self._idle_rx).hex()
             )
+            self._idle_rx.clear()
             return
-        expected = _frame_boundary(data)
-        if expected is not None and len(data) >= expected:
-            frame = data[:expected]
+        if len(self._idle_rx) > const.MAX_RX_BUFFER:
+            # Garbage without a boundary: bound the idle buffer the same
+            # way the pending path bounds self._rx.
+            _LOGGER.debug(
+                "idle buffer overflow (%d bytes) — dropping", len(self._idle_rx)
+            )
+            self._idle_rx.clear()
+            return
+        while True:
+            expected = _frame_boundary(bytes(self._idle_rx))
+            if expected is None or len(self._idle_rx) < expected:
+                if self._idle_rx:
+                    _LOGGER.debug(
+                        "stale notification chunk while idle (%d bytes)",
+                        len(self._idle_rx),
+                    )
+                break
+            frame = bytes(self._idle_rx[:expected])
+            del self._idle_rx[:expected]
             crc_ok = modbus.validate_crc(frame)
             is_block = (
                 crc_ok
@@ -2089,6 +2240,10 @@ class AquaTempBleClient:
                 and modbus.block_response_length(frame) == len(frame)
             )
             if is_block:
+                # Spec 013 FR-1 (contract 013 §3.1): the store feed —
+                # BEFORE the census lines; idle or in-flight, every
+                # CRC-valid block frame is kept.
+                self._store_push(frame)
                 start, qty = struct.unpack(">HH", frame[2:6])
                 # Spec 009 FR-1 (plan 009 §2.2): collect (start, t after
                 # subscribe) for the idle-window summary — the E2
@@ -2123,10 +2278,6 @@ class AquaTempBleClient:
                     len(frame),
                     "OK" if crc_ok else "FAIL",
                 )
-        else:
-            _LOGGER.debug(
-                "stale notification chunk while idle (%d bytes)", len(data)
-            )
 
     def _arm_silence_timer(self) -> None:
         """(Re)arm the silence timer after every chunk (rule 2)."""
@@ -2291,6 +2442,57 @@ class AquaTempBleClient:
         except modbus.ModbusError as exc:
             raise AquaTempResponseError(exc) from exc
         _LOGGER.debug("write echo OK: %s", echo.hex())
+
+    # ------------------------------------------------- spec 013 harvest
+    async def harvest_pushes(
+        self,
+        wanted_starts: set[int] | frozenset[int] | None = None,
+        timeout: float | None = None,
+    ) -> dict[int, PushCapture]:
+        """Listen-only harvest (spec 013 FR-2, contract 013 §1): await
+        the unit's spontaneous block pushes on the ALREADY-SUBSCRIBED
+        notify characteristic and send ZERO frames.
+
+        The zero-TX invariant (contract 013 §1.1): no FC03 read, no
+        query, no write, no ATT operation beyond the CCCD subscription
+        connect() already performed — the firmware's application-layer
+        gate (H-APP-GATE, research 013 §0.4) has nothing to drop.
+        Enforcement (§1.3): this method performs no write-characteristic
+        call; the test gate asserts the fake write char received zero
+        writes (AC-2).
+
+        Returns when every start in `wanted_starts` has been seen
+        (CRC-valid, store-fed — idle or in-flight both feed it) or
+        `timeout` elapses. Returns the collected {start: PushCapture}
+        entries; PARTIAL results are allowed and never raise (the
+        caller decides — FR-2). Defaults (const-adjacent, research
+        013 §5.4: all four observed starts arrive within ~16 s):
+        wanted = const.PUSH_HARVEST_STARTS ({1001, 1046, 2001, 2046}),
+        timeout = const.PUSH_HARVEST_TIMEOUT (30 s).
+        """
+        if wanted_starts is None:
+            wanted_starts = const.PUSH_HARVEST_STARTS
+        if timeout is None:
+            timeout = const.PUSH_HARVEST_TIMEOUT
+        if not self.is_connected:
+            # A precondition failure, not a partial result: without the
+            # subscription no push can ever arrive — the caller must
+            # connect first (the flow and the coordinator both do).
+            raise AquaTempConnectionError("not connected")
+        deadline = _now() + timeout
+        while True:
+            got = {
+                start: self._pushed[start]
+                for start in wanted_starts
+                if start in self._pushed
+            }
+            if len(got) == len(wanted_starts):
+                return got
+            if _now() >= deadline:
+                # Partial results at the timeout — never raise (FR-2):
+                # the caller decides what a partial harvest means.
+                return got
+            await asyncio.sleep(0.05)
 
 
 # --------------------------------------------------------------------------

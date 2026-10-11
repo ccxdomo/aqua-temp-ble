@@ -105,6 +105,39 @@ BINARY_ACTIVE_WHEN_NONZERO = True  # [A] polarity default of the binary sensors
 REG_DATA_LITTLE_ENDIAN = False     # [A] register data byte order; flip if the probe
 # shows byte-swapped values (e.g. 0xF300 instead of 0x00F3 for 24.3 degC).
 
+# --- pushed plane (spec 013, data-model 013 §6) ---------------------------
+# The unit pushes four CRC-valid 45-register blocks spontaneously
+# (1001/1046/2001/2046 — [P, research 013 §2]) while NEVER answering our
+# byte-perfect base reads (att-accepted-silent, [P]). Block 2046-2090
+# carries the T-family live temperatures at 2046-2051: the T01 sentinel
+# anchor at 2046 (this unit's only absent sensor [P panel]) and the
+# live-proven 2047 (14.0 -> 14.5 degC between two pushes [P]). The
+# constants below are the single source of truth for the pushed-plane
+# mapping — a permuted calibration outcome is a ONE-LINE edit in
+# PUSHED_TEMPS (quickstart 013 §2).
+PUSH_TEMP_BLOCK_START = 2046          # [P] the T-family live-temperature block
+PUSH_TEMP_CONFIRMED = False           # calibration switch (quickstart 013 §2):
+# False until the owner's side-by-side run matched the app's T-family
+# display (contract 013 §5) — no unconfirmed register is ever displayed
+# under a certain name. The per-entry `push_temp_confirmed` option ORs
+# with this global switch (the WRITE_ECHO_EXPECTED precedent).
+
+# member -> pushed register; the T-window hypothesis (research 013 §2.4).
+PUSHED_TEMPS: dict[str, int] = {
+    "suction_temp": 2046,       # T01 — sentinel on this unit -> unknown
+    "inlet_water_temp": 2047,   # T02 — live-proven register [P]
+    "outlet_water_temp": 2048,  # T03
+    "coil_temp": 2049,         # T04
+    "ambient_temp": 2050,      # T05
+    "exhaust_temp": 2051,      # T06
+}
+
+# The pushed-plane address window (FR-7): the blocks the unit pushes
+# live in the two dataset series 1001-1180 and 2001-2090 (research 013
+# §3); the entity-bearing pushes observed are 2001-2090 only [P].
+PUSH_PLANE_FIRST = 2001
+PUSH_PLANE_LAST = 2090
+
 
 def is_sentinel(raw: int | None) -> bool:
     """True when `raw` is a "sensor absent" sentinel (False for None)."""
@@ -249,6 +282,39 @@ BINARIES: tuple[RegDef, ...] = (
            icon="mdi:water", diagnostic=True, family="S03"),
 )
 
+# --- pushed-plane registries (spec 013 FR-5, data-model 013 §6) ----------
+# PUSHED_MIRRORS: the base-pinned keys with their pushed registers — the
+# same physical quantity on two planes (contract 013 §4.1: one entity
+# key per quantity, never two entities). In push mode these entities
+# exist as today and take their values from the mirrors, but ONLY once
+# the calibration gate is open (contract 013 §4.3) — until then they
+# decode `unknown`.
+PUSHED_MIRRORS: dict[str, int] = {
+    "inlet_water_temp": PUSHED_TEMPS["inlet_water_temp"],
+    "outlet_water_temp": PUSHED_TEMPS["outlet_water_temp"],
+    "ambient_temp": PUSHED_TEMPS["ambient_temp"],
+}
+
+# PUSHED_SENSORS: the push-only keys (no base home [V base]) — created
+# only behind the PUSH_TEMP_CONFIRMED gate (FR-5). Addresses come from
+# PUSHED_TEMPS — the single source of truth (a permuted calibration
+# outcome is a one-line edit there, data-model 013 §6).
+PUSHED_SENSORS: tuple[RegDef, ...] = tuple(
+    RegDef(
+        d.key,
+        PUSHED_TEMPS[d.key],
+        d.label,
+        d.scale,
+        d.signed,
+        d.device_class,
+        d.unit,
+        d.state_class,
+        family=d.family,
+    )
+    for d in SENSORS
+    if d.key in PUSHED_TEMPS and d.key not in PUSHED_MIRRORS
+)
+
 # Reverse map used by the probe logs ("reg N = ... # Label"). The [P]/[V] tag
 # records the confidence level of each label; the family code documents the
 # panel-observed group (spec 003 data-model.md).
@@ -319,6 +385,7 @@ def in_base_block(address: int) -> bool:
 def check_registry_integrity(
     sensors: tuple[RegDef, ...] = SENSORS,
     binaries: tuple[RegDef, ...] = BINARIES,
+    pushed_temps: dict[str, int] | None = None,
 ) -> None:
     """Validate the entity registries (FR-11 / entity-contract.md §6).
 
@@ -329,8 +396,19 @@ def check_registry_integrity(
     - a pinned address outside the polled base block 7..51 (high-block
       polling is not implemented — spec 003 §8; leave such a register
       unpinned until phase B);
-    - a binary RegDef carrying a temperature device_class (or vice versa).
-    The shipped registries must pass — asserted in tests/test_registers.py.
+    - a binary RegDef carrying a temperature device_class (or vice versa);
+    - a pushed-plane violation (spec 013 FR-7, contract 013 §7.1): a
+      pushed key that is not a shipped TEMPERATURE entity key (H/R/P
+      are never entities — spec 003 §6), a pushed address outside
+      2001-2090, or a duplicate address within the pushed plane. The
+      pushed plane maps shipped sensor keys only — validated against
+      the SHIPPED SENSORS, so a custom base-plane tuple passed for the
+      spec-003 rules never breaks the pushed validation. Cross-plane
+      collisions are impossible by the two window checks; mirror
+      pairs (base+push for one key) are the documented legal case
+      (data-model 013 §6).
+    The shipped registries must pass — asserted in tests/test_registers.py
+    and tests/test_registers_push_013.py.
     """
     seen_keys: set[str] = set()
     seen_addresses: dict[int, str] = {}
@@ -362,6 +440,29 @@ def check_registry_integrity(
                     f"{seen_addresses[regdef.address]!r} and {regdef.key!r} (FR-11)"
                 )
             seen_addresses[regdef.address] = regdef.key
+
+    # --- pushed plane (spec 013 FR-7, contract 013 §7.1) -------------------
+    pushed = dict(pushed_temps) if pushed_temps is not None else dict(PUSHED_TEMPS)
+    seen_pushed: dict[int, str] = {}
+    for key, address in pushed.items():
+        shipped = next((d for d in SENSORS if d.key == key), None)
+        if shipped is None or shipped.device_class != "temperature":
+            raise ValueError(
+                f"pushed key {key!r} is not a shipped temperature entity — "
+                "the pushed plane maps shipped sensor keys only (spec 013 "
+                "FR-7; H/R/P are never entities, spec 003 §6)"
+            )
+        if not (PUSH_PLANE_FIRST <= address <= PUSH_PLANE_LAST):
+            raise ValueError(
+                f"pushed register {address} for {key!r} is outside the pushed "
+                f"plane {PUSH_PLANE_FIRST}-{PUSH_PLANE_LAST} (spec 013 FR-7)"
+            )
+        if address in seen_pushed:
+            raise ValueError(
+                f"pushed register {address} pinned for both "
+                f"{seen_pushed[address]!r} and {key!r} (spec 013 FR-7)"
+            )
+        seen_pushed[address] = key
 
 
 check_registry_integrity()

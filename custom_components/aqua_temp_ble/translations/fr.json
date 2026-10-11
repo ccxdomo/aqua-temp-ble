@@ -46,6 +46,14 @@
         "data": {
           "name": "Nom"
         }
+      },
+      "confirm_push": {
+        "title": "Nommez votre appareil",
+        "description": "Le test de connexion vers {address} a réussi en mode push : l'unité n'a répondu à aucune de nos requêtes, mais elle pousse en continu des données vivantes que l'intégration lit désormais sans rien émettre.\n\nEn mode push, seules les entités de surveillance sont disponibles — les capteurs de température apparaissent une fois les valeurs capturées confirmées ci-dessous (ou plus tard dans les options). Le contrôle (climatisation), le code de défaut et la version du firmware sont absents tant que l'unité ne répond pas aux requêtes.\n\n- Alimentation : {power}\n- Mode : {mode}\n- Température d'eau entrante : {inlet}\n- Température d'eau sortante : {outlet}\n- Température ambiante : {ambient}\n\nChoisissez un nom convivial pour cette pompe à chaleur :",
+        "data": {
+          "name": "Nom",
+          "push_temp_confirmed": "Les températures capturées correspondent à la vue des paramètres de l'application (calibration vérifiée)"
+        }
       }
     },
     "error": {
@@ -67,7 +75,8 @@
         "data": {
           "poll_interval": "Intervalle d'interrogation (secondes)",
           "temperature_unit": "Unité de température affichée",
-          "pair_on_connect": "Appairer à la connexion (à activer après preuve)"
+          "pair_on_connect": "Appairer à la connexion (à activer après preuve)",
+          "push_temp_confirmed": "Les températures capturées correspondent à la vue des paramètres de l'application (calibration vérifiée)"
         }
       }
     }

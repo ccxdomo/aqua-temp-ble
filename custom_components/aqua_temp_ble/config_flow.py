@@ -44,6 +44,7 @@ from .const import (
     DOMAIN,
     MAX_OTHER_DEVICES,
     NAME_PREFIXES,
+    PUSH_HARVEST_TIMEOUT,
     SCAN_WAIT_SECONDS,
     UUID_NOTIFY,
     UUID_WRITE,
@@ -204,6 +205,10 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
         self._name: str | None = None
         self._regs: dict[int, int] | None = None
         self._test_error: str | None = None
+        # Spec 013 FR-3: set by the push-harvest stage — the test
+        # SUCCEEDED on the unit's pushed blocks (mode "push"); the
+        # confirm step and the created entry read it.
+        self._push_mode: bool = False
         # Spec 011 FR-2 (contract 011 §2): the running test stage —
         # stamped BEFORE each stage runs (the 007 conventions extended
         # to the probe stages); failure lines report the running stage,
@@ -448,7 +453,13 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
         # errors). The stashed _test_error is consumed by that form.
         self._test_task = None
         if self._test_error is None:
-            return self.async_show_progress_done(next_step_id="confirm")
+            # Spec 013 FR-3: a push-mode success routes to the push
+            # confirm step (the monitoring-only note + the calibration
+            # checkbox, quickstart 013 §2); the classic success keeps
+            # today's exact confirm step (US-6).
+            return self.async_show_progress_done(
+                next_step_id="confirm_push" if self._push_mode else "confirm"
+            )
         if self._origin == "manual":
             return self.async_show_progress_done(next_step_id="manual")
         return self.async_show_progress_done(next_step_id="device")
@@ -498,6 +509,7 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
             "connection test to %s: build %s", self._address, BUILD_VERSION
         )
         self._stage = "connect"
+        self._push_mode = False  # spec 013 FR-3: reset per attempt
         try:
             async with asyncio.timeout(TEST_TIMEOUT):
                 # hass is passed so device resolution reads the HA
@@ -541,7 +553,20 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
                         on_stage=self._set_test_stage,
                     )
                     if regs is None:
-                        raise first_timeout
+                        # Spec 013 FR-3 (contract 013 §2): the push-harvest
+                        # stage — ONLY after the read timed out AND the
+                        # probe stayed silent (the att-accepted-silent
+                        # world, research 013 §0.5): a pure-listening window
+                        # on the already-subscribed notify pipe. ZERO
+                        # frames sent (contract 013 §1) — nothing for the
+                        # application-layer gate to drop. A CRC-valid push
+                        # of the T-family block (start 2046, data-model
+                        # 013 §6) makes the test SUCCEED with mode "push"
+                        # (US-1); no push re-raises the ORIGINAL timeout:
+                        # the no_response key + message stay byte-identical
+                        # (FR-3, US-6).
+                        if not await self._async_push_harvest(client):
+                            raise first_timeout
                 finally:
                     await client.disconnect()
                 self._regs = regs
@@ -642,6 +667,59 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
         else:
             self._test_error = None
 
+    async def _async_push_harvest(self, client: Any) -> bool:
+        """The push-harvest stage (spec 013 FR-3, contract 013 §2.3).
+
+        Runs ONLY after the first read timed out AND the security probe
+        returned None (the att-accepted-silent world — the 0.8.0
+        production trace, research 013 §1): a pure-listening window on
+        the already-subscribed notify pipe. ZERO frames are sent
+        (contract 013 §1) — the firmware's application-layer gate has
+        nothing to drop. Success criterion: >= 1 CRC-valid push of the
+        T-family block (start 2046, data-model 013 §6) -> True (the
+        test SUCCEEDS with mode "push", US-1). No 2046 within the
+        window -> False and the caller re-raises its ORIGINAL first-read
+        timeout: the no_response key + message stay byte-identical
+        (FR-3, US-6). The evidence lines are WARNING (contract 013 §2.3
+        — decisive-once, the panel keeps WARNING+ only, contract 012
+        §2); the success summary's T-window raws are the calibration
+        data source (quickstart 013 §2).
+        """
+        # Stage label per the 007/011 conventions (contract 011 §2):
+        # stamped BEFORE the stage runs so a budget expiry mid-harvest
+        # reports the stage it hit, never a later one.
+        self._stage = "push-harvest"
+        _LOGGER.warning(
+            "push harvest: listening %.0f s for block pushes (no frames sent)",
+            PUSH_HARVEST_TIMEOUT,
+        )
+        caps = await client.harvest_pushes(
+            {1001, 1046, 2001, 2046},  # the four observed starts [P] (research 013 §2)
+            PUSH_HARVEST_TIMEOUT,
+        )
+        t_cap = caps.get(registers.PUSH_TEMP_BLOCK_START)
+        if t_cap is None:
+            _LOGGER.warning(
+                "push harvest: no block pushes within %.0f s",
+                PUSH_HARVEST_TIMEOUT,
+            )
+            return False
+        raws = t_cap.registers
+        _LOGGER.warning(
+            "push harvest: T-block captured (start=%d ×%d); "
+            "T-window raws: 2046=%d 2047=%d 2048=%d 2049=%d 2050=%d 2051=%d",
+            registers.PUSH_TEMP_BLOCK_START,
+            t_cap.count,
+            raws.get(2046, 0),
+            raws.get(2047, 0),
+            raws.get(2048, 0),
+            raws.get(2049, 0),
+            raws.get(2050, 0),
+            raws.get(2051, 0),
+        )
+        self._push_mode = True
+        return True
+
     async def async_step_confirm(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
@@ -660,6 +738,58 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
             options={
                 "poll_interval": DEFAULT_POLL_INTERVAL,
                 "temperature_unit": DEFAULT_TEMPERATURE_UNIT,
+            },
+        )
+
+    async def async_step_confirm_push(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """The push-mode confirm step (spec 013 FR-3/FR-5).
+
+        Same summary placeholders as the classic confirm step — all
+        "unknown" here (no base answer exists in push mode; no
+        unconfirmed register is ever displayed under a certain name,
+        contract 013 §4.3) — plus the push-mode note (the confirm-step
+        UI string, FR-3/FR-6.1): monitoring entities only; control,
+        the fault code and the firmware version are absent until the
+        request path revives (spec 013 §6 — no promise of control).
+        The `push_temp_confirmed` checkbox is the calibration gate
+        (FR-5, quickstart 013 §2): the owner checks it ONLY after the
+        side-by-side run matched the app's T-family display (contract
+        013 §5); a mismatch is reported and pins nothing.
+        """
+        if user_input is None:
+            return self.async_show_form(
+                step_id="confirm_push",
+                data_schema=vol.Schema(
+                    {
+                        vol.Required("name", default=DEFAULT_NAME): str,
+                        vol.Optional("push_temp_confirmed", default=False): bool,
+                    }
+                ),
+                description_placeholders=_probe_placeholders(
+                    self._address, self._regs or {}
+                ),
+            )
+        return self.async_create_entry(
+            title=user_input["name"],
+            data={
+                "address": self._address,
+                "name": user_input["name"],
+                # Spec 013 FR-3: the entry's read plane — "push" entries
+                # never send request frames (the coordinator's push mode,
+                # FR-4); classic entries keep today's exact shape (no
+                # mode field, US-6).
+                "mode": "push",
+            },
+            options={
+                "poll_interval": DEFAULT_POLL_INTERVAL,
+                "temperature_unit": DEFAULT_TEMPERATURE_UNIT,
+                # Spec 013 FR-5: the calibration gate, stored on the
+                # entry (contract 013 §5.3 — the shipped default False).
+                "push_temp_confirmed": bool(
+                    user_input.get("push_temp_confirmed", False)
+                ),
             },
         )
 
@@ -694,23 +824,33 @@ class AquaTempOptionsFlowHandler(OptionsFlow):
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
         current = self.config_entry.options
-        schema = vol.Schema(
-            {
+        schema: dict[Any, Any] = {
+            vol.Required(
+                "poll_interval",
+                default=current.get("poll_interval", DEFAULT_POLL_INTERVAL),
+            ): vol.All(vol.Coerce(int), vol.Range(min=10, max=600)),
+            vol.Required(
+                "temperature_unit",
+                default=current.get("temperature_unit", DEFAULT_TEMPERATURE_UNIT),
+            ): vol.In({"C": "Celsius (°C)", "F": "Fahrenheit (°F)"}),
+            # Spec 011 FR-6: the evidence-gated pairing lever — OFF
+            # until the connection test proved the bond gate (the
+            # `security probe: answered after pairing` line).
+            vol.Required(
+                "pair_on_connect",
+                default=current.get("pair_on_connect", DEFAULT_PAIR_ON_CONNECT),
+            ): bool,
+        }
+        if str(self.config_entry.data.get("mode", "classic")) == "push":
+            # Spec 013 FR-5 (contract 013 §5.3): the calibration gate's
+            # post-setup flip — the owner matches the captured T-window
+            # against the app's T-family display (quickstart 013 §2),
+            # then reloads so the temperature entities appear. Classic
+            # entries keep today's exact options form (US-6).
+            schema[
                 vol.Required(
-                    "poll_interval",
-                    default=current.get("poll_interval", DEFAULT_POLL_INTERVAL),
-                ): vol.All(vol.Coerce(int), vol.Range(min=10, max=600)),
-                vol.Required(
-                    "temperature_unit",
-                    default=current.get("temperature_unit", DEFAULT_TEMPERATURE_UNIT),
-                ): vol.In({"C": "Celsius (°C)", "F": "Fahrenheit (°F)"}),
-                # Spec 011 FR-6: the evidence-gated pairing lever — OFF
-                # until the connection test proved the bond gate (the
-                # `security probe: answered after pairing` line).
-                vol.Required(
-                    "pair_on_connect",
-                    default=current.get("pair_on_connect", DEFAULT_PAIR_ON_CONNECT),
-                ): bool,
-            }
-        )
-        return self.async_show_form(step_id="init", data_schema=schema)
+                    "push_temp_confirmed",
+                    default=current.get("push_temp_confirmed", False),
+                )
+            ] = bool
+        return self.async_show_form(step_id="init", data_schema=vol.Schema(schema))

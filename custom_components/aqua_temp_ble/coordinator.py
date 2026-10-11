@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
 
@@ -26,6 +27,13 @@ from . import const, modbus, registers
 from .aqua_client import AquaTempBleClient, AquaTempError
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _now() -> float:
+    """Monotonic clock seam (the contract 007 §4 pattern — the ONLY
+    clock the push-mode freshness gate reads, spec 013 FR-4; tests patch
+    this module attribute, never time.monotonic globally)."""
+    return time.monotonic()
 
 # name (registers.MODE_VALUE_TO_NAME) -> HVACMode. The int<->HVAC mapping is
 # derived from registers.MODE_VALUE_TO_NAME so the calibration surface stays
@@ -60,6 +68,11 @@ _logged_unknown_modes: set[int | None] = set()
 # absent" states, not errors; they stay visible as raw values in the probe
 # dumps, which is exactly where they are useful.
 _logged_implausible: set[int] = set()
+
+# Spec 013 (contract 013 §4.2): a base-plane capture while in push mode
+# is an anomaly — logged ONCE per HA session, otherwise ignored. The
+# module-set pattern of _logged_implausible (mutable without a global).
+_logged_push_mode_base: set[str] = set()
 
 
 def decode_temp_logged(address: int, raw: int | None) -> float | None:
@@ -108,6 +121,13 @@ class AquaTempData:
     fault_code: int | None           # reg 47
     firmware: str | None             # regs 48..51 joined
     binaries: dict[str, bool | None]  # verified binary regs only
+    # --- spec 013 pushed-plane fields (appended WITH defaults; the
+    # classic from_regs call site above is untouched) ---
+    mode: str = "classic"             # "classic" | "push" (spec 013 FR-3)
+    push_confirmed: bool = False      # the calibration gate (FR-5, contract 013 §4.3)
+    push_counts: dict[int, int] = field(default_factory=dict)  # per-start push counts (FR-6)
+    push_first_seen: float | None = None  # the T-block's first push ts (FR-6)
+    push_last_seen: float | None = None   # the T-block's latest push ts (freshness gate)
 
     @classmethod
     def from_regs(cls, regs: dict[int, int]) -> AquaTempData:
@@ -190,6 +210,49 @@ class AquaTempData:
             binaries=binaries,
         )
 
+    @classmethod
+    def from_pushes(cls, captures: dict[int, Any], confirmed: bool) -> AquaTempData:
+        """Build the snapshot from the pushed-block store (spec 013 FR-4,
+        contract 013 §4).
+
+        Only the T-family block (start registers.PUSH_TEMP_BLOCK_START)
+        feeds the entity plane — and ONLY when the calibration gate is
+        open (contract 013 §4.3: unconfirmed raws never enter the entity
+        plane; the mirrored keys decode `unknown` instead). Every capture
+        still feeds the diagnostic counts (FR-6). Control keys
+        (power/mode/setpoint/fault/firmware) have NO pushed home [P/V]
+        — None by design; the climate entity is not created and no write
+        is ever attempted (contract 013 §4.4 — optimistic state is
+        forbidden, spec 001 precedent). Binaries stay empty (their
+        pushed homes are unknown [V]).
+        """
+        t_cap = captures.get(registers.PUSH_TEMP_BLOCK_START)
+        regs: dict[int, int] = {}
+        if t_cap is not None and confirmed:
+            regs = dict(t_cap.registers)
+        counts = {int(start): cap.count for start, cap in captures.items()}
+        return cls(
+            registers=regs,
+            power=None,
+            boost=None,
+            mode_value=None,
+            hvac_mode=None,
+            target_temp=None,
+            min_target=None,
+            max_target=None,
+            inlet_temp=None,
+            outlet_temp=None,
+            ambient_temp=None,
+            fault_code=None,
+            firmware=None,
+            binaries={},
+            mode="push",
+            push_confirmed=confirmed,
+            push_counts=counts,
+            push_first_seen=t_cap.first_seen if t_cap is not None else None,
+            push_last_seen=t_cap.last_seen if t_cap is not None else None,
+        )
+
 
 class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
     """One FC03 read per cycle. Writes are serialized against reads."""
@@ -226,7 +289,15 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
 
     # -------------------------------------------------------------- polling
     async def _async_update_data(self) -> AquaTempData:
-        """Exactly one 45-register FC03 read per cycle; no retry storm."""
+        """Exactly one 45-register FC03 read per cycle; no retry storm.
+
+        Spec 013 FR-4: entries with mode == "push" NEVER send a request —
+        their cycle reads the pushed-block store instead (contract 013
+        §1: zero TX; this unit ignores our reads but pushes continuously
+        [P], and each never-answered read costs 8 s of the cycle,
+        research 013 §5.6)."""
+        if str(self.config_entry.data.get("mode", "classic")) == "push":
+            return await self._async_update_push()
         async with self._io_lock:
             if not self.client.is_connected:
                 # Spec 011 FR-6: the evidence-gated pairing lever. Default
@@ -246,6 +317,99 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
                 await self.client.disconnect()  # clean slate for next cycle
                 raise UpdateFailed(f"read failed: {err}") from err
             return AquaTempData.from_regs(regs)
+
+    # ------------------------------------------------ spec 013 push mode
+    def push_freshness_window(self) -> float:
+        """max(2 x poll interval, 60 s) — the freshness rule of contract
+        013 §6.1: a store entry is used only while its last-seen age
+        stays inside this window (the long-run push cadence is unproven,
+        U-3 — the rule guards against a stale stream shown as current)."""
+        interval = self.config_entry.options.get(
+            "poll_interval", const.DEFAULT_POLL_INTERVAL
+        )
+        return max(2.0 * float(interval), 60.0)
+
+    @property
+    def push_temp_confirmed(self) -> bool:
+        """The calibration gate (spec 013 FR-5, contract 013 §4.3): the
+        per-entry `push_temp_confirmed` option OR the global registers
+        switch (the one-line calibration fix, the WRITE_ECHO_EXPECTED
+        precedent). False until the side-by-side run matched the app's
+        T-family display (quickstart 013 §2) — no unconfirmed register
+        is ever displayed under a certain name."""
+        return bool(
+            registers.PUSH_TEMP_CONFIRMED
+            or self.config_entry.options.get("push_temp_confirmed", False)
+        )
+
+    def now(self) -> float:
+        """The coordinator's monotonic clock (the _now seam, contract 007
+        §4) — public so the entity platforms share the freshness gate's
+        clock (spec 013 FR-6, the push_stream diagnostic)."""
+        return _now()
+
+    def _log_push_mode_base_anomaly(self) -> None:
+        """Contract 013 §4.2: a base-plane capture in the store while in
+        push mode is an ANOMALY — one WARNING per HA session, the data
+        otherwise ignored (this spec never reverts the mode; the mode
+        re-evaluation is a future spec's decision)."""
+        if "base" in _logged_push_mode_base:
+            return
+        _logged_push_mode_base.add("base")
+        _LOGGER.warning(
+            "push mode: base-block frame captured in the pushed store "
+            "(start %d) — the request path may have revived; treating it "
+            "as an anomaly and ignoring it per contract 013 §4.2 (the "
+            "mode re-evaluation is a future spec's decision)",
+            registers.BASE_BLOCK_START,
+        )
+
+    async def _async_update_push(self) -> AquaTempData:
+        """The push-mode cycle (spec 013 FR-4, contract 013 §1/§6.2): ZERO
+        request frames — read the store, not the link.
+
+        The ladder (contract 013 §6.2): connect (the CCCD subscription
+        connect() already performs — the only ATT operation allowed,
+        §1.1) -> read the store -> re-harvest when the T-block entry is
+        missing or stale (the zero-TX listen window, FR-2's API) -> fail
+        honestly with UpdateFailed("push stream silent") and recycle the
+        link (the next cycle's connect starts fresh — U-3's defensive
+        stance). Push-mode failures NEVER fall back to sending requests
+        (§6.2): the request path is dead for this unit [P] and nothing
+        this spec adds can be refused (§1.2)."""
+        async with self._io_lock:
+            if not self.client.is_connected:
+                await self.client.connect(
+                    pair=self.config_entry.options.get(
+                        "pair_on_connect", const.DEFAULT_PAIR_ON_CONNECT
+                    )
+                )
+            captures = dict(self.client.pushed_blocks)
+            window = self.push_freshness_window()
+            t_cap = captures.get(registers.PUSH_TEMP_BLOCK_START)
+            now = _now()
+            if t_cap is None or now - t_cap.last_seen > window:
+                # Rung 2 — re-harvest: a bounded zero-TX listen on the
+                # already-subscribed pipe (observed: all four starts
+                # within ~16 s, research 013 §5.4 — wide margin).
+                caps = await self.client.harvest_pushes(
+                    {registers.PUSH_TEMP_BLOCK_START},
+                    const.PUSH_HARVEST_TIMEOUT,
+                )
+                if caps:
+                    captures.update(caps)
+                    t_cap = captures.get(registers.PUSH_TEMP_BLOCK_START)
+                now = _now()
+            if t_cap is None or now - t_cap.last_seen > window:
+                # Rung 3 — fail honestly; the disconnect recycles the
+                # link for the next cycle (U-3).
+                await self.client.disconnect()
+                raise UpdateFailed("push stream silent")
+            if registers.BASE_BLOCK_START in captures:
+                # Contract 013 §4.2: a base-plane frame in the store
+                # while in push mode — anomaly, logged once, ignored.
+                self._log_push_mode_base_anomaly()
+            return AquaTempData.from_pushes(captures, self.push_temp_confirmed)
 
     async def async_write_register(self, address: int, value: int) -> None:
         """Serialize a write against reads, then confirm with one refresh."""

@@ -84,6 +84,18 @@ DEFAULT_PAIR_ON_CONNECT = False
 # §10.1); capability-checked with inspect.signature, never assumed.
 PAIR_ENABLE_PROP = "pair"
 
+# Spec 013 (the pushed-block harvest — the listen-only read plane): the
+# harvest listens for the unit's spontaneous block pushes and sends
+# NOTHING (contract 013 §1 — zero TX; nothing the firmware's
+# application-layer gate could drop). The 30 s window: all four
+# observed starts appeared within two consecutive 8 s request windows
+# (~16 s) in production (research 013 §5.4) — wide margin. The default
+# wanted set is the four observed block starts [P] (1001/1046/2001/
+# 2046); the app's other two query blocks (1091/1136) are appended if
+# ever seen [V].
+PUSH_HARVEST_TIMEOUT = 30.0
+PUSH_HARVEST_STARTS = frozenset({1001, 1046, 2001, 2046})
+
 # Config flow (spec 002) — scanning UX tuning (tasks.md block 1).
 # Flow-facing constants live here, next to the other integration-wide
 # knobs; everything above stays protocol-only.

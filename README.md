@@ -204,6 +204,58 @@ directly (the decision matrix of
 binding for the follow-up; the "bLE" choreography and the persistence
 retest remain documented in the 011 quickstart).
 
+## Push mode — reading the unit's own data stream (spec 013)
+
+Three production runs proved this unit **never answers** the byte-perfect
+base read (the connection test's `security probe: verdict
+att-accepted-silent` line): the GATT layer accepts our writes, the
+Modbus engine stays silent. The unit, however, **pushes** four
+CRC-valid 45-register blocks spontaneously on the notify
+characteristic (~2 frames/s): `1001-1045`, `1046-1090`,
+`2001-2045`, `2046-2090`. These are two different data **planes**
+with no register offset between them (research 013 §3):
+
+- **Base plane** (registers 7-51): status/control — power, mode,
+  setpoint, temperatures, fault, firmware. Read by FC03 requests —
+  which this unit ignores.
+- **Pushed plane** (registers 1001-2090): the app's parameter view —
+  the **T-family live temperatures** at 2046-2051 (the absent-sensor
+  sentinel `0x7FFD` at 2046 matches T01 Suction, and 2047 changed
+  live between two pushes), the H-family settings at 1018-1023, the
+  R-family thresholds at 1046-1060. The block `2001-2045` is still
+  **undecoded** — its capture is this spec's main open evidence.
+
+**What build 0.9.0 ships** (`specs/013-pushed-blocks-coverage/`): the
+connection test ends with a **push-harvest stage** — after the read
+timeout and the silent probe, it listens for the pushes for 30 s
+while sending **zero frames** (nothing the firmware's gate could
+drop). Seeing the T-family block (start 2046) makes the test
+**succeed** with mode `push` — the integration stops dead-ending
+`no_response` against a unit that talks constantly. A `push` entry
+never sends the doomed 8-second request per poll cycle: it reads the
+push stream (freshness-gated; a silent stream goes honestly
+`unavailable` and the link recycles), updates arrive at push cadence
+(observed ≤ ~4 s — faster than the 30 s poll). The first push of each
+block is logged at WARNING with its **full hex** (`block push
+captured: start=… hex=…`, ≤ 4 lines per connection) — that
+`start=2001` line is the never-decoded block's capture; paste it back
+for analysis. A `push_stream` diagnostic sensor reports the per-start
+push counts and ages.
+
+**Honesty rules in push mode:** only monitoring entities exist. The
+temperature sensors appear **only after the one-run calibration
+check** — photograph the app's parameter view (password "66"), kill
+the app, run the connection test within ~2 minutes, compare the
+success summary's `T-window raws:` line with the photo, then check
+"values matched" on the confirm step (or later in the options) and
+reload. Until confirmed, the mirrored keys show `unknown`; a mismatch
+is reported and pins nothing (the mapping is one editable line in
+`registers.py`). The suction sensor stays `unknown` on this unit — its
+T01 sensor is absent; that is the honest state. Climate control, the
+fault code and the firmware version have **no identified home in the
+pushes** — those entities are simply not created in push mode, and no
+control is promised.
+
 ## Troubleshooting
 
 | Symptom | Cause / fix |

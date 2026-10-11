@@ -326,7 +326,10 @@ def test_idle_summary_with_settle_pushes() -> None:
         assert regs[26] == 243  # the request itself still completes
         summaries = [
             m for lvl, m in cap.records
-            if lvl >= logging.INFO and "idle window before first request" in m
+            # Spec 013 (contract 013 §2.2, the only level amendment): the
+            # idle summary moved INFO -> WARNING — re-pinned here; the
+            # message stays byte-identical to contract 009 §3.
+            if lvl == logging.WARNING and "idle window before first request" in m
         ]
         assert summaries == [
             "idle window before first request: 4 block push(es), "
@@ -355,7 +358,9 @@ def test_idle_summary_zero_pushes() -> None:
         assert summaries == [
             "idle window before first request: 0 block push(es)"
         ], cap.records
-        assert summaries[0] in [m for lvl, m in cap.records if lvl >= logging.INFO]
+        # Spec 013 (contract 013 §2.2): the summary is WARNING now —
+        # re-pinned (the message itself is byte-identical).
+        assert summaries[0] in [m for lvl, m in cap.records if lvl == logging.WARNING]
 
     with _FakeClockPatch(clock):
         asyncio.run(run())
