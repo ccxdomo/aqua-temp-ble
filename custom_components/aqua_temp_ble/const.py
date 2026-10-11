@@ -10,10 +10,17 @@ DOMAIN = "aqua_temp_ble"
 # strings are used on purpose (see module docstring).
 PLATFORMS = ["climate", "sensor", "binary_sensor", "button"]
 
-# GATT characteristics recovered from the vendor app (FINDINGS.md §3, §11.3)
+# GATT characteristics recovered from the vendor app (FINDINGS.md §3, §11.3).
+# FIRST choice on every connect; when the unit does not expose them,
+# aqua_client discovers the real characteristics adaptively instead of
+# failing (see aqua_client.py, adaptive GATT discovery).
 UUID_WRITE = "0000ff01-0000-1000-8000-00805f9b34fb"   # [P] handle 2214
 UUID_NOTIFY = "0000ff02-0000-1000-8000-00805f9b34fb"  # [P] handle 2216
-# ff03 (handle 2215) exists but its role is unknown — do NOT use it. [V]
+# ff03 (handle 2215): role unknown in the vendor app dump (FINDINGS.md
+# §11.3). LAST-RESORT write candidate for the adaptive discovery — tried
+# only when ff01 is absent and no vendor service exposes a writable
+# characteristic. [V]
+UUID_WRITE_FALLBACK = "0000ff03-0000-1000-8000-00805f9b34fb"
 
 # BLE name prefixes the vendor app itself filters on (Dart pool). [P]
 # Operating channel: "BlueNRG-" + "WT-" (research 006 §3); "hiflying-" is

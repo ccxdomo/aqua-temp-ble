@@ -2,7 +2,10 @@
 
 Owns the bleak connection and enforces a strict one-at-a-time
 request/response cycle. Responses to a Modbus request arrive as GATT
-notifications on ff02 and MAY be fragmented (typical chunks of 20 bytes at
+notifications on the notify characteristic (ff02 on the documented
+units; adaptively discovered otherwise — see
+_resolve_notify_characteristic) and MAY be fragmented (typical chunks
+of 20 bytes at
 default MTU; a single 95-byte notification is possible when the MTU is
 negotiated higher; actual chunking is [V]). Reassembly rules, in order
 (BLUEPRINT §2.2d):
@@ -26,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import namedtuple
 from typing import Any
 
 from bleak import BleakClient, BleakScanner
@@ -114,6 +118,58 @@ def _now() -> float:
     return time.monotonic()
 
 
+# --------------------------------------------------------------------------
+# Adaptive GATT discovery (the fix for the production incident).
+#
+# Production evidence: the user's unit establishes the GATT link in
+# ~2.9 s but does NOT expose ff01 — the historic hard-coded lookup died
+# with "write characteristic 0000ff01-... not found on the device". The
+# unit's real table is unknown (its advertisement exposes no service
+# UUIDs either), so the client now ENUMERATES the table after connect
+# (logged at INFO), resolves the write/notify characteristics
+# adaptively with ff01/ff02 as the FIRST choice, and fails with an
+# error whose MESSAGE lists the real table when nothing usable exists.
+
+#: One enumerated GATT characteristic (uuid/handle/properties + the
+#: service that hosts it). Built by _enumerate_gatt, consumed by the
+#: adaptive resolvers and the listing error messages.
+GattCharInfo = namedtuple(
+    "GattCharInfo", ["uuid", "handle", "properties", "service_uuid", "service_handle"]
+)
+
+# The Bluetooth base UUID suffix: 16-bit aliases are the
+# 0000XXXX-0000-1000-8000-00805f9b34fb literals.
+_STANDARD_UUID_SUFFIX = "-0000-1000-8000-00805f9b34fb"
+
+
+def _sixteen_bit_alias(uuid: str) -> int | None:
+    """16-bit alias of a standard-base UUID, else None (full 128-bit)."""
+    text = str(uuid).strip().lower()
+    if len(text) == 36 and text.startswith("0000") and text[8:] == _STANDARD_UUID_SUFFIX:
+        try:
+            return int(text[4:8], 16)
+        except ValueError:
+            return None
+    return None
+
+
+def _is_vendor_service_uuid(uuid: str) -> bool:
+    """True unless the UUID is a standard SIG service.
+
+    Heuristic, deliberately cheap: a full 128-bit UUID without the
+    Bluetooth base is vendor-specific by definition, and a 16-bit
+    alias outside the 0x1800-0x18FF standard block too — that covers
+    the 0xFF00-0xFFFF transparent-transport convention of the Chinese
+    modules (ff00/ff01/ff02, FINDINGS §11.3) and member services such
+    as 0xFE59 (Nordic UART). Standard services (GAP 0x1800, GATT
+    0x1801, device info 0x180A, battery 0x180F, ...) never host the
+    vendor protocol pipe, so their characteristics are never
+    candidates for the fallbacks.
+    """
+    alias = _sixteen_bit_alias(uuid)
+    return alias is None or not (0x1800 <= alias <= 0x18FF)
+
+
 class AquaTempBleClient:
     """Bleak connection + single-flight Modbus request/response cycle."""
 
@@ -125,6 +181,12 @@ class AquaTempBleClient:
         self._hass = hass  # optional Home Assistant instance (device cache)
         self._client: BleakClient | None = None
         self._write_with_response = True
+        # Adaptive GATT discovery (see the module-level note): resolved
+        # during connect() — the known UUIDs when the device exposes
+        # them, discovered fallbacks otherwise.
+        self._write_uuid: str | None = None
+        self._notify_uuid: str | None = None
+        self._gatt_chars: list[GattCharInfo] | None = None
         self._rx = bytearray()
         self._pending: asyncio.Future[bytes] | None = None
         self._expected_fc: int | None = None
@@ -158,7 +220,7 @@ class AquaTempBleClient:
         return bleak_retry_connector
 
     async def connect(self, max_attempts: int = 2) -> None:
-        """Resolve the device, connect and subscribe to ff02.
+        """Resolve the device, connect and subscribe to the notify characteristic.
 
         max_attempts is the bleak-retry-connector attempt budget: the
         coordinator keeps the historic default of 2; since spec 006 FR-3
@@ -276,7 +338,17 @@ class AquaTempBleClient:
         t_notify: float | None = None
         t_write_char: float | None = None
         try:
-            await client.start_notify(const.UUID_NOTIFY, self._on_notify)
+            # Adaptive GATT discovery: ONE walk of the device's services
+            # logs the REAL table (UUID, handle, properties — the whole
+            # point: the unit's layout was never known, only assumed) and
+            # feeds the fallback resolution below. Best-effort: a
+            # non-enumerable services object logs at DEBUG and leaves
+            # the direct UUID lookups working.
+            self._gatt_chars = self._enumerate_gatt(client)
+            self._resolve_notify_characteristic(client)
+            await client.start_notify(
+                self._notify_uuid or const.UUID_NOTIFY, self._on_notify
+            )
             t_notify = _now()
             self._resolve_write_characteristic(client)
             t_write_char = _now()
@@ -289,9 +361,22 @@ class AquaTempBleClient:
             # cancellation contract).
             await asyncio.sleep(const.SETTLE_AFTER_SUBSCRIBE)
             t_settle = _now()
-        except AquaTempError:
-            # Link is up but ff02/ff01 setup failed: tear down so the next
-            # connect() starts from a clean state.
+        except AquaTempError as exc:
+            # Link is up but the characteristic resolution failed: tear
+            # down so the next connect() starts from a clean state. The
+            # same stage+elapsed ERROR line as the generic branch below
+            # (spec 007 §3.2 contract) — the resolution failures now
+            # carry the diagnosis (the real GATT table rides in the
+            # exception message), so they must not stay silent.
+            stage = "notify" if t_notify is None else "write-char"
+            _LOGGER.error(
+                "post-connect setup (ff02 notify / ff01 lookup) on %s "
+                "failed at stage %s after %.1f s: %s",
+                self._address,
+                stage,
+                _now() - t0,
+                exc_chain(exc),
+            )
             await self.disconnect()
             raise
         except Exception as exc:  # noqa: BLE001
@@ -407,24 +492,203 @@ class AquaTempBleClient:
         self._cancel_silence_timer()
         self._fail_pending(AquaTempConnectionError(f"connection to {self._address} lost"))
 
-    def _resolve_write_characteristic(self, client: BleakClient) -> None:
-        """Pick the write mode from the ff01 characteristic properties.
+    # --------------------------------------------- adaptive GATT discovery
+    @staticmethod
+    def _char_props(obj: Any) -> list[str]:
+        """Characteristic properties as a plain list, robust to bleak
+        versions exposing a set/tuple and to objects without any."""
+        props = getattr(obj, "properties", None)
+        if isinstance(props, (list, tuple, set, frozenset)):
+            return [str(p) for p in props]
+        return []
 
-        Vendor parity (research 006 §2.1): the app writes WITHOUT response
-        (WriteType.withoutResponse in its write path). Rule, in order:
-        write-without-response first, write (with response) fallback, hard
-        error when the characteristic offers neither — never guess a mode
-        the GATT table does not advertise (property-gated, spec 006 FR-2).
+    @staticmethod
+    def _iter_service_characteristics(service: Any) -> list[Any]:
+        """Characteristics of one service, robust across bleak versions.
+
+        bleak >= 0.19 exposes service.characteristics as a handle-keyed
+        collection (mapping.values()); some builds and stand-ins expose
+        a plain iterable. Both are supported; anything else yields [].
         """
+        chars_obj = getattr(service, "characteristics", None)
+        if chars_obj is None:
+            return []
+        values = getattr(chars_obj, "values", None)
+        if callable(values):
+            try:
+                return list(values())
+            except Exception:  # noqa: BLE001
+                pass
         try:
-            char = client.services.get_characteristic(const.UUID_WRITE)
+            return list(chars_obj)
+        except Exception:  # noqa: BLE001
+            return []
+
+    def _lookup_char(self, client: BleakClient, uuid: str) -> Any | None:
+        """One characteristic by UUID; None when absent or the table is
+        broken (the enumeration below then reports what it could walk)."""
+        try:
+            return client.services.get_characteristic(uuid)
         except Exception as exc:  # noqa: BLE001
-            raise AquaTempConnectionError(f"cannot inspect GATT services: {exc}") from exc
-        if char is None:
-            raise AquaTempConnectionError(
-                f"write characteristic {const.UUID_WRITE} not found on the device"
+            _LOGGER.debug(
+                "characteristic lookup %s failed: %s: %s",
+                uuid,
+                type(exc).__name__,
+                exc,
             )
-        props = list(getattr(char, "properties", []) or [])
+            return None
+
+    def _enumerate_gatt(self, client: BleakClient) -> list[GattCharInfo] | None:
+        """Walk the device's services and log the full GATT table.
+
+        ONE connect must be enough to see the REAL layout — service and
+        characteristic UUIDs, handles, properties — at INFO:
+
+            GATT enumeration <addr>: 2 service(s), 4 characteristic(s)
+            GATT enumeration <addr>: service <uuid> (handle <h>): 3 char(s)
+            GATT enumeration <addr>:   char <uuid> (handle <h>) properties [...]
+
+        Best-effort by design (never raises): a non-enumerable services
+        object — old bleak builds, exotic backends, test stand-ins —
+        logs at DEBUG and yields None, leaving the direct UUID lookups
+        working. Feeds _resolve_notify_characteristic /
+        _resolve_write_characteristic and the listing error messages.
+        """
+        services_obj = getattr(client, "services", None)
+        if services_obj is None:
+            _LOGGER.debug(
+                "GATT enumeration %s: no services object on the client",
+                self._address,
+            )
+            return None
+        collected: list[tuple[str, Any, list[Any]]] = []
+        chars: list[GattCharInfo] = []
+        try:
+            for service in services_obj:
+                svc_uuid = str(getattr(service, "uuid", "") or "").lower()
+                svc_handle = getattr(service, "handle", None)
+                svc_chars = self._iter_service_characteristics(service)
+                collected.append((svc_uuid, svc_handle, svc_chars))
+                for char in svc_chars:
+                    chars.append(
+                        GattCharInfo(
+                            str(getattr(char, "uuid", "") or "").lower(),
+                            getattr(char, "handle", None),
+                            self._char_props(char),
+                            svc_uuid,
+                            svc_handle,
+                        )
+                    )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug(
+                "GATT enumeration %s failed: %s: %s",
+                self._address,
+                type(exc).__name__,
+                exc,
+            )
+            return chars or None
+        _LOGGER.info(
+            "GATT enumeration %s: %d service(s), %d characteristic(s)",
+            self._address,
+            len(collected),
+            len(chars),
+        )
+        for svc_uuid, svc_handle, svc_chars in collected:
+            _LOGGER.info(
+                "GATT enumeration %s: service %s (handle %s): %d char(s)",
+                self._address,
+                svc_uuid,
+                svc_handle,
+                len(svc_chars),
+            )
+            for char in svc_chars:
+                _LOGGER.info(
+                    "GATT enumeration %s:   char %s (handle %s) properties %s",
+                    self._address,
+                    str(getattr(char, "uuid", "") or "").lower(),
+                    getattr(char, "handle", None),
+                    self._char_props(char),
+                )
+        return chars or None
+
+    def _format_gatt_table(self) -> str:
+        """Compact one-line rendering of the enumerated table.
+
+        Embedded in the resolution failure MESSAGES so one log line is
+        enough to hard-code the right UUID on the next iteration — no
+        new probe round needed.
+        """
+        chars = self._gatt_chars
+        if not chars:
+            return (
+                "GATT table unavailable: the device's services could not "
+                "be enumerated"
+            )
+        services: list[str] = []
+        rendered: dict[str, list[str]] = {}
+        for char in chars:
+            if char.service_uuid not in rendered:
+                rendered[char.service_uuid] = []
+                services.append(char.service_uuid)
+            handle = f" (handle {char.handle})" if char.handle is not None else ""
+            rendered[char.service_uuid].append(
+                f"char {char.uuid}{handle} properties {char.properties}"
+            )
+        parts = []
+        for svc_uuid in services:
+            svc_handle = next(
+                c.service_handle for c in chars if c.service_uuid == svc_uuid
+            )
+            service_desc = (
+                f"service {svc_uuid} (handle {svc_handle})"
+                if svc_handle is not None
+                else f"service {svc_uuid}"
+            )
+            parts.append(f"{service_desc}: [{', '.join(rendered[svc_uuid])}]")
+        return "GATT table: " + "; ".join(parts)
+
+    def _find_write_candidate(self) -> GattCharInfo | None:
+        """Fallback step (b): first writable char of a vendor service.
+
+        Ordered pools, first match wins (enumeration order = handle
+        order, so 'first' is also 'lowest handle'):
+          1. vendor-service chars with write/write-without-response in
+             a service that ALSO exposes notify/indicate — a
+             request/response pipe looks like this;
+          2. any vendor-service writable char.
+        Standard SIG services (GAP, GATT, battery, ...) are never
+        candidates (_is_vendor_service_uuid).
+        """
+        chars = self._gatt_chars
+        if not chars:
+            return None
+        writable = [
+            c
+            for c in chars
+            if ("write" in c.properties or "write-without-response" in c.properties)
+        ]
+        vendor = [c for c in writable if _is_vendor_service_uuid(c.service_uuid)]
+        notify_services = {
+            c.service_uuid
+            for c in chars
+            if ("notify" in c.properties or "indicate" in c.properties)
+        }
+        for pool in (
+            [c for c in vendor if c.service_uuid in notify_services],
+            vendor,
+        ):
+            if pool:
+                return pool[0]
+        return None
+
+    def _set_write_mode_from_properties(self, uuid: str, props: list[str]) -> None:
+        """Property-gated write mode (spec 006 FR-2), unchanged rule.
+
+        Vendor parity (research 006 §2.1): the app writes WITHOUT
+        response. write-without-response first, write (with response)
+        fallback, hard error when the characteristic offers neither —
+        never guess a mode the GATT table does not advertise.
+        """
         if "write-without-response" in props:
             # Vendor parity: the app writes WITHOUT response
             # (WriteType.withoutResponse in its write path, research 006 §2.1).
@@ -433,12 +697,133 @@ class AquaTempBleClient:
             self._write_with_response = True
         else:
             raise AquaTempConnectionError(
-                f"write characteristic {const.UUID_WRITE} has no usable write property"
+                f"write characteristic {uuid} has no usable write property"
             )
-        _LOGGER.debug(
-            "ff01 properties %s -> write_with_response=%s",
-            props,
-            self._write_with_response,
+
+    def _resolve_notify_characteristic(self, client: BleakClient) -> None:
+        """Pick the notify characteristic: ff02 first, then fallback.
+
+        Strategy, in order:
+          a. the known UUID_NOTIFY (ff02) when the device exposes it;
+          b. a notify/indicate characteristic of the SAME service as
+             the write candidate (the vendor data service), else of any
+             vendor-specific service — standard SIG services (battery
+             2a19, ...) are never candidates: subscribing to them
+             would deliver non-Modbus chunks forever;
+          c. explicit AquaTempConnectionError whose MESSAGE lists the
+             real table.
+        An alternative choice is announced at INFO: 'using notify
+        characteristic <uuid> (properties=...)'. Runs BEFORE start_notify
+        so a resolution failure precedes any subscription.
+        """
+        char = self._lookup_char(client, const.UUID_NOTIFY)
+        if char is not None:
+            self._notify_uuid = const.UUID_NOTIFY
+            return
+        chars = self._gatt_chars or []
+        candidates = [
+            c for c in chars if ("notify" in c.properties or "indicate" in c.properties)
+        ]
+        write_candidate = self._find_write_candidate()
+        write_service = (
+            write_candidate.service_uuid if write_candidate is not None else None
+        )
+        for pool in (
+            [c for c in candidates if c.service_uuid == write_service],
+            [c for c in candidates if _is_vendor_service_uuid(c.service_uuid)],
+        ):
+            if pool:
+                self._notify_uuid = pool[0].uuid
+                _LOGGER.info(
+                    "using notify characteristic %s (properties=%s) on %s",
+                    pool[0].uuid,
+                    pool[0].properties,
+                    self._address,
+                )
+                return
+        raise AquaTempConnectionError(
+            "no notify-capable characteristic on the device "
+            f"(known UUID {const.UUID_NOTIFY} absent; {self._format_gatt_table()})"
+        )
+
+    def _resolve_write_characteristic(self, client: BleakClient) -> None:
+        """Pick the write characteristic: ff01 first, then fallbacks.
+
+        Strategy, in order:
+          a. the known UUID_WRITE (ff01) when the device exposes it —
+             the mode stays property-gated (spec 006 FR-2), including
+             the loud error when ff01 advertises no write property
+             (spec 006 AC-2 pins that behaviour);
+          b. a vendor-service writable characteristic
+             (_find_write_candidate);
+          c. ff03 (UUID_WRITE_FALLBACK, handle 2215 — role unknown,
+             FINDINGS §11.3) as the last-resort candidate, even when it
+             advertises no write property: a refused GATT write fails
+             loudly at the first request instead of the integration
+             dying at connect;
+          d. explicit AquaTempConnectionError whose MESSAGE lists the
+             real table.
+        An alternative choice is announced at INFO: 'using write
+        characteristic <uuid> (properties=...)'.
+        """
+        # (a) Known UUID — unchanged historic behaviour.
+        char = self._lookup_char(client, const.UUID_WRITE)
+        if char is not None:
+            props = self._char_props(char)
+            self._set_write_mode_from_properties(const.UUID_WRITE, props)
+            self._write_uuid = const.UUID_WRITE
+            _LOGGER.debug(
+                "ff01 properties %s -> write_with_response=%s",
+                props,
+                self._write_with_response,
+            )
+            return
+        # (b) Vendor-service writable characteristic.
+        candidate = self._find_write_candidate()
+        if candidate is not None:
+            self._set_write_mode_from_properties(candidate.uuid, candidate.properties)
+            self._write_uuid = candidate.uuid
+            _LOGGER.info(
+                "using write characteristic %s (properties=%s) on %s",
+                candidate.uuid,
+                candidate.properties,
+                self._address,
+            )
+            return
+        # (c) ff03 last resort (works even without an enumerable table).
+        char = self._lookup_char(client, const.UUID_WRITE_FALLBACK)
+        if char is not None:
+            props = self._char_props(char)
+            self._write_uuid = const.UUID_WRITE_FALLBACK
+            if "write-without-response" in props:
+                self._write_with_response = False
+            elif "write" in props:
+                self._write_with_response = True
+            else:
+                # Last resort: ff03 exists but advertises no write
+                # property — its role was never confirmed (FINDINGS
+                # §11.3). Try it anyway (a refused GATT write fails
+                # loudly at the first request) with the vendor-parity
+                # mode: without response (research 006 §2.1).
+                self._write_with_response = False
+                _LOGGER.warning(
+                    "write characteristic %s (properties=%s) does not "
+                    "advertise a write property; using it as the "
+                    "last-resort candidate",
+                    const.UUID_WRITE_FALLBACK,
+                    props,
+                )
+            _LOGGER.info(
+                "using write characteristic %s (properties=%s) on %s",
+                const.UUID_WRITE_FALLBACK,
+                props,
+                self._address,
+            )
+            return
+        # (d) Nothing usable: explicit error carrying the real table.
+        raise AquaTempConnectionError(
+            "no usable write characteristic on the device "
+            f"(known UUID {const.UUID_WRITE} absent; {self._format_gatt_table()})"
         )
 
     async def _resolve_device(self) -> Any | None:
@@ -575,9 +960,13 @@ class AquaTempBleClient:
 
     # -------------------------------------------------------- request/response
     async def _write_frame(self, frame: bytes) -> None:
-        """Transport seam — send a raw frame on ff01. (Overridden in tests.)"""
+        """Transport seam — send a raw frame on the resolved write
+        characteristic (ff01 on documented units; an adaptively
+        discovered UUID otherwise). (Overridden in tests.)"""
         await self._client.write_gatt_char(
-            const.UUID_WRITE, bytes(frame), response=self._write_with_response
+            self._write_uuid or const.UUID_WRITE,
+            bytes(frame),
+            response=self._write_with_response,
         )
 
     async def _request(self, frame: bytes, expected_fc: int | None, timeout: float) -> bytes:
