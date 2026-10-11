@@ -52,7 +52,8 @@
       "cannot_connect": "Failed to connect to the device. Make sure the vendor app is closed (the unit accepts a single Bluetooth connection) and that the unit is in range, then try again.",
       "no_response": "The device accepted the connection but did not answer. Move closer and try again.",
       "crc_error": "The device replied, but the response was corrupted. Try again.",
-      "invalid_address": "Invalid Bluetooth address format (expected XX:XX:XX:XX:XX:XX)."
+      "invalid_address": "Invalid Bluetooth address format (expected XX:XX:XX:XX:XX:XX).",
+      "not_found": "Home Assistant can no longer see this device nearby. Put the unit in pairing mode (hold the panel button for about 5 seconds until the display shows \"bLE\"), make sure it is powered on, then scan again."
     },
     "abort": {
       "already_configured": "This heat pump is already configured.",

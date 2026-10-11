@@ -21,7 +21,11 @@ UUID_NOTIFY = "0000ff02-0000-1000-8000-00805f9b34fb"  # [P] handle 2216
 # had the letters transposed ("bluerng-") and could never match a real unit.
 NAME_PREFIXES = ("bluenrg-", "hiflying-", "prov_")
 
-CONNECT_TIMEOUT = 15.0    # seconds
+# Seconds. Binds the standalone raw-client path only (tools/smoke_client,
+# unit tests): inside Home Assistant, bleak-retry-connector hardcodes
+# every connect attempt to 20.0 s and ignores this value (spec 005 FR-6,
+# research 005 §3.2).
+CONNECT_TIMEOUT = 15.0
 REQUEST_TIMEOUT = 8.0    # max wait for a full Modbus response
 SILENCE_TIMEOUT = 0.6    # gap without a new chunk that ends a fragmented response
 WRITE_ECHO_TIMEOUT = 3.0  # max wait for an FC10 echo; 0 = fire-and-forget

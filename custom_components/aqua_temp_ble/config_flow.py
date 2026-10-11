@@ -30,8 +30,10 @@ from . import registers
 from .aqua_client import (
     AquaTempBleClient,
     AquaTempConnectionError,
+    AquaTempDeviceNotFoundError,
     AquaTempResponseError,
     AquaTempTimeoutError,
+    exc_chain,
 )
 from .const import (
     DEFAULT_POLL_INTERVAL,
@@ -47,7 +49,13 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
-TEST_TIMEOUT = 20.0  # budget for the whole connection test, seconds
+# Budget for the whole connection test, seconds (spec 005 FR-5). One
+# honest attempt needs up to ~30 s: bleak-retry-connector hardcodes the
+# per-attempt connect timeout to 20.0 s (research 005 §3.2), notify setup
+# takes ~2 s and the register read up to 8 s — 40 s adds margin while
+# max_attempts=1 keeps the probe bounded. Supersedes spec 004 AC-4's 20 s
+# value (the cannot_connect routing key for budget expiry is unchanged).
+TEST_TIMEOUT = 40.0
 DEFAULT_NAME = "Aqua Temp heat pump"
 
 # English fallbacks for the runtime-translated menu option labels (spec
@@ -411,32 +419,76 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
         """Body of the test progress task — created once per attempt.
 
         Never raises: every failure path stores an error key in
-        _test_error, success stores None. The step's re-entry reads the
-        stash after the task completes; task completion is the only
-        completion signal (no flag to keep in sync).
+        _test_error AND logs one diagnosable line (spec 005 FR-2: no
+        failure maps to a UI key without a log naming the address and the
+        real exception — the production incident's silent path). The
+        step's re-entry reads the stash after the task completes; task
+        completion is the only completion signal (no flag to keep in
+        sync).
         """
         try:
             async with asyncio.timeout(TEST_TIMEOUT):
-                # hass is passed so device resolution prefers the HA
-                # bluetooth cache before falling back to bleak scanning.
+                # hass is passed so device resolution reads the HA
+                # bluetooth caches explicitly (never raw scans inside
+                # Home Assistant — spec 005 FR-7).
                 client = AquaTempBleClient(
                     self._address, name=self._name, hass=self.hass
                 )
-                await client.connect()
+                # max_attempts=1: a bounded probe — one honest attempt
+                # must fit inside the budget above; a second 20 s connect
+                # attempt never could (plan 005 §3).
+                await client.connect(max_attempts=1)
                 try:
                     self._regs = await client.read_registers(
                         registers.BASE_BLOCK_START, registers.BASE_BLOCK_COUNT
                     )
                 finally:
                     await client.disconnect()
-        except AquaTempConnectionError:
+        except AquaTempDeviceNotFoundError as exc:
+            # Order matters: an AquaTempError but NOT an AquaTempConnectionError
+            # — catching it first keeps the mapping exact (plan 005 §2).
+            self._test_error = "not_found"
+            _LOGGER.warning(
+                "connection test to %s: device not found: %s",
+                self._address,
+                exc,
+            )
+        except AquaTempConnectionError as exc:
             self._test_error = "cannot_connect"
-        except AquaTempTimeoutError:
+            _LOGGER.warning(
+                "connection test to %s failed: %s",
+                self._address,
+                exc_chain(exc),
+            )
+        except AquaTempTimeoutError as exc:
             self._test_error = "no_response"
-        except AquaTempResponseError:
+            _LOGGER.warning(
+                "connection test to %s: no response: %s",
+                self._address,
+                exc_chain(exc),
+            )
+        except AquaTempResponseError as exc:
             self._test_error = "crc_error"
+            _LOGGER.warning(
+                "connection test to %s: bad response: %s",
+                self._address,
+                exc_chain(exc),
+            )
         except TimeoutError:
+            # The asyncio.timeout budget expired and cancelled the
+            # connect/read in flight — the pre-005 code swallowed this
+            # silently (research 005 §4.2). The budget value and the
+            # likely causes go to the log; the user-facing key stays
+            # cannot_connect (its advice is the correct action).
             self._test_error = "cannot_connect"
+            _LOGGER.warning(
+                "connection test to %s exceeded the %.0f s budget — the "
+                "connect or read did not complete in time. The unit is "
+                "likely not accepting the connection (single BLE link "
+                "held by the vendor app?) or is out of range.",
+                self._address,
+                TEST_TIMEOUT,
+            )
         except Exception:  # noqa: BLE001
             _LOGGER.exception("unexpected error during connection test")
             self._test_error = "cannot_connect"

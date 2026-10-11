@@ -47,6 +47,16 @@ class AquaTempConnectionError(AquaTempError):
     """Cannot connect, or the connection was lost."""
 
 
+class AquaTempDeviceNotFoundError(AquaTempError):
+    """The device could not be found in any discovery source.
+
+    Deliberately NOT an AquaTempConnectionError (spec 005 FR-9): the
+    device was never found, which is a different failure than "found but
+    could not connect". Being an AquaTempError keeps the coordinator's
+    `except AquaTempError` handling unchanged.
+    """
+
+
 class AquaTempTimeoutError(AquaTempError):
     """No complete response arrived in time."""
 
@@ -66,13 +76,14 @@ class AquaTempResponseError(AquaTempError):
             super().__init__(message_or_exc)
 
 
-def _exc_chain(exc: BaseException) -> str:
+def exc_chain(exc: BaseException) -> str:
     """Render an exception with its cause chain, root cause included.
 
-    The production incident showed the real transport error never reaching
-    the logs; this renders 'Type: message <- RootType: root message' so log
-    lines and AquaTempConnectionError strings always carry the underlying
-    failure, not just the outer wrapper.
+    Public helper (spec 005 FR-1) so the config flow can log full cause
+    chains too. The production incident showed the real transport error
+    never reaching the logs; this renders 'Type: message <- RootType:
+    root message' so log lines and AquaTempConnectionError strings always
+    carry the underlying failure, not just the outer wrapper.
     """
     parts = [f"{type(exc).__name__}: {exc}"]
     seen = {exc}
@@ -82,6 +93,12 @@ def _exc_chain(exc: BaseException) -> str:
         parts.append(f" <- {type(cause).__name__}: {cause}")
         cause = cause.__cause__
     return "".join(parts)
+
+
+# Backwards-compatible private alias (spec 005 FR-1): any external caller
+# of the historic name keeps working; internal call sites use the public
+# name.
+_exc_chain = exc_chain
 
 
 class AquaTempBleClient:
@@ -127,8 +144,15 @@ class AquaTempBleClient:
             return None
         return bleak_retry_connector
 
-    async def connect(self) -> None:
-        """Resolve the device, connect (2 attempts) and subscribe to ff02.
+    async def connect(self, max_attempts: int = 2) -> None:
+        """Resolve the device, connect and subscribe to ff02.
+
+        max_attempts is the bleak-retry-connector attempt budget: the
+        coordinator keeps the historic default of 2; the config-flow
+        connection test passes 1 — a bounded probe that must fit inside
+        the flow's own TEST_TIMEOUT budget (plan 005 §3). Note that ONE
+        attempt can itself take up to 20 s: bleak-retry-connector hardcodes
+        the per-attempt connect timeout (research 005 §3.2).
 
         Home Assistant path: bleak_retry_connector.establish_connection() —
         retried connects with per-failure backoff, stale bluez connection
@@ -141,45 +165,46 @@ class AquaTempBleClient:
         loop, identical in spirit to the historic implementation.
 
         Either way the REAL failure (type + message + cause chain) is
-        logged before being converted to AquaTempConnectionError.
+        logged before being converted to AquaTempConnectionError. A
+        resolution miss raises AquaTempDeviceNotFoundError instead
+        (spec 005 FR-9) — the device was never found, which is not a
+        connection failure.
         """
         if self.is_connected:
             return
         device = await self._resolve_device()
         if device is None:
-            raise AquaTempConnectionError(
+            raise AquaTempDeviceNotFoundError(
                 f"no Aqua Temp device found for address {self._address}"
             )
         try:
             brc = self._load_retry_connector()
             if brc is not None:
-                # max_attempts=2 preserves the historic retry budget;
-                # transient errors (bluez slots, EOF, BrokenPipe) get
-                # additional retries with backoff inside the library.
-                # Extra kwargs are forwarded to the BleakClient
-                # constructor, which is the canonical place for the connect
-                # timeout in bleak >= 0.21 (connect() still honours a
-                # `timeout` kwarg for backwards compatibility, but the
-                # constructor is the path documented and exercised by the
-                # library). const.CONNECT_TIMEOUT therefore stays effective
-                # per attempt; bleak-retry-connector adds its own safety
-                # deadline on top.
+                # max_attempts is the caller's probe budget (2 for the
+                # coordinator, 1 for the config-flow test); transient
+                # errors (bluez slots, EOF, BrokenPipe) still get extra
+                # retries with backoff inside the library.
+                # timeout=const.CONNECT_TIMEOUT is a CONSTRUCTOR-ONLY
+                # kwarg: brc hardcodes the connect attempt to
+                # BLEAK_TIMEOUT = 20.0 s (research 005 §3.2), so the
+                # constant is dead for connects inside Home Assistant —
+                # it only bounds the standalone raw-client path below.
                 client: BleakClient = await brc.establish_connection(
                     BleakClient,
                     device,
                     name=self._name or getattr(device, "name", "") or self._address,
                     disconnected_callback=self._on_disconnect,
-                    max_attempts=2,
+                    max_attempts=max_attempts,
                     timeout=const.CONNECT_TIMEOUT,
                 )
             else:
                 client = await self._connect_with_raw_client(device)
         except Exception as exc:  # noqa: BLE001
             _LOGGER.error(
-                "connect to %s failed: %s", self._address, _exc_chain(exc)
+                "connect to %s failed: %s", self._address, exc_chain(exc)
             )
             raise AquaTempConnectionError(
-                f"could not connect to {self._address}: {_exc_chain(exc)}"
+                f"could not connect to {self._address}: {exc_chain(exc)}"
             ) from exc
         self._client = client
         try:
@@ -195,11 +220,11 @@ class AquaTempBleClient:
                 "post-connect setup (ff02 notify / ff01 lookup) on %s "
                 "failed: %s",
                 self._address,
-                _exc_chain(exc),
+                exc_chain(exc),
             )
             await self.disconnect()
             raise AquaTempConnectionError(
-                f"could not connect to {self._address}: {_exc_chain(exc)}"
+                f"could not connect to {self._address}: {exc_chain(exc)}"
             ) from exc
         _LOGGER.info(
             "Connected to %s (%s)",
@@ -297,22 +322,98 @@ class AquaTempBleClient:
         )
 
     async def _resolve_device(self) -> Any | None:
-        """Find the BLE device: HA cache -> bleak by address -> name prefix scan."""
-        # 1. HA bluetooth manager cache (no scan needed)
+        """Find the BLE device for the configured address.
+
+        HA mode (hass is not None): explicit Home Assistant bluetooth APIs,
+        in HA's own sanctioned order (plan 005 §1.1, contract
+        device-resolution.md §2):
+          tier 1: connectable manager history (the config-flow device
+                  list's source of truth — research 005 §2.2),
+          tier 2: non-connectable history (HA's own fallback order —
+                  research 005 §3.1; logged: connection may fail),
+          tier 3: name-prefix match over the connectable discovery
+                  history (the MAC-may-have-changed case).
+        Every tier is an instant cache read — a scan is NEVER started
+        inside Home Assistant; the historic raw bleak calls were silently
+        monkeypatched into cache lookups by the HA bluetooth manager and
+        their log texts lied about scanning (research 005 §3.1).
+
+        Standalone mode (hass is None): raw bleak lookups only —
+        find_device_by_address, then discover + name-prefix filter —
+        byte-identical to the historic implementation (NFR-4).
+
+        Every tier/step logs its provenance (FR-3) so a listed-but-
+        unconnectable device becomes diagnosable in one run.
+        """
         if self._hass is not None:
             try:
+                # Lazy import on purpose: standalone tools/tests run without
+                # Home Assistant; inside HA the symbols always exist.
                 from homeassistant.components.bluetooth import (
                     async_ble_device_from_address,
+                    async_discovered_service_info,
                 )
             except ImportError:
                 _LOGGER.debug("HA bluetooth helper not available (standalone mode)")
             else:
+                # Tier 1: the manager's connectable history.
                 device = async_ble_device_from_address(
                     self._hass, self._address, connectable=True
                 )
                 if device is not None:
+                    _LOGGER.debug(
+                        "%s: resolved from HA connectable cache", self._address
+                    )
                     return device
-        # 2. bleak direct lookup by address
+                # Tier 2: HA's own fallback order — the address was only
+                # seen by scanners that cannot make GATT connections.
+                device = async_ble_device_from_address(
+                    self._hass, self._address, connectable=False
+                )
+                if device is not None:
+                    _LOGGER.warning(
+                        "%s: only visible via a non-connectable scanner; "
+                        "the connection may fail",
+                        self._address,
+                    )
+                    return device
+                # Tier 3: the MAC-may-have-changed case — a name-prefix
+                # match over the connectable discovery history (the same
+                # effective data the old patched BleakScanner.discover()
+                # read; research 005 §3.1).
+                _LOGGER.warning(
+                    "%s: not found in the HA bluetooth cache; looking for a "
+                    "name-prefix match (the MAC may have changed)",
+                    self._address,
+                )
+                matches = [
+                    info
+                    for info in async_discovered_service_info(
+                        self._hass, connectable=True
+                    )
+                    if (info.name or "").lower().startswith(const.NAME_PREFIXES)
+                ]
+                if not matches:
+                    return None
+                if len(matches) > 1:
+                    _LOGGER.warning(
+                        "multiple Aqua Temp candidates found: %s",
+                        [(info.name, info.address) for info in matches],
+                    )
+                chosen = matches[0]
+                if chosen.address.lower() != self._address.lower():
+                    _LOGGER.warning(
+                        "Device found at a DIFFERENT address %s (configured: %s). "
+                        "The MAC has probably changed — please re-configure the "
+                        "integration with the new address. Using the discovered "
+                        "device for this session.",
+                        chosen.address,
+                        self._address,
+                    )
+                return chosen.device
+        # Standalone mode (hass is None, or the HA bluetooth helper is
+        # absent): the ONLY path that starts raw bleak lookups (FR-8).
+        # 1. bleak direct lookup by address
         try:
             device = await BleakScanner.find_device_by_address(self._address, timeout=5.0)
         except Exception as exc:  # noqa: BLE001
@@ -320,7 +421,7 @@ class AquaTempBleClient:
             device = None
         if device is not None:
             return device
-        # 3. scan by name prefix (MAC may have changed across reboots)
+        # 2. scan by name prefix (MAC may have changed across reboots)
         _LOGGER.warning(
             "address %s not found directly; scanning by name prefix %s ...",
             self._address,

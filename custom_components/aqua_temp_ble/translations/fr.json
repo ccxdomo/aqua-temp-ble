@@ -52,7 +52,8 @@
       "cannot_connect": "Impossible de se connecter à l'appareil. Vérifiez que l'application du fabricant est fermée (l'unité n'accepte qu'une seule connexion Bluetooth) et que l'unité est à portée, puis réessayez.",
       "no_response": "L'appareil a accepté la connexion mais n'a pas répondu. Rapprochez-vous et réessayez.",
       "crc_error": "L'appareil a répondu, mais la réponse était corrompue. Réessayez.",
-      "invalid_address": "Format d'adresse Bluetooth invalide (attendu : XX:XX:XX:XX:XX:XX)."
+      "invalid_address": "Format d'adresse Bluetooth invalide (attendu : XX:XX:XX:XX:XX:XX).",
+      "not_found": "Home Assistant ne voit plus cet appareil à proximité. Mettez l'unité en mode appairage (maintenez le bouton du panneau environ 5 secondes jusqu'à l'affichage « bLE »), vérifiez qu'elle est allumée, puis scannez de nouveau."
     },
     "abort": {
       "already_configured": "Cette pompe à chaleur est déjà configurée.",

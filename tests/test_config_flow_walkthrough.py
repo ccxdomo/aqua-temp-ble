@@ -6,6 +6,12 @@ may only yield progress or progress_done; anything else is exactly
 what HA punishes with the ValueError that crashed the production
 instance (research 004 §3.2).
 
+Extended by spec 005: every failure branch of the connection test must
+log a diagnosable line (address + real exception) before mapping its UI
+key — no failure may be silent (AC-1) — plus the two new routing cases:
+not_found (device resolution miss, FR-12) and budget expiry (still keyed
+cannot_connect, but logged, FR-5/AC-3).
+
 Unlike test_config_flow_list.py (the pure list builder), this file drives
 the ACTUAL flow steps end to end — user menu -> device list -> live test
 -> confirm -> entry — plus every branch: rescan, no-devices menu,
@@ -32,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import logging
 import sys
 import types
 from pathlib import Path
@@ -309,7 +316,10 @@ class FakeClient:
         self.disconnected = False
         type(self).instances.append(self)
 
-    async def connect(self):
+    async def connect(self, max_attempts=None):
+        # max_attempts kwarg (spec 005): the flow test calls
+        # connect(max_attempts=1) as a bounded probe; the pre-005 flow
+        # called connect() bare — both shapes must work.
         if type(self).fault is not None:
             raise type(self).fault
         self.connected = True
@@ -333,6 +343,52 @@ class SlowFakeClient(FakeClient):
     async def read_registers(self, start, count):
         await asyncio.sleep(0.05)
         return await super().read_registers(start, count)
+
+
+class HangingFakeClient(FakeClient):
+    """FakeClient whose connect() outlives the (patched) test budget —
+    the pre-005 silent cancellation path: the connect hangs, the flow's
+    asyncio.timeout cancels it in flight. Spec 005 expects the budget
+    expiry to be logged now (AC-3)."""
+
+    async def connect(self, max_attempts=None):
+        await asyncio.sleep(0.5)  # always longer than the patched budget
+        self.connected = True
+
+
+class _CaptureHandler(logging.Handler):
+    """Collect formatted log messages — caplog without pytest."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.DEBUG)
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.append(record.getMessage())
+
+
+class _LogCapture:
+    """Attach a capturing handler to a logger for the duration of a `with`.
+
+    The logger level is lowered to DEBUG on entry and restored on exit so
+    provenance DEBUG lines are assertable too (spec 005 FR-3).
+    """
+
+    def __init__(self, logger: logging.Logger) -> None:
+        self._logger = logger
+        self._handler = _CaptureHandler()
+        self._previous_level: int | None = None
+
+    def __enter__(self) -> _CaptureHandler:
+        self._previous_level = self._logger.level
+        self._logger.setLevel(logging.DEBUG)
+        self._logger.addHandler(self._handler)
+        return self._handler
+
+    def __exit__(self, *exc_info: object) -> bool:
+        self._logger.removeHandler(self._handler)
+        self._logger.setLevel(self._previous_level)
+        return False
 
 
 def make_flow(hass):
@@ -466,17 +522,26 @@ async def test_failed_test_returns_to_device_form_with_error():
     await flow.async_step_device()  # device form
 
     FakeClient.fault = cf.AquaTempConnectionError("vendor app holds the link")
-    result = await flow.async_step_device(
-        user_input={"address": "AA:BB:CC:DD:EE:10"}
-    )
-    assert result["type"] == "progress" and result["step_id"] == "test", result
-    # Re-entry must yield progress_done(next_step_id="device"); the manager
-    # then re-renders the device form with the stashed error (004 FR-4).
-    result = await _drive_progress(flow, result)
+    with _LogCapture(cf._LOGGER) as log:
+        result = await flow.async_step_device(
+            user_input={"address": "AA:BB:CC:DD:EE:10"}
+        )
+        assert result["type"] == "progress" and result["step_id"] == "test", result
+        # Re-entry must yield progress_done(next_step_id="device"); the manager
+        # then re-renders the device form with the stashed error (004 FR-4).
+        result = await _drive_progress(flow, result)
     assert result["type"] == "form", result
     assert result["step_id"] == "device", result
     assert result["errors"] == {"base": "cannot_connect"}, result
     assert "AA:BB:CC:DD:EE:10" in result["data_schema"]["address"]
+    # Spec 005 FR-2/AC-6: the cannot_connect branch logs the address and
+    # the full exception chain (red-first: silent on the pre-005 code).
+    assert any(
+        "AA:BB:CC:DD:EE:10" in m
+        and "failed" in m
+        and "vendor app holds the link" in m
+        for m in log.messages
+    ), log.messages
 
     # The stash is consumed by that render: a second render of the same
     # step shows no stale error (004 FR-4 read-and-clear).
@@ -515,9 +580,14 @@ async def test_manual_path_and_failure_symmetry():
     FakeClient.fault = cf.AquaTempTimeoutError("no complete response")
     # Re-entry must yield progress_done(next_step_id="manual"); the
     # manager re-renders the manual form with the stashed error.
-    result = await _drive_progress(flow, result)
+    with _LogCapture(cf._LOGGER) as log:
+        result = await _drive_progress(flow, result)
     assert result["type"] == "form" and result["step_id"] == "manual", result
     assert result["errors"] == {"base": "no_response"}, result
+    # Spec 005 FR-2: the no_response branch logs the address + chain.
+    assert any(
+        "aa:bb:cc:dd:ee:ff" in m and "no response" in m for m in log.messages
+    ), log.messages
 
     # The stash is consumed: a second render shows no stale error.
     result = await flow.async_step_manual()
@@ -579,15 +649,82 @@ async def test_crc_error_failure_routes_to_device_form():
     await flow.async_step_device()  # device form
 
     FakeClient.fault = cf.AquaTempResponseError("bad CRC")
-    result = await flow.async_step_device(
-        user_input={"address": "AA:BB:CC:DD:EE:10"}
-    )
-    result = await _drive_progress(flow, result)
+    with _LogCapture(cf._LOGGER) as log:
+        result = await flow.async_step_device(
+            user_input={"address": "AA:BB:CC:DD:EE:10"}
+        )
+        result = await _drive_progress(flow, result)
     assert result["type"] == "form" and result["step_id"] == "device", result
     assert result["errors"] == {"base": "crc_error"}, result
+    # Spec 005 FR-2: the crc_error branch logs the address + chain.
+    assert any(
+        "AA:BB:CC:DD:EE:10" in m and "bad response" in m for m in log.messages
+    ), log.messages
     # Stash consumed: a second render shows no stale error.
     result = await flow.async_step_device()
     assert result["errors"] is None, result
+
+
+async def test_not_found_routes_to_device_form_with_log():
+    """Spec 005 FR-12/AC-2: a resolution miss routes not_found + logs it.
+
+    Red-first: on the 5aa887b code this test cannot even construct the
+    fault (no AquaTempDeviceNotFoundError) and no branch logged.
+    """
+    hass = FakeHass(infos=[FakeInfo("AA:BB:CC:DD:EE:10", "BlueNRG-7A", -50)])
+    flow = make_flow(hass)
+    await flow.async_step_user()  # menu
+    await flow.async_step_device()  # device form
+
+    FakeClient.fault = cf.AquaTempDeviceNotFoundError(
+        "no Aqua Temp device found for address AA:BB:CC:DD:EE:10"
+    )
+    with _LogCapture(cf._LOGGER) as log:
+        result = await flow.async_step_device(
+            user_input={"address": "AA:BB:CC:DD:EE:10"}
+        )
+        result = await _drive_progress(flow, result)
+    assert result["type"] == "form" and result["step_id"] == "device", result
+    assert result["errors"] == {"base": "not_found"}, result
+    # AC-1: the not_found branch logs the address and the cause.
+    assert any(
+        "AA:BB:CC:DD:EE:10" in m and "not found" in m for m in log.messages
+    ), log.messages
+    # Stash consumed: a second render shows no stale error.
+    result = await flow.async_step_device()
+    assert result["errors"] is None, result
+
+
+async def test_budget_expiry_routes_cannot_connect_with_log():
+    """Spec 005 FR-5/FR-12/AC-3: budget expiry stays keyed cannot_connect
+    but is no longer silent — the log names the budget and the address.
+
+    Red-first note: the ROUTING assertion also passes on the pre-005
+    code (the key was already cannot_connect); the LOG assertion is the
+    red part — the old TimeoutError branch mapped the key without any
+    log line (research 005 §4.2, the production incident's signature).
+    """
+    hass = FakeHass(infos=[FakeInfo("AA:BB:CC:DD:EE:10", "BlueNRG-7A", -50)])
+    flow = make_flow(hass)
+    cf.AquaTempBleClient = HangingFakeClient  # connect outlives the budget
+
+    original_timeout = cf.TEST_TIMEOUT
+    cf.TEST_TIMEOUT = 0.2  # patched budget: the 0.5 s hang always expires it
+    try:
+        with _LogCapture(cf._LOGGER) as log:
+            result = await flow.async_step_device(
+                user_input={"address": "AA:BB:CC:DD:EE:10"}
+            )
+            result = await _drive_progress(flow, result)
+    finally:
+        cf.TEST_TIMEOUT = original_timeout
+
+    assert result["type"] == "form" and result["step_id"] == "device", result
+    assert result["errors"] == {"base": "cannot_connect"}, result
+    # AC-3: the budget-expiry branch names the budget value explicitly.
+    assert any(
+        "AA:BB:CC:DD:EE:10" in m and "budget" in m for m in log.messages
+    ), log.messages
 
 
 async def test_scan_branch_returns_to_user_menu():
@@ -801,6 +938,8 @@ def main() -> None:
         test_manual_path_and_failure_symmetry,
         test_reentry_while_running_returns_same_task,
         test_crc_error_failure_routes_to_device_form,
+        test_not_found_routes_to_device_form_with_log,
+        test_budget_expiry_routes_cannot_connect_with_log,
         test_scan_branch_returns_to_user_menu,
         test_no_devices_menu_and_configured_exclusion,
         test_no_bluetooth_adapter_aborts,
