@@ -891,21 +891,27 @@ class AquaTempBleClient:
         only, FR-4). The bond state is logged before/after (best-effort,
         contract 011 §3.6). Only ever called from the config-test stages
         or behind the pair_on_connect option — never from a poll loop
-        (contract 011 §1.5).
+        (contract 011 §1.5). Evidence lines are WARNING (contract 012
+        §2): the operator's HA log page keeps only WARNING+.
         """
         bleak_version = _package_version("bleak")
         brc = self._load_retry_connector()
         brc_version = (
             _package_version("bleak-retry-connector") if brc is not None else None
         )
-        _LOGGER.info("pairing: bond state before: %s", await self._read_bond_state())
+        # WARNING (contract 012 §2): the bond-state lines are decisive-once
+        # evidence — the operator's system_log panel stores WARNING+ only
+        # (research 012 §4).
+        _LOGGER.warning("pairing: bond state before: %s", await self._read_bond_state())
         pair_method = None
         if self._client is not None:
             candidate = getattr(self._client, "pair", None)
             pair_method = candidate if callable(candidate) else None
         chain = ""
         if pair_method is not None:
-            _LOGGER.info(
+            # WARNING (contract 012 §2): the rung line is evidence the
+            # routing decision reads (research 012 §4 — panel = WARNING+).
+            _LOGGER.warning(
                 "pairing: attempting via rung A (bleak pair method) "
                 "(bleak=%s, brc=%s)",
                 bleak_version,
@@ -913,7 +919,9 @@ class AquaTempBleClient:
             )
             result, chain = await self._call_pair_method_once(pair_method)
         else:
-            _LOGGER.info(
+            # WARNING (contract 012 §2): the rung line is evidence the
+            # routing decision reads (research 012 §4 — panel = WARNING+).
+            _LOGGER.warning(
                 "pairing: attempting via rung B (reconnect with pair=True) "
                 "(bleak=%s, brc=%s)",
                 bleak_version,
@@ -926,7 +934,10 @@ class AquaTempBleClient:
                 bleak_version=bleak_version,
                 brc_version=brc_version,
             )
-        _LOGGER.info("pairing: bond state after: %s", await self._read_bond_state())
+        # WARNING (contract 012 §2): the bond-state lines are decisive-once
+        # evidence — the operator's system_log panel stores WARNING+ only
+        # (research 012 §4).
+        _LOGGER.warning("pairing: bond state after: %s", await self._read_bond_state())
         return result
 
     async def _call_pair_method_once(self, pair_method: Any) -> tuple[str, str]:
@@ -940,13 +951,19 @@ class AquaTempBleClient:
         except Exception as exc:  # noqa: BLE001 — the chain IS the datum
             chain = exc_chain(exc)
             if _pairing_already_bonded(chain.lower()):
-                _LOGGER.info("pairing: skipped: already bonded")
+                # WARNING (contract 012 §2): the X3 no-op proof is evidence
+                # — the panel keeps WARNING+ only (research 012 §4).
+                _LOGGER.warning("pairing: skipped: already bonded")
                 return "skipped", chain
-            _LOGGER.info(
+            # WARNING (contract 012 §2): the failure chain is evidence the
+            # routing decision reads (research 012 §4 — panel = WARNING+).
+            _LOGGER.warning(
                 "pairing: failed: %s%s", chain, _pairing_ble_guidance(chain)
             )
             return "failed", chain
-        _LOGGER.info("pairing: succeeded")
+        # WARNING (contract 012 §2): the decisive success line (research
+        # 012 §4 — the panel keeps WARNING+ only).
+        _LOGGER.warning("pairing: succeeded")
         return "succeeded", ""
 
     async def _pair_via_reconnect(self) -> tuple[str, str]:
@@ -969,7 +986,9 @@ class AquaTempBleClient:
                 else "this bleak build exposes neither a pair method nor "
                 "a pair constructor parameter"
             )
-            _LOGGER.info(
+            # WARNING (contract 012 §2): an unavailable rung is decisive
+            # evidence (research 012 §4 — panel = WARNING+).
+            _LOGGER.warning(
                 "pairing: unavailable: %s (research 011 §10.1)", reason
             )
             return "unavailable", ""
@@ -990,13 +1009,19 @@ class AquaTempBleClient:
         except Exception as exc:  # noqa: BLE001 — the chain stays verbatim
             chain = exc_chain(exc)
             if _pairing_already_bonded(chain.lower()):
-                _LOGGER.info("pairing: skipped: already bonded")
+                # WARNING (contract 012 §2): the X3 no-op proof is evidence
+                # — the panel keeps WARNING+ only (research 012 §4).
+                _LOGGER.warning("pairing: skipped: already bonded")
                 return "skipped", chain
-            _LOGGER.info(
+            # WARNING (contract 012 §2): the failure chain is evidence the
+            # routing decision reads (research 012 §4 — panel = WARNING+).
+            _LOGGER.warning(
                 "pairing: failed: %s%s", chain, _pairing_ble_guidance(chain)
             )
             return "failed", chain
-        _LOGGER.info("pairing: succeeded")
+        # WARNING (contract 012 §2): the decisive success line (research
+        # 012 §4 — the panel keeps WARNING+ only).
+        _LOGGER.warning("pairing: succeeded")
         return "succeeded", ""
 
     async def _rung_c_retry(
@@ -1008,7 +1033,9 @@ class AquaTempBleClient:
         or a failed registration is 'unavailable', never an exception
         (AC-8; research 011 §10.2).
         """
-        _LOGGER.info(
+        # WARNING (contract 012 §2): the rung line is evidence the routing
+        # decision reads (research 012 §4 — panel = WARNING+).
+        _LOGGER.warning(
             "pairing: attempting via rung C (minimal BlueZ agent, "
             "NoInputNoOutput, then one rung retry) (bleak=%s, brc=%s)",
             bleak_version,
@@ -1029,14 +1056,18 @@ class AquaTempBleClient:
                 "rung C unavailable: the agent module/dbus_fast import "
                 "failed (spec 011 FR-3)"
             )
-            _LOGGER.info(
+            # WARNING (contract 012 §2): the unavailable verdict is decisive
+            # evidence (research 012 §4 — panel = WARNING+).
+            _LOGGER.warning(
                 "pairing: unavailable: no pairing agent could be "
                 "registered (dbus_fast not available)"
             )
             return "unavailable", ""
         bus = await bluez_agent.register_agent()
         if bus is None:
-            _LOGGER.info(
+            # WARNING (contract 012 §2): the unavailable verdict is decisive
+            # evidence (research 012 §4 — panel = WARNING+).
+            _LOGGER.warning(
                 "pairing: unavailable: agent registration failed on this "
                 "bluetoothd"
             )
@@ -2306,6 +2337,8 @@ async def run_security_probe(
     Stage labels are reported through on_stage BEFORE each stage runs
     (contract 011 §2: failure lines report the running stage, never a
     later one — the 007 conventions extended to the probe stages).
+    Evidence lines are WARNING (contract 012 §2): the operator's HA log
+    page keeps only WARNING+.
     """
     stage = on_stage or (lambda _name: None)
     address = getattr(client, "address", "?")
@@ -2314,7 +2347,10 @@ async def run_security_probe(
     # Stage security-probe (contract 011 §3.1): the entry line names the
     # exact pipe and address it is about to test.
     stage("security-probe")
-    _LOGGER.info(
+    # WARNING (contract 012 §2): the operator's system_log panel stores
+    # WARNING+ only (research 012 §4) — below WARNING the evidence is
+    # operator-invisible.
+    _LOGGER.warning(
         "security probe: re-sending base read as acknowledged write "
         "(response=True) on %s to %s",
         write_uuid,
@@ -2331,15 +2367,19 @@ async def run_security_probe(
         )
     except AquaTempConnectionError as exc:
         # The acknowledged write was refused — classify the chain
-        # (contract 011 §5.1) and log exactly one verdict line.
+        # (contract 011 §5.1) and log exactly one verdict line at WARNING
+        # (contract 012 §2 — the panel keeps WARNING+ only, research
+        # 012 §4).
         chain = str(exc)  # carries the ATT error chain verbatim (FR-1)
         verdict = _classify_ack_write_failure(chain)
-        _LOGGER.info("security probe: verdict %s: %s", verdict, chain)
+        _LOGGER.warning("security probe: verdict %s: %s", verdict, chain)
     except AquaTempTimeoutError as exc:
         # The write was accepted but the engine stayed silent — the
         # H-APP-GATE branch (research 011 §11 rank 2); the census rides
-        # in the exception message (contract 009 §3).
-        _LOGGER.info(
+        # in the exception message (contract 009 §3). WARNING (contract
+        # 012 §2): the verdict must reach the operator's panel (research
+        # 012 §4).
+        _LOGGER.warning(
             "security probe: verdict att-accepted-silent "
             "(ack ok, no Modbus answer within %.1fs; census: %s)",
             const.REQUEST_TIMEOUT,
@@ -2350,8 +2390,10 @@ async def run_security_probe(
         # The acknowledged write REACHED the engine — the unit answered
         # with a Modbus exception frame: the write pipe is open at the
         # ATT layer (research 011 §2.2 row 2). No regs to route; the
-        # original timeout keeps the UI key (FR-2.5).
-        _LOGGER.info(
+        # original timeout keeps the UI key (FR-2.5). WARNING (contract
+        # 012 §2): decisive evidence — the panel keeps WARNING+ only
+        # (research 012 §4).
+        _LOGGER.warning(
             "security probe: acknowledged write answered by a Modbus "
             "exception frame (%s) — the write pipe is open at the ATT "
             "layer (research 011 §2.2)",
@@ -2361,8 +2403,9 @@ async def run_security_probe(
     else:
         # The acknowledged write itself woke the engine — itself
         # decisive evidence (contract 011 §2 row 3 / §6 row 4): the
-        # gate is the write TYPE, not the bond.
-        _LOGGER.info(
+        # gate is the write TYPE, not the bond. WARNING (contract 012
+        # §2): the panel keeps WARNING+ only (research 012 §4).
+        _LOGGER.warning(
             "security probe: acknowledged write answered — the Write "
             "Request woke the Modbus engine (contract 011 §2; research "
             "011 §2.2)"
@@ -2390,7 +2433,10 @@ async def run_security_probe(
             const.PAIR_TIMEOUT,
         )
     except Exception as exc:  # noqa: BLE001 — a pairing failure never breaks the test
-        _LOGGER.info("pairing: failed: %s", exc_chain(exc))
+        # WARNING (contract 012 §2): the failure chain is decisive-once
+        # evidence — the system_log panel stores WARNING+ only (research
+        # 012 §4).
+        _LOGGER.warning("pairing: failed: %s", exc_chain(exc))
         pair_result = "failed"
     if pair_result not in ("succeeded", "skipped"):
         # FR-4: the retry follows a successful/skipped pair only — a
@@ -2409,11 +2455,15 @@ async def run_security_probe(
             resend_max=retry_resend_max,
         )
     except AquaTempTimeoutError as exc:
-        _LOGGER.info(
+        # WARNING (contract 012 §2): decisive evidence — the operator's
+        # system_log panel stores WARNING+ only (research 012 §4).
+        _LOGGER.warning(
             "security probe: still silent after pairing (census: %s)", exc
         )
         return None
-    _LOGGER.info(
+    # WARNING (contract 012 §2): the case-closed evidence line — the
+    # operator's system_log panel stores WARNING+ only (research 012 §4).
+    _LOGGER.warning(
         "security probe: answered after pairing (%d attempt of the window)",
         getattr(client, "last_request_write_count", 1),
     )

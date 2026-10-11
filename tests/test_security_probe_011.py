@@ -23,6 +23,12 @@ Covers the three deliverables of specs/011-android-vs-linux-ble:
    the options flow, connect(pair=True) threading, and the AC-4
    non-regression (with the option off, no probe/pair ever runs on
    the success path).
+5. Spec 012 (the log-visibility contract, Part 7): the probe/pair
+   evidence lines are at WARNING — the operator's HA log page
+   (Settings → System → Logs, the system_log ring buffer) stores
+   WARNING+ only (research 012 §4) — and every connection test starts
+   with a build-marker WARNING naming the running version (spec 012
+   FR-2/FR-3, contract 012 §2/§3).
 
 Red-first: on the 0b16e0a+010 code none of the seams exist —
 const.PAIR_TIMEOUT, read_registers(force_response=...), pair(),
@@ -45,6 +51,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import logging
 import sys
 import types
@@ -279,9 +286,14 @@ class _LogCap(logging.Handler):
     def __init__(self) -> None:
         super().__init__(level=logging.DEBUG)
         self.messages: list[str] = []
+        # Spec 012 FR-3: the caps also record each record's levelname —
+        # the suite now asserts LEVELS, not just message strings (the
+        # coverage hole that let an operator-invisible INFO grammar pass).
+        self.levels: list[str] = []
 
     def emit(self, record: logging.LogRecord) -> None:
         self.messages.append(record.getMessage())
+        self.levels.append(record.levelname)
 
 
 class _capture_logs:
@@ -1208,9 +1220,13 @@ class _FlowLogCap(logging.Handler):
     def __init__(self) -> None:
         super().__init__(level=logging.DEBUG)
         self.messages: list[str] = []
+        # Spec 012 FR-3: levels recorded alongside messages — the level
+        # contract of contract 012 §2 is asserted through this cap.
+        self.levels: list[str] = []
 
     def emit(self, record: logging.LogRecord) -> None:
         self.messages.append(record.getMessage())
+        self.levels.append(record.levelname)
 
 
 class _flow_logs:
@@ -1626,6 +1642,280 @@ async def test_options_flow_pair_on_connect_toggle() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Part 7 — spec 012: the log-level visibility contract (contract 012 §2/§3)
+# ---------------------------------------------------------------------------
+
+
+async def _drive_probe_flow(script, *, pair_result="succeeded", pair_error=None):
+    """One flow walkthrough over a scripted probe outcome, returning the
+    routing result and the captured (message, levelname) pairs (spec 012
+    FR-3: the caps record levels since this part — the suite asserts the
+    operator-visible LEVEL, not just the message string)."""
+    flow = _make_flow(script=script, pair_result=pair_result, pair_error=pair_error)
+    with _flow_logs() as log:
+        result = await flow.async_step_device(user_input={"address": ADDRESS})
+        result = await _drive_progress(flow, result)
+    return result, list(zip(log.messages, log.levels))
+
+
+async def test_flow_probe_evidence_lines_are_warning() -> None:
+    """Spec 012 FR-1/AC-2 (contract 012 §2): the att-accepted-silent
+    walkthrough — the probe entry line and the verdict line are at
+    WARNING, and ZERO `security probe:`/`pairing:` records exist at any
+    other level. The operator's system_log panel stores WARNING+ only
+    (research 012 §4): below WARNING the evidence is operator-invisible."""
+    result, records = await _drive_probe_flow(
+        [cf.AquaTempTimeoutError(FIRST_TIMEOUT), cf.AquaTempTimeoutError(FIRST_TIMEOUT)]
+    )
+    assert result["errors"] == {"base": "no_response"}, result
+    evidence = [
+        (m, lvl)
+        for m, lvl in records
+        if m.startswith("security probe:") or m.startswith("pairing:")
+    ]
+    assert evidence, records
+    assert all(lvl == "WARNING" for _m, lvl in evidence), evidence
+    # both decisive lines of this walkthrough are captured at WARNING
+    assert any(
+        m.startswith("security probe: re-sending base read as acknowledged write")
+        for m, _lvl in evidence
+    ), evidence
+    assert any(
+        m.startswith("security probe: verdict att-accepted-silent")
+        for m, _lvl in evidence
+    ), evidence
+
+
+async def test_flow_all_probe_evidence_lines_are_warning() -> None:
+    """Spec 012 FR-1 (contract 012 §2): EVERY probe evidence line the
+    flow can emit — the entry line, the classified verdict, the
+    accepted-silent verdict, the Modbus-exception frame, the answered
+    write, the probe pair-catch failure, still-silent-after-pairing and
+    answered-after-pairing — is at WARNING in every walkthrough that
+    exercises it (zero probe/pair records at any other level)."""
+    scenarios = [
+        ("accepted-silent", [cf.AquaTempTimeoutError(FIRST_TIMEOUT), cf.AquaTempTimeoutError(FIRST_TIMEOUT)], {}),
+        ("case-closed", [cf.AquaTempTimeoutError(FIRST_TIMEOUT), cf.AquaTempConnectionError(SECURITY_CHAIN), dict(FLOW_REGS)], {}),
+        ("modbus-exception", [cf.AquaTempTimeoutError(FIRST_TIMEOUT), cf.AquaTempResponseError("Modbus exception frame")], {}),
+        ("pair-catch-failure", [cf.AquaTempTimeoutError(FIRST_TIMEOUT), cf.AquaTempConnectionError(SECURITY_CHAIN)], {"pair_error": RuntimeError("org.bluez.Error.Failed: boom")}),
+        ("still-silent", [cf.AquaTempTimeoutError(FIRST_TIMEOUT), cf.AquaTempConnectionError(SECURITY_CHAIN), cf.AquaTempTimeoutError(FIRST_TIMEOUT)], {}),
+        ("answers-directly", [cf.AquaTempTimeoutError(FIRST_TIMEOUT), dict(FLOW_REGS)], {}),
+    ]
+    seen: list[str] = []
+    for name, script, kwargs in scenarios:
+        result, records = await _drive_probe_flow(script, **kwargs)
+        evidence = [
+            (m, lvl)
+            for m, lvl in records
+            if m.startswith("security probe:") or m.startswith("pairing:")
+        ]
+        assert evidence, (name, records)
+        assert all(lvl == "WARNING" for _m, lvl in evidence), (name, evidence)
+        seen.extend(m for m, _lvl in evidence)
+    # every contract 012 §2 evidence shape was exercised at WARNING
+    prefixes = (
+        "security probe: re-sending base read as acknowledged write",
+        "security probe: verdict att-error-security: ",
+        "security probe: verdict att-accepted-silent",
+        "security probe: acknowledged write answered by a Modbus exception frame",
+        "security probe: acknowledged write answered — the Write",
+        "pairing: failed: ",
+        "security probe: still silent after pairing",
+        "security probe: answered after pairing",
+    )
+    for prefix in prefixes:
+        assert any(m.startswith(prefix) for m in seen), prefix
+
+
+async def test_pairing_ladder_lines_are_warning() -> None:
+    """Spec 012 FR-1 (contract 012 §2): every pairing-ladder evidence
+    line — bond states before/after, the rung A/B/C attempt lines,
+    succeeded / skipped / failed / unavailable — is at WARNING. The
+    ladder runs on the REAL client (the flow's FakeProbeClient.pair
+    replaces it, so these lines are client-level only)."""
+    evidence: list[tuple[str, str]] = []
+
+    async def _run_pair(client) -> str:
+        with _capture_logs() as cap:
+            result = await client.pair()
+        evidence.extend(
+            (m, lvl)
+            for m, lvl in zip(cap.messages, cap.levels)
+            if m.startswith("pairing:")
+        )
+        return result
+
+    # Rung A: success / AlreadyExists-skip / authentication failure.
+    assert await _run_pair(_make_probe_client(RecordingBleakClient())) == "succeeded"
+    assert await _run_pair(
+        _make_probe_client(
+            RecordingBleakClient(
+                pair_script=[RuntimeError("org.bluez.Error.AlreadyExists: exists")]
+            )
+        )
+    ) == "skipped"
+    assert await _run_pair(
+        _make_probe_client(
+            RecordingBleakClient(
+                pair_script=[
+                    RuntimeError("org.bluez.Error.AuthenticationFailed: refused")
+                ]
+            )
+        )
+    ) == "failed"
+    # No rung at all (no pair method, no pair kwarg): unavailable without
+    # touching the link (contract 011 §3.3).
+    assert (
+        await _run_pair(_make_probe_client(_RecordingBleakClientBase()))
+        == "unavailable"
+    )
+    # Rung C, dbus_fast absent: the guarded import reports unavailable.
+    with _patch_agent_module(available=False):
+        rung_c_client = _make_probe_client(
+            RecordingBleakClient(
+                pair_script=[
+                    RuntimeError("org.bluez.Error.Failed: No agent is registered")
+                ]
+            )
+        )
+        assert await _run_pair(rung_c_client) == "unavailable"
+    # Rung C, registration refused (register_agent -> None): unavailable.
+    with _patch_agent_module():
+
+        async def _register_none():
+            return None
+
+        agent.register_agent = _register_none  # type: ignore[method-assign]
+        rung_c_client = _make_probe_client(
+            RecordingBleakClient(
+                pair_script=[
+                    RuntimeError("org.bluez.Error.Failed: No agent is registered")
+                ]
+            )
+        )
+        assert await _run_pair(rung_c_client) == "unavailable"
+    # Rung B (the bleak >= 1.0 shape): success / AlreadyExists-skip /
+    # generic failure during the re-establish.
+    def _rung_b_client(establish_error: BaseException | None):
+        class RungBClient(aqua_client.AquaTempBleClient):
+            async def _resolve_device(self) -> object:
+                return object()  # a fake BLEDevice
+
+            async def _establish_connection(self, device, *, max_attempts, pair=False):
+                if establish_error is not None:
+                    raise establish_error
+                return RecordingBleakClient()
+
+            async def _post_connect_setup(self, client, device, *, t0, t_resolve, t_connect):
+                self._client = client  # the setup "ran"
+
+        client = RungBClient(ADDRESS)
+        client._client = _RecordingBleakClientBase()  # the pairless old link
+        return client
+
+    old_cls = aqua_client.BleakClient
+
+    class _PairCapableBleakClient:  # the bleak >= 1.0 constructor shape
+        def __init__(self, device, *, disconnected_callback=None, timeout=None, pair=False):
+            pass
+
+    aqua_client.BleakClient = _PairCapableBleakClient
+    try:
+        assert await _run_pair(_rung_b_client(None)) == "succeeded"
+        assert (
+            await _run_pair(
+                _rung_b_client(RuntimeError("org.bluez.Error.AlreadyExists: exists"))
+            )
+            == "skipped"
+        )
+        assert (
+            await _run_pair(
+                _rung_b_client(RuntimeError("org.bluez.Error.NetworkUnreachable: gone"))
+            )
+            == "failed"
+        )
+    finally:
+        aqua_client.BleakClient = old_cls
+
+    assert evidence, "no pairing lines were captured"
+    bad = [(m, lvl) for m, lvl in evidence if lvl != "WARNING"]
+    assert not bad, bad
+    # every contract 012 §2 ladder line shape was exercised at WARNING
+    prefixes = (
+        "pairing: bond state before: ",
+        "pairing: attempting via rung A",
+        "pairing: attempting via rung B",
+        "pairing: attempting via rung C",
+        "pairing: skipped: already bonded",
+        "pairing: succeeded",
+        "pairing: failed: ",
+        "pairing: bond state after: ",
+    )
+    for prefix in prefixes:
+        assert any(m.startswith(prefix) for m, _lvl in evidence), prefix
+    # the three distinct 'unavailable' verdicts (capability / dbus_fast
+    # absent / registration refused) all ran at WARNING
+    unavailable = [m for m, _lvl in evidence if m.startswith("pairing: unavailable: ")]
+    assert len(unavailable) >= 3, unavailable
+    assert any(
+        m.startswith("pairing: unavailable: no pairing agent could be registered")
+        for m in unavailable
+    ), unavailable
+    assert any(
+        m.startswith("pairing: unavailable: agent registration failed")
+        for m in unavailable
+    ), unavailable
+
+
+async def test_census_lines_stay_info_counterexample() -> None:
+    """Spec 012 counter-example (contract 012 §1.2): the high-volume
+    census diagnostics stay at INFO — a 16-push-per-window stream must
+    not become WARNING noise (the 008/009 census discipline stands;
+    grep-stable formats unchanged)."""
+    push = _build_block_frame(1001)  # a CRC-valid non-matching push
+    fake = _RecordingBleakClientBase(answer_frames=[push], answer_on_write=1)
+    client = _make_probe_client(fake)
+    with _patch_const("REQUEST_TIMEOUT", 0.2), _capture_logs() as cap:
+        try:
+            await client.read_registers(7, 45)
+        except aqua_client.AquaTempTimeoutError:
+            pass
+    census = [
+        (m, lvl)
+        for m, lvl in zip(cap.messages, cap.levels)
+        if m.startswith("block push observed")
+    ]
+    assert census, cap.messages
+    assert all(lvl == "INFO" for _m, lvl in census), census
+
+
+async def test_flow_build_marker_logged_once_first() -> None:
+    """Spec 012 FR-2/AC-3 (contract 012 §3): every connection test
+    starts with EXACTLY ONE build-marker WARNING — the FIRST captured
+    record, naming the running build so a stale-module install (the
+    files never loaded) is always detectable from the panel."""
+    result, records = await _drive_probe_flow([dict(FLOW_REGS)])
+    assert result["type"] == "form" and result["step_id"] == "confirm", result
+    marker = f"connection test to {ADDRESS}: build {cf.BUILD_VERSION}"
+    matches = [(m, lvl) for m, lvl in records if m == marker]
+    assert matches == [(marker, "WARNING")], [r for r in records if "build" in r[0]]
+    assert records[0] == (marker, "WARNING"), records[:3]
+
+
+async def test_build_version_matches_manifest() -> None:
+    """Spec 012 FR-3c (contract 012 §3.3 — the drift pin): the marker's
+    version is read from manifest.json at module import — the marker can
+    never lie about the running build, and never breaks the flow
+    ('unknown' only on a guarded read failure)."""
+    manifest = json.loads((COMPONENT_DIR / "manifest.json").read_text(encoding="utf-8"))
+    assert cf.BUILD_VERSION == manifest["version"], (
+        cf.BUILD_VERSION,
+        manifest["version"],
+    )
+    assert cf.BUILD_VERSION != "unknown"
+
+
+# ---------------------------------------------------------------------------
 # Standalone runner
 # ---------------------------------------------------------------------------
 
@@ -1666,6 +1956,12 @@ def main() -> int:
         test_flow_pair_stage_wedge_is_bounded_and_skips_retry,
         test_flow_pair_failure_routes_no_response_never_crashes,
         test_options_flow_pair_on_connect_toggle,
+        test_flow_probe_evidence_lines_are_warning,
+        test_flow_all_probe_evidence_lines_are_warning,
+        test_pairing_ladder_lines_are_warning,
+        test_census_lines_stay_info_counterexample,
+        test_flow_build_marker_logged_once_first,
+        test_build_version_matches_manifest,
     ]
     failures = 0
     for test in tests:

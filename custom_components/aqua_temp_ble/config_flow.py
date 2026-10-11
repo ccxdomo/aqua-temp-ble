@@ -64,6 +64,25 @@ MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 TEST_TIMEOUT = 70.0
 DEFAULT_NAME = "Aqua Temp heat pump"
 
+
+def _manifest_version() -> str:
+    """The integration's manifest version — the build marker (spec
+    012 FR-2, contract 012 §3): the panel must always identify which
+    build produced the lines below. Guarded: the marker never breaks
+    the flow, and never lies (a test pins equality with the manifest).
+    """
+    try:
+        import json
+        from pathlib import Path
+        return json.loads(
+            Path(__file__).with_name("manifest.json").read_text(encoding="utf-8")
+        )["version"]
+    except Exception:  # noqa: BLE001 — marker must never break the flow
+        return "unknown"
+
+
+BUILD_VERSION = _manifest_version()
+
 # English fallbacks for the runtime-translated menu option labels (spec
 # 002 FR-1/FR-13: a menu is used precisely because menu labels are
 # translatable, unlike dropdown option values). Live instances translate
@@ -470,6 +489,14 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
         # completes, so a failure raised by the READ still reports the
         # read's stage (the failure site, not the subsequent cleanup).
         t_test = time.monotonic()
+        # Spec 012 FR-2 (contract 012 §3): the test's first line names
+        # the running build at WARNING — the panel the operator reads
+        # stores only WARNING+ (research 012 §4), and a marker mismatch
+        # on an "updated" install means the files never loaded (the
+        # stale-module world, research 012 §5).
+        _LOGGER.warning(
+            "connection test to %s: build %s", self._address, BUILD_VERSION
+        )
         self._stage = "connect"
         try:
             async with asyncio.timeout(TEST_TIMEOUT):

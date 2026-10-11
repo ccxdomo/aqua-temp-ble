@@ -177,7 +177,7 @@ data:
 - `tests/test_modbus.py`, `tests/test_reassembly.py` — protocol + reassembly
   unit tests (plain python, no extra deps)
 
-## Next steps — make the unit's write refusal visible (spec 011)
+## Next steps — make the unit's write refusal visible (specs 011/012)
 
 The leading theory for the silent first read is a transport-level write
 gate: the unit accepts notifications from anyone but only accepts *writes*
@@ -188,13 +188,21 @@ refusal is invisible by ATT design (`specs/011-android-vs-linux-ble/research.md`
 *acknowledged* write on a timeout (a security gate then surfaces as a named
 ATT error in the log instead of silence), tries to **pair** the Pi when the
 error says so, and re-asks once; the `pair_on_connect` option stays OFF
-until that test proves the bond gate. The full no-terminal procedure —
-the "bLE" pairing gesture on the panel, the persistence retest, the
-optional phone capture — is `specs/011-android-vs-linux-ble/quickstart.md`:
-run the connection test from the HA UI and paste every `security probe:` /
-`pairing:` log line back (the decision matrix of
-`specs/011-android-vs-linux-ble/contracts/security-probe.md` §6 is binding
-for the follow-up).
+until that test proves the bond gate. The **0.8.0 build** (spec 012) makes
+that evidence readable where you actually look: the `security probe:` /
+`pairing:` verdict lines are **warnings** now, so they appear directly on
+Settings → System → Logs, and every test starts with a
+`connection test to <address>: build 0.8.0` marker line naming the running
+build. The next no-terminal procedure is
+[`specs/012-probe-not-firing/quickstart.md`](specs/012-probe-not-firing/quickstart.md):
+its §0 recovers the verdict already sitting in your existing
+`home-assistant.log` (the "Download full log" button — the Logs page keeps
+only warnings, which is why the 011 build's verdicts never showed there),
+then §1/§2 run the updated build and read the outcome from the Logs page
+directly (the decision matrix of
+`specs/011-android-vs-linux-ble/contracts/security-probe.md` §6 stays
+binding for the follow-up; the "bLE" choreography and the persistence
+retest remain documented in the 011 quickstart).
 
 ## Troubleshooting
 
