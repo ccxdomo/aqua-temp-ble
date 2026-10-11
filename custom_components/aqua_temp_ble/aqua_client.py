@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 from bleak import BleakClient, BleakScanner
@@ -101,6 +102,18 @@ def exc_chain(exc: BaseException) -> str:
 _exc_chain = exc_chain
 
 
+def _now() -> float:
+    """Monotonic clock seam for the stage-timing instrumentation.
+
+    The ONLY clock connect() reads (plan 007 §1.1, contract 007 §4):
+    tests fake the clock by patching this module attribute, never
+    time.monotonic globally. The stage timings it produces convert the
+    next failed run into the research 007 §8 signature table — the
+    whole point of spec 007 (FR-1, research 007 §8).
+    """
+    return time.monotonic()
+
+
 class AquaTempBleClient:
     """Bleak connection + single-flight Modbus request/response cycle."""
 
@@ -172,10 +185,21 @@ class AquaTempBleClient:
         resolution miss raises AquaTempDeviceNotFoundError instead
         (spec 005 FR-9) — the device was never found, which is not a
         connection failure.
+
+        Stage-timing instrumentation (spec 007 FR-1, research 007 §8):
+        connect() records one monotonic timestamp per stage boundary
+        and logs a "connect summary" line on success, the failing stage
+        + elapsed on failure — observation only, the connect
+        behaviour itself is untouched (spec 007 NFR-2).
         """
         if self.is_connected:
             return
+        # Stage "resolve" boundaries (spec 007 FR-1, research 007 §8):
+        # t0 is connect()'s entry, t_resolve the moment the device was
+        # obtained — the summary's first stage duration.
+        t0 = _now()
         device = await self._resolve_device()
+        t_resolve = _now()
         if device is None:
             raise AquaTempDeviceNotFoundError(
                 f"no Aqua Temp device found for address {self._address}"
@@ -192,6 +216,20 @@ class AquaTempBleClient:
                 # BLEAK_TIMEOUT = 20.0 s (research 005 §3.2), so the
                 # constant is dead for connects inside Home Assistant —
                 # it only bounds the standalone raw-client path below.
+                # Attempt-window transparency (spec 007 FR-2, research
+                # 007 §4): max_attempts exhausted 20 s windows are the
+                # arithmetic the production ">40 s" failure is made of —
+                # logged BEFORE the call so a hanging connect is
+                # self-explaining in our own log at INFO (contract 007
+                # §2.1). The 20.0 is brc's hardcoded BLEAK_TIMEOUT,
+                # deliberately not one of our constants.
+                _LOGGER.info(
+                    "connecting to %s: up to %d connect attempt(s) of %.0f s "
+                    "each (bleak-retry-connector BLEAK_TIMEOUT, research 007 §4)",
+                    self._address,
+                    max_attempts,
+                    20.0,
+                )
                 client: BleakClient = await brc.establish_connection(
                     BleakClient,
                     device,
@@ -201,18 +239,47 @@ class AquaTempBleClient:
                     timeout=const.CONNECT_TIMEOUT,
                 )
             else:
+                # Attempt-window line, standalone twin (spec 007 FR-2,
+                # research 007 §4): the raw fallback loops exactly twice,
+                # const.CONNECT_TIMEOUT per attempt (contract 007 §2.1
+                # standalone variant).
+                _LOGGER.info(
+                    "connecting to %s: up to 2 connect attempt(s) of %.0f s "
+                    "each (raw bleak, const.CONNECT_TIMEOUT)",
+                    self._address,
+                    const.CONNECT_TIMEOUT,
+                )
                 client = await self._connect_with_raw_client(device)
         except Exception as exc:  # noqa: BLE001
+            # Connect-stage failure (spec 007 FR-1, contract 007 §3.1,
+            # research 007 §8): the elapsed is measured from connect()
+            # entry; the stage is "connect" — this whole try block IS
+            # the connect stage. The chain stays verbatim (spec 005 FR-2).
+            elapsed = _now() - t0
             _LOGGER.error(
-                "connect to %s failed: %s", self._address, exc_chain(exc)
+                "connect to %s failed at stage connect after %.1f s: %s",
+                self._address,
+                elapsed,
+                exc_chain(exc),
             )
             raise AquaTempConnectionError(
                 f"could not connect to {self._address}: {exc_chain(exc)}"
             ) from exc
+        # Stage "connect" completed (spec 007 FR-1, research 007 §8):
+        # link + BlueZ GATT discovery inside bleak's window are done.
+        t_connect = _now()
         self._client = client
+        # Post-connect stage boundaries (spec 007 FR-1, contract 007
+        # §3.2): None until completed, so the failure handler can name
+        # the stage that was in flight — never a duration for an
+        # incomplete stage (plan 007 §1.2).
+        t_notify: float | None = None
+        t_write_char: float | None = None
         try:
             await client.start_notify(const.UUID_NOTIFY, self._on_notify)
+            t_notify = _now()
             self._resolve_write_characteristic(client)
+            t_write_char = _now()
             # Vendor parity (research 006 §2 step 4): give the module a
             # beat to route ff02 notifications after the CCCD write
             # before the first Modbus frame (spec 006 FR-1). Inside this
@@ -221,22 +288,52 @@ class AquaTempBleClient:
             # handled by the caller's task teardown, spec 005's
             # cancellation contract).
             await asyncio.sleep(const.SETTLE_AFTER_SUBSCRIBE)
+            t_settle = _now()
         except AquaTempError:
             # Link is up but ff02/ff01 setup failed: tear down so the next
             # connect() starts from a clean state.
             await self.disconnect()
             raise
         except Exception as exc:  # noqa: BLE001
+            # Post-connect setup failure (spec 007 FR-1, contract 007
+            # §3.2, research 007 §8): the stage is the one in flight,
+            # derived from the completed boundaries only.
+            if t_notify is None:
+                stage = "notify"
+            elif t_write_char is None:
+                stage = "write-char"
+            else:
+                stage = "settle"
+            elapsed = _now() - t0
             _LOGGER.error(
                 "post-connect setup (ff02 notify / ff01 lookup) on %s "
-                "failed: %s",
+                "failed at stage %s after %.1f s: %s",
                 self._address,
+                stage,
+                elapsed,
                 exc_chain(exc),
             )
             await self.disconnect()
             raise AquaTempConnectionError(
                 f"could not connect to {self._address}: {exc_chain(exc)}"
             ) from exc
+        # Connect summary (spec 007 FR-1, contract 007 §2.2, research
+        # 007 §8): ONE greppable line decomposing the whole connect —
+        # the runbook's step-1 evidence. Stage order and format are
+        # normative; every duration comes from completed stages only
+        # and the total is their sum. The parity line below is kept
+        # verbatim (other code greps it); the summary precedes it.
+        _LOGGER.info(
+            "connect summary %s: total %.1f s (resolve %.2f, connect %.1f, "
+            "notify %.2f, write-char %.2f, settle %.1f)",
+            self._address,
+            t_settle - t0,
+            t_resolve - t0,
+            t_connect - t_resolve,
+            t_notify - t_connect,
+            t_write_char - t_notify,
+            t_settle - t_write_char,
+        )
         _LOGGER.info(
             "Connected to %s (%s)",
             self._address,

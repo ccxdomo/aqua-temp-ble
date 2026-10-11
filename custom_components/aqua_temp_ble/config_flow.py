@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from collections.abc import Iterable
 from typing import Any
 
@@ -428,7 +429,21 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
         step's re-entry reads the stash after the task completes; task
         completion is the only completion signal (no flag to keep in
         sync).
+
+        Stage + elapsed instrumentation (spec 007 FR-3, research 007
+        §8): every failure line also reports the stage the test died in
+        and the elapsed since entry, against the TEST_TIMEOUT budget
+        (contract 007 §3.3) — log-only, the UI keys and their mapping
+        are unchanged (spec 007 NFR-2).
         """
+        # Test-level stage label + elapsed (spec 007 FR-3, research 007
+        # §8): the label advances as the body progresses — "connect"
+        # while connect() runs, "first-read" for the base read. The
+        # "disconnect" label is set only after the teardown completes,
+        # so a failure raised by the READ still reports "first-read"
+        # (the failure site, not the subsequent cleanup).
+        t_test = time.monotonic()
+        stage = "connect"
         try:
             async with asyncio.timeout(TEST_TIMEOUT):
                 # hass is passed so device resolution reads the HA
@@ -444,41 +459,68 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
                 # single BLE link mid-attempt, or stale bluez state cleared
                 # by the first attempt's cleanup.
                 await client.connect(max_attempts=2)
+                stage = "first-read"
                 try:
                     self._regs = await client.read_registers(
                         registers.BASE_BLOCK_START, registers.BASE_BLOCK_COUNT
                     )
                 finally:
                     await client.disconnect()
+                stage = "disconnect"
         except AquaTempDeviceNotFoundError as exc:
             # Order matters: an AquaTempError but NOT an AquaTempConnectionError
             # — catching it first keeps the mapping exact (plan 005 §2).
             self._test_error = "not_found"
+            # Stage "resolve" (contract 007 §3.3): this exception can
+            # only come from the resolution tiers — the device was never
+            # found (research 007 §8 signature table).
             _LOGGER.warning(
-                "connection test to %s: device not found: %s",
+                "connection test to %s: device not found: %s "
+                "at stage resolve after %.1f s (budget %.0f s)",
                 self._address,
                 exc,
+                time.monotonic() - t_test,
+                TEST_TIMEOUT,
             )
         except AquaTempConnectionError as exc:
             self._test_error = "cannot_connect"
+            # Stage from the body's progress (contract 007 §3.3): the
+            # connect() call as a whole reports "connect"; the precise
+            # sub-stage of a post-setup failure is carried by the
+            # aqua_client ERROR line (contract 007 §3.2, research 007
+            # §8) — this line is the test-level view.
             _LOGGER.warning(
-                "connection test to %s failed: %s",
+                "connection test to %s failed: %s "
+                "at stage %s after %.1f s (budget %.0f s)",
                 self._address,
                 exc_chain(exc),
+                stage,
+                time.monotonic() - t_test,
+                TEST_TIMEOUT,
             )
         except AquaTempTimeoutError as exc:
             self._test_error = "no_response"
+            # Stage "first-read" (contract 007 §3.3): the request
+            # deadline only expires during the base read.
             _LOGGER.warning(
-                "connection test to %s: no response: %s",
+                "connection test to %s: no response: %s "
+                "at stage first-read after %.1f s (budget %.0f s)",
                 self._address,
                 exc_chain(exc),
+                time.monotonic() - t_test,
+                TEST_TIMEOUT,
             )
         except AquaTempResponseError as exc:
             self._test_error = "crc_error"
+            # Stage "first-read" (contract 007 §3.3): an invalid frame
+            # only surfaces during the base read.
             _LOGGER.warning(
-                "connection test to %s: bad response: %s",
+                "connection test to %s: bad response: %s "
+                "at stage first-read after %.1f s (budget %.0f s)",
                 self._address,
                 exc_chain(exc),
+                time.monotonic() - t_test,
+                TEST_TIMEOUT,
             )
         except TimeoutError:
             # The asyncio.timeout budget expired and cancelled the
@@ -487,16 +529,31 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
             # likely causes go to the log; the user-facing key stays
             # cannot_connect (its advice is the correct action).
             self._test_error = "cannot_connect"
+            # Stage = the phase the cancellation hit (contract 007
+            # §3.3): "connect" or "first-read" — the label was current
+            # when asyncio.timeout fired (research 007 §8).
             _LOGGER.warning(
                 "connection test to %s exceeded the %.0f s budget — two "
                 "connect attempts and the read did not complete in time. "
                 "The unit is likely not accepting the connection (single "
-                "BLE link held by the vendor app?) or is out of range.",
+                "BLE link held by the vendor app?) or is out of range. "
+                "at stage %s after %.1f s (budget %.0f s)",
                 self._address,
+                TEST_TIMEOUT,
+                stage,
+                time.monotonic() - t_test,
                 TEST_TIMEOUT,
             )
         except Exception:  # noqa: BLE001
-            _LOGGER.exception("unexpected error during connection test")
+            # Stage "unknown" (contract 007 §3.3): an unexpected
+            # exception has no reliable site — the stage label says so
+            # instead of guessing (research 007 §8).
+            _LOGGER.exception(
+                "unexpected error during connection test "
+                "at stage unknown after %.1f s (budget %.0f s)",
+                time.monotonic() - t_test,
+                TEST_TIMEOUT,
+            )
             self._test_error = "cannot_connect"
         else:
             self._test_error = None

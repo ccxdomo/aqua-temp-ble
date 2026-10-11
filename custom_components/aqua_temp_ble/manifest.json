@@ -1,13 +1,22 @@
 {
   "domain": "aqua_temp_ble",
   "name": "Aqua Temp BLE",
-  "codeowners": ["@ccxdomo"],
+  "codeowners": [
+    "@ccxdomo"
+  ],
   "config_flow": true,
-  "dependencies": ["bluetooth"],
+  "dependencies": [
+    "bluetooth"
+  ],
   "documentation": "https://github.com/ccxdomo/aqua-temp-ble",
   "integration_type": "device",
   "iot_class": "local_polling",
-  "loggers": ["custom_components.aqua_temp_ble"],
-  "requirements": ["bleak>=0.22.0", "bleak-retry-connector>=3.5.0"],
-  "version": "0.1.0"
+  "loggers": [
+    "custom_components.aqua_temp_ble"
+  ],
+  "requirements": [
+    "bleak>=0.22.0",
+    "bleak-retry-connector>=3.5.0"
+  ],
+  "version": "0.6.0"
 }

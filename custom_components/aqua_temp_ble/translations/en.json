@@ -38,7 +38,7 @@
       },
       "test": {
         "title": "Testing the connection",
-        "description": "Connecting to {address} and reading the base register block (7-51)…"
+        "description": "Connecting to {address} and reading the base register block (7-51). This can take about a minute."
       },
       "confirm": {
         "title": "Name your device",

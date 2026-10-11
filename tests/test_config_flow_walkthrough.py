@@ -23,6 +23,13 @@ adapter-less abort, manual path, test-failure routing back to the origin
 form, and the dormant bluetooth path (contracts/config-flow-states.md §2
 is the normative transition table; labels per plan.md §6).
 
+Extended by spec 007: every failure branch of the connection test
+appends its stage + elapsed + budget suffix to the log line (FR-3,
+contract 007 §3.3) — log-only, the UI keys are untouched (NFR-2), and
+the stage values follow the contract's branch table (resolve for the
+resolution miss, connect for the connect phase, first-read for the
+read phase, unknown for the unexpected branch).
+
 Home Assistant is fully stubbed (no real HA install needed): config_flow
 is imported against minimal fake homeassistant/voluptuous/bleak modules,
 and the stubbed result helpers record every step result for inspection.
@@ -556,10 +563,17 @@ async def test_failed_test_returns_to_device_form_with_error():
     assert "AA:BB:CC:DD:EE:10" in result["data_schema"]["address"]
     # Spec 005 FR-2/AC-6: the cannot_connect branch logs the address and
     # the full exception chain (red-first: silent on the pre-005 code).
+    # Spec 007 FR-3/AC-4 (red-first: no suffix on the pre-007 code): the
+    # same line now carries the stage, the elapsed and the budget
+    # (contract 007 §3.3) — the fake raises from connect(), so the
+    # stage is "connect".
     assert any(
         "AA:BB:CC:DD:EE:10" in m
         and "failed" in m
         and "vendor app holds the link" in m
+        and "at stage connect" in m
+        and "after " in m
+        and "budget" in m
         for m in log.messages
     ), log.messages
 
@@ -605,8 +619,16 @@ async def test_manual_path_and_failure_symmetry():
     assert result["type"] == "form" and result["step_id"] == "manual", result
     assert result["errors"] == {"base": "no_response"}, result
     # Spec 005 FR-2: the no_response branch logs the address + chain.
+    # Spec 007 FR-3/AC-4 (red-first): the suffix's stage is "first-read"
+    # (contract 007 §3.3 — the request deadline only expires during the
+    # read).
     assert any(
-        "aa:bb:cc:dd:ee:ff" in m and "no response" in m for m in log.messages
+        "aa:bb:cc:dd:ee:ff" in m
+        and "no response" in m
+        and "at stage first-read" in m
+        and "after " in m
+        and "budget" in m
+        for m in log.messages
     ), log.messages
 
     # The stash is consumed: a second render shows no stale error.
@@ -677,8 +699,15 @@ async def test_crc_error_failure_routes_to_device_form():
     assert result["type"] == "form" and result["step_id"] == "device", result
     assert result["errors"] == {"base": "crc_error"}, result
     # Spec 005 FR-2: the crc_error branch logs the address + chain.
+    # Spec 007 FR-3/AC-4 (red-first): stage "first-read" — an invalid
+    # frame only surfaces during the read (contract 007 §3.3).
     assert any(
-        "AA:BB:CC:DD:EE:10" in m and "bad response" in m for m in log.messages
+        "AA:BB:CC:DD:EE:10" in m
+        and "bad response" in m
+        and "at stage first-read" in m
+        and "after " in m
+        and "budget" in m
+        for m in log.messages
     ), log.messages
     # Stash consumed: a second render shows no stale error.
     result = await flow.async_step_device()
@@ -707,8 +736,15 @@ async def test_not_found_routes_to_device_form_with_log():
     assert result["type"] == "form" and result["step_id"] == "device", result
     assert result["errors"] == {"base": "not_found"}, result
     # AC-1: the not_found branch logs the address and the cause.
+    # Spec 007 FR-3/AC-4 (red-first): stage "resolve" — this exception
+    # can only come from the resolution tiers (contract 007 §3.3).
     assert any(
-        "AA:BB:CC:DD:EE:10" in m and "not found" in m for m in log.messages
+        "AA:BB:CC:DD:EE:10" in m
+        and "not found" in m
+        and "at stage resolve" in m
+        and "after " in m
+        and "budget" in m
+        for m in log.messages
     ), log.messages
     # Stash consumed: a second render shows no stale error.
     result = await flow.async_step_device()
@@ -742,8 +778,42 @@ async def test_budget_expiry_routes_cannot_connect_with_log():
     assert result["type"] == "form" and result["step_id"] == "device", result
     assert result["errors"] == {"base": "cannot_connect"}, result
     # AC-3: the budget-expiry branch names the budget value explicitly.
+    # Spec 007 FR-3/AC-4 (red-first): the stage is where the cancellation
+    # hit — the fake hangs inside connect(), so "connect" (contract 007
+    # §3.3, research 007 §8).
     assert any(
-        "AA:BB:CC:DD:EE:10" in m and "budget" in m for m in log.messages
+        "AA:BB:CC:DD:EE:10" in m
+        and "budget" in m
+        and "at stage connect" in m
+        and "after " in m
+        for m in log.messages
+    ), log.messages
+
+
+async def test_unexpected_failure_logs_stage_unknown():
+    """Spec 007 FR-3/AC-4: the unexpected-exception branch logs the
+    stage suffix too (contract 007 §3.3: stage "unknown" — an unexpected
+    exception has no reliable site; the label says so instead of
+    guessing). UI key stays cannot_connect (spec 005 mapping).
+
+    Red-first: the pre-007 line carries no stage/elapsed suffix.
+    """
+    hass = FakeHass(infos=[FakeInfo("AA:BB:CC:DD:EE:10", "BlueNRG-7A", -50)])
+    flow = make_flow(hass)
+    FakeClient.fault = ValueError("bleak exploded")
+    with _LogCapture(cf._LOGGER) as log:
+        result = await flow.async_step_device(
+            user_input={"address": "AA:BB:CC:DD:EE:10"}
+        )
+        result = await _drive_progress(flow, result)
+    assert result["type"] == "form" and result["step_id"] == "device", result
+    assert result["errors"] == {"base": "cannot_connect"}, result
+    assert any(
+        "unexpected error during connection test" in m
+        and "at stage unknown" in m
+        and "after " in m
+        and "budget" in m
+        for m in log.messages
     ), log.messages
 
 
@@ -983,6 +1053,7 @@ def main() -> None:
         test_crc_error_failure_routes_to_device_form,
         test_not_found_routes_to_device_form_with_log,
         test_budget_expiry_routes_cannot_connect_with_log,
+        test_unexpected_failure_logs_stage_unknown,
         test_connection_test_budget_and_attempts,
         test_scan_branch_returns_to_user_menu,
         test_no_devices_menu_and_configured_exclusion,

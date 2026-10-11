@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import sys
 from pathlib import Path
 
@@ -25,6 +26,14 @@ import registers  # noqa: E402
 
 
 async def main(argv: list[str]) -> int:
+    # Standalone visibility (spec 007 FR-1 corollary, plan 007 §3):
+    # make the connect stage-timing lines — attempt window, connect
+    # summary, failure stage — visible on stderr without Home Assistant
+    # (INFO records are otherwise dropped outside HA). The register
+    # dump format below is untouched.
+    logging.basicConfig(
+        level=logging.INFO, format="%(levelname)s %(name)s: %(message)s"
+    )
     parser = argparse.ArgumentParser(description="Aqua Temp BLE smoke test (read-only)")
     parser.add_argument("address", help="BLE address of the unit (XX:XX:XX:XX:XX:XX)")
     parser.add_argument("--name", default=None, help="expected device name (optional)")

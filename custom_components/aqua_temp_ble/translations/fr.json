@@ -38,7 +38,7 @@
       },
       "test": {
         "title": "Test de connexion",
-        "description": "Connexion à {address} et lecture du bloc de registres de base (7-51)…"
+        "description": "Connexion a {address} et lecture du bloc de registres de base (7-51). Cela peut prendre environ une minute."
       },
       "confirm": {
         "title": "Nommez votre appareil",
