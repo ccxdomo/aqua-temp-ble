@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Walkthrough tests for the spec 002 config flow state machine.
+"""Walkthrough tests for the spec 002 config flow state machine, extended
+by spec 004: the progress steps are driven manager-faithfully and the
+progress-step contract is asserted on every re-entry — a progress step
+may only yield progress or progress_done; anything else is exactly
+what HA punishes with the ValueError that crashed the production
+instance (research 004 §3.2).
 
 Unlike test_config_flow_list.py (the pure list builder), this file drives
 the ACTUAL flow steps end to end — user menu -> device list -> live test
@@ -88,6 +93,9 @@ def _install_stubs() -> None:
 
         def __init_subclass__(cls, **kwargs):
             super().__init_subclass__()
+            # HA's real ConfigFlow stores the domain passed via the class
+            # kwarg; result helpers expose it as `handler` (research 004 §3.3).
+            cls.handler = kwargs.get("domain")
 
         # -- results (recorded for inspection) --------------------------
         def async_show_menu(
@@ -134,6 +142,16 @@ def _install_stubs() -> None:
                 "progress_action": progress_action,
                 "progress_task": progress_task,
                 "description_placeholders": dict(description_placeholders or {}),
+            }
+
+        def async_show_progress_done(self, *, next_step_id):
+            # HA result shape (research 004 §3.3): SHOW_PROGRESS_DONE whose
+            # step_id is the NEXT step the manager will call (kwarg is
+            # next_step_id, not step_id).
+            return {
+                "type": "progress_done",
+                "step_id": next_step_id,
+                "handler": getattr(self, "handler", None),
             }
 
         def async_abort(self, *, reason):
@@ -308,6 +326,15 @@ class FakeClient:
         self.disconnected = True
 
 
+class SlowFakeClient(FakeClient):
+    """FakeClient whose read hangs briefly, to observe a re-entry while
+    the progress task is still running (E-7: mid-progress refresh)."""
+
+    async def read_registers(self, start, count):
+        await asyncio.sleep(0.05)
+        return await super().read_registers(start, count)
+
+
 def make_flow(hass):
     """Build a fresh flow bound to the fake hass (client fakes reset)."""
     FakeClient.reset()
@@ -336,8 +363,33 @@ def _flatten_translations(domain, data):
     return out
 
 
+async def _drive_progress(flow, result):
+    """Mirror HA's FlowManager for SHOW_PROGRESS results (plan 004 §5).
+
+    The manager registers a done-callback on the progress task and, when
+    the task completes, re-enters the step with user_input=None. THE
+    contract (research 004 §3.2): that re-entry may only yield progress
+    (same or new task) or progress_done — any other result type is what
+    HA punishes with "ValueError: Show progress can only transition to
+    show progress or show progress done." On progress_done the
+    manager's configure loop advances to async_step_<next_step_id>(None).
+    """
+    assert result["type"] == "progress", result
+    await result["progress_task"]  # the manager's done-callback fires
+    # Re-entry: HA calls the step again with user_input=None.
+    result = await getattr(flow, f"async_step_{result['step_id']}")(None)
+    assert result["type"] in ("progress", "progress_done"), (
+        "progress re-entry must yield progress or progress_done "
+        f"(data_entry_flow contract) — got {result['type']!r}: {result}"
+    )
+    if result["type"] == "progress_done":
+        # Manager loop: advance to the next step with user_input=None.
+        result = await getattr(flow, f"async_step_{result['step_id']}")(None)
+    return result
+
+
 # ---------------------------------------------------------------------------
-# Walkthrough tests (contracts/config-flow-states.md §2)
+# Walkthrough tests (contracts/config-flow-states.md §2 + 004 contract)
 # ---------------------------------------------------------------------------
 
 
@@ -378,17 +430,19 @@ async def test_happy_path_menu_device_test_confirm_entry():
     assert result["progress_action"] == "test"  # must match the step_id
     assert result["progress_task"] is not None
     assert flow._stub_unique_id == "AA:BB:CC:DD:EE:10"  # upper-cased unique id
-    await result["progress_task"]
+
+    # 4. Manager-faithful drive: task completes -> HA re-enters the step,
+    #    which must yield progress_done(confirm) -> the manager advances to
+    #    the confirm form (004 FR-1; the pre-fix code returned the form
+    #    directly and HA raised the ValueError).
+    result = await _drive_progress(flow, result)
+    assert result["type"] == "form" and result["step_id"] == "confirm", result
     client = FakeClient.instances[-1]
     # FR-9: the client is built with the flow's hass; name does not leak.
     assert client.hass is hass
     assert client.address == "AA:BB:CC:DD:EE:10"
     assert client.name is None
     assert client.disconnected  # the test always closes the link
-
-    # 4. Progress task done -> re-entry routes to confirm with decoded regs.
-    result = await flow.async_step_test()
-    assert result["type"] == "form" and result["step_id"] == "confirm", result
     placeholders = result["description_placeholders"]
     assert placeholders["address"] == "AA:BB:CC:DD:EE:10"
     assert placeholders["power"] == "on", placeholders
@@ -416,22 +470,26 @@ async def test_failed_test_returns_to_device_form_with_error():
         user_input={"address": "AA:BB:CC:DD:EE:10"}
     )
     assert result["type"] == "progress" and result["step_id"] == "test", result
-    await result["progress_task"]
-    result = await flow.async_step_test()
-
-    # Back to the device form with the error — NOT to the menu.
+    # Re-entry must yield progress_done(next_step_id="device"); the manager
+    # then re-renders the device form with the stashed error (004 FR-4).
+    result = await _drive_progress(flow, result)
     assert result["type"] == "form", result
     assert result["step_id"] == "device", result
     assert result["errors"] == {"base": "cannot_connect"}, result
     assert "AA:BB:CC:DD:EE:10" in result["data_schema"]["address"]
 
-    # Recovery: a retry with a working unit completes the flow.
+    # The stash is consumed by that render: a second render of the same
+    # step shows no stale error (004 FR-4 read-and-clear).
+    result = await flow.async_step_device()
+    assert result["type"] == "form" and result["errors"] is None, result
+
+    # Recovery: a retry with a working unit completes the flow. Exactly
+    # one new test task starts (AC-7 rapid retry).
     FakeClient.fault = None
     result = await flow.async_step_device(
         user_input={"address": "AA:BB:CC:DD:EE:10"}
     )
-    await result["progress_task"]
-    result = await flow.async_step_test()
+    result = await _drive_progress(flow, result)
     assert result["type"] == "form" and result["step_id"] == "confirm", result
 
 
@@ -455,12 +513,15 @@ async def test_manual_path_and_failure_symmetry():
     assert result["type"] == "progress" and result["step_id"] == "test", result
     assert flow._stub_unique_id == "AA:BB:CC:DD:EE:FF"
     FakeClient.fault = cf.AquaTempTimeoutError("no complete response")
-    await result["progress_task"]
-    result = await flow.async_step_test()
-
-    # Symmetric routing: back to the MANUAL form with the error key.
+    # Re-entry must yield progress_done(next_step_id="manual"); the
+    # manager re-renders the manual form with the stashed error.
+    result = await _drive_progress(flow, result)
     assert result["type"] == "form" and result["step_id"] == "manual", result
     assert result["errors"] == {"base": "no_response"}, result
+
+    # The stash is consumed: a second render shows no stale error.
+    result = await flow.async_step_manual()
+    assert result["type"] == "form" and result["errors"] is None, result
 
     # An already-configured address aborts BEFORE any test runs.
     FakeClient.fault = None
@@ -472,6 +533,61 @@ async def test_manual_path_and_failure_symmetry():
     else:
         raise AssertionError("a configured address must abort the flow")
     assert len(FakeClient.instances) == 1  # no new test started
+
+
+async def test_reentry_while_running_returns_same_task():
+    """E-7/FR-3: a re-entry while the task still runs returns the SAME task.
+
+    The manager no-ops on an unchanged progress task (research 004 §3.1);
+    re-creating a task per entry (the pre-004 behaviour) would duplicate
+    connection attempts against a unit that accepts a single BLE link.
+    """
+    hass = FakeHass(infos=[FakeInfo("AA:BB:CC:DD:EE:10", "BlueNRG-7A", -50)])
+    flow = make_flow(hass)
+    cf.AquaTempBleClient = SlowFakeClient  # read hangs briefly
+
+    result = await flow.async_step_device(
+        user_input={"address": "AA:BB:CC:DD:EE:10"}
+    )
+    assert result["type"] == "progress" and result["step_id"] == "test", result
+    first_task = result["progress_task"]
+
+    # Mid-progress re-entry (frontend refresh): progress again, with the
+    # SAME task object — never a second attempt.
+    again = await flow.async_step_test()
+    assert again["type"] == "progress" and again["step_id"] == "test", again
+    assert again["progress_task"] is first_task, (
+        "a re-entry while the task runs must return the SAME task object"
+    )
+
+    # The single run then completes: progress_done -> confirm form.
+    result = await _drive_progress(flow, again)
+    assert result["type"] == "form" and result["step_id"] == "confirm", result
+    assert len(FakeClient.instances) == 1  # exactly one connection attempt
+
+
+async def test_crc_error_failure_routes_to_device_form():
+    """crc_error (invalid response frame) routes to the origin form too.
+
+    Failure-routing matrix (004 routing table): cannot_connect from the
+    device origin and the dormant bluetooth path, no_response from the
+    manual origin, crc_error here — every key reaches its origin form.
+    """
+    hass = FakeHass(infos=[FakeInfo("AA:BB:CC:DD:EE:10", "BlueNRG-7A", -50)])
+    flow = make_flow(hass)
+    await flow.async_step_user()  # menu
+    await flow.async_step_device()  # device form
+
+    FakeClient.fault = cf.AquaTempResponseError("bad CRC")
+    result = await flow.async_step_device(
+        user_input={"address": "AA:BB:CC:DD:EE:10"}
+    )
+    result = await _drive_progress(flow, result)
+    assert result["type"] == "form" and result["step_id"] == "device", result
+    assert result["errors"] == {"base": "crc_error"}, result
+    # Stash consumed: a second render shows no stale error.
+    result = await flow.async_step_device()
+    assert result["errors"] is None, result
 
 
 async def test_scan_branch_returns_to_user_menu():
@@ -489,19 +605,20 @@ async def test_scan_branch_returns_to_user_menu():
         assert result["type"] == "progress" and result["step_id"] == "scan", result
         assert result["progress_action"] == "scan"  # must match the step_id
         assert result["description_placeholders"]["seconds"] == 0.01, result
-        await result["progress_task"]
-
-        # Re-entry after the wait -> back to the USER menu, counts refreshed.
+        # A new advertiser appears while the wait runs: the menu driven
+        # after progress_done re-renders with the fresh history.
         hass.bt_infos.append(FakeInfo("AA:BB:CC:DD:EE:99", "BlueNRG-2", -40))
-        result = await flow.async_step_scan()
+
+        # Re-entry must yield progress_done(next_step_id="user"); the
+        # manager then re-renders the USER menu with fresh counts.
+        result = await _drive_progress(flow, result)
         assert result["type"] == "menu" and result["step_id"] == "user", result
         assert list(result["menu_options"]) == ["device", "scan", "manual"]
         assert result["description_placeholders"] == {"recognized": 2, "total": 2}
 
-        # E-11: an immediate second scan is harmless.
+        # E-11: an immediate second scan is harmless (one fresh wait).
         result = await flow.async_step_scan()
-        await result["progress_task"]
-        result = await flow.async_step_scan()
+        result = await _drive_progress(flow, result)
         assert result["type"] == "menu" and result["step_id"] == "user", result
     finally:
         cf.SCAN_WAIT_SECONDS = original_wait
@@ -597,14 +714,42 @@ async def test_dormant_bluetooth_path():
         types.SimpleNamespace(name="BlueNRG-7A", address="AA:BB:CC:DD:EE:10")
     )
     assert result["type"] == "progress" and result["step_id"] == "test", result
-    await result["progress_task"]
+
+    # origin="user": the failure routes to the DEVICE list (menus cannot
+    # display errors) via progress_done(next_step_id="device"). The client
+    # is instantiated by the task, so inspect it after the drive.
+    result = await _drive_progress(flow, result)
     client = FakeClient.instances[-1]
     assert client.name == "BlueNRG-7A"  # discovery name reaches the client
     assert client.hass is hass
-
-    result = await flow.async_step_test()
     assert result["type"] == "form" and result["step_id"] == "device", result
     assert result["errors"] == {"base": "cannot_connect"}, result
+    # Stash consumed: a second render shows no stale error.
+    result = await flow.async_step_device()
+    assert result["type"] == "form" and result["errors"] is None, result
+
+
+async def test_bluetooth_failure_drained_history_clears_stash():
+    """E-6: routed failure + drained discovery history -> the device step
+    falls back to the user menu and DROPS the stashed error (menus cannot
+    display it) — it must not leak into a later form render.
+    """
+    hass = FakeHass(infos=[])  # history drains before the form re-renders
+    flow = make_flow(hass)
+    FakeClient.fault = cf.AquaTempConnectionError("link lost")
+    result = await flow.async_step_bluetooth(
+        types.SimpleNamespace(name="BlueNRG-7A", address="AA:BB:CC:DD:EE:10")
+    )
+    assert result["type"] == "progress" and result["step_id"] == "test", result
+    result = await _drive_progress(flow, result)
+    # No devices left: the device step falls back to the no-devices menu.
+    assert result["type"] == "menu" and result["step_id"] == "no_devices", result
+    # The stash was dropped by the fallback: a later manual form render
+    # shows NO stale error (004 FR-4, contract §5).
+    assert flow._test_error is None
+    result = await flow.async_step_manual()
+    assert result["type"] == "form" and result["step_id"] == "manual", result
+    assert result["errors"] is None, result
 
 
 async def test_flow_state_constants_and_no_sentinels():
@@ -619,6 +764,13 @@ async def test_flow_state_constants_and_no_sentinels():
     const_mod = sys.modules[f"{PKG}.const"]
     assert const_mod.SCAN_WAIT_SECONDS == 8.0
     assert const_mod.MAX_OTHER_DEVICES == 30
+    # 004 data model: the boolean done-flags are gone; the task references
+    # start clean on a fresh flow.
+    flow = make_flow(FakeHass())
+    assert flow._test_task is None and flow._scan_task is None
+    assert flow._test_error is None
+    assert "_test_done" not in vars(flow)
+    assert "_scan_done" not in vars(flow)
 
 
 async def test_device_list_in_form_matches_contract_builder():
@@ -647,17 +799,31 @@ def main() -> None:
         test_happy_path_menu_device_test_confirm_entry,
         test_failed_test_returns_to_device_form_with_error,
         test_manual_path_and_failure_symmetry,
+        test_reentry_while_running_returns_same_task,
+        test_crc_error_failure_routes_to_device_form,
         test_scan_branch_returns_to_user_menu,
         test_no_devices_menu_and_configured_exclusion,
         test_no_bluetooth_adapter_aborts,
         test_menu_labels_follow_real_translations,
         test_dormant_bluetooth_path,
+        test_bluetooth_failure_drained_history_clears_stash,
         test_flow_state_constants_and_no_sentinels,
         test_device_list_in_form_matches_contract_builder,
     ]
+    failures = 0
     for test in tests:
-        asyncio.run(test())
+        try:
+            asyncio.run(test())
+        except (AssertionError, AttributeError) as exc:
+            # AssertionError: contract/stage violation. AttributeError:
+            # data-model violation (expected attribute missing).
+            failures += 1
+            print(f"FAIL  {test.__name__}: {exc}")
+            continue
         print(f"PASS  {test.__name__}")
+    if failures:
+        print(f"\nFAILED: {failures}/{len(tests)} config flow walkthrough tests")
+        sys.exit(1)
     print(f"\nPASSED: {len(tests)}/{len(tests)} config flow walkthrough tests")
 
 

@@ -255,7 +255,21 @@ class AquaTempBleClient:
                 _LOGGER.debug("disconnect error (ignored): %s", exc)
 
     def _on_disconnect(self, _client: BleakClient) -> None:
-        """bleak disconnected_callback — runs in the event loop thread."""
+        """bleak disconnected_callback — runs in the event loop thread.
+
+        bleak fires this callback on ANY disconnect transition, including
+        our own clean disconnect() (research 004 §5), so distinguish the
+        two: our disconnect() clears self._client BEFORE awaiting bleak's
+        disconnect and has already cancelled the silence timer and failed
+        any pending request — an expected close, reported at DEBUG. An
+        unexpected link loss still warns and fails the in-flight read
+        immediately (unchanged behaviour).
+        """
+        if self._client is None:
+            # Self-initiated close (specs/004 FR-6): timer and pending
+            # request were already handled by disconnect().
+            _LOGGER.debug("BLE connection to %s closed", self._address)
+            return
         _LOGGER.warning("BLE connection to %s lost", self._address)
         self._cancel_silence_timer()
         self._fail_pending(AquaTempConnectionError(f"connection to {self._address} lost"))

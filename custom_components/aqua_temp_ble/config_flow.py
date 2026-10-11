@@ -171,8 +171,12 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
         self._name: str | None = None
         self._regs: dict[int, int] | None = None
         self._test_error: str | None = None
-        self._test_done = False
-        self._scan_done = False
+        # Progress-step state (specs/004): the asyncio task itself is the
+        # done-flag (.done() is authoritative — a stale boolean could be
+        # set by a previous attempt's task). Created once per attempt,
+        # cleared when the completion is routed to the next step.
+        self._test_task: asyncio.Task[None] | None = None
+        self._scan_task: asyncio.Task[None] | None = None
         self._origin = "user"  # step to return to on a failed test
         self._device_labels: dict[str, str] = {}
 
@@ -269,11 +273,21 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
             await self.async_set_unique_id(self._address.upper(), raise_on_progress=False)
             self._abort_if_unique_id_configured()
             return await self.async_step_test()
+        if errors is None and self._test_error is not None:
+            # A routed test failure re-renders this form through the
+            # manager (user_input=None): display the stashed error once,
+            # then clear it (specs/004 FR-4 — internal routing no longer
+            # passes errors=; the stash is the only transport).
+            errors = {"base": self._test_error}
+            self._test_error = None
         self._device_labels, _counts = await self._async_build_device_labels()
         if not self._device_labels:
             # Edge case: the history drained between the menu and this
             # visit. Never render a device form without devices — the
-            # menu step re-renders with its no-devices presentation.
+            # menu step re-renders with its no-devices presentation. A
+            # menu cannot display errors either, so drop any stashed
+            # error: it must not leak into a later form render (E-6).
+            self._test_error = None
             return await self.async_step_user()
         return self.async_show_form(
             step_id="device",
@@ -290,31 +304,39 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
 
         HA's scanners already run continuously (research 002 Q3); the flow
         never starts a scan itself — the wait only gives a unit that just
-        entered pairing mode time to advertise. Repeated clicks are
-        harmless (E-11): each click is exactly one bounded wait.
+        entered pairing mode time to advertise. Same progress contract as
+        async_step_test (specs/004): one task per attempt, the SAME task on
+        re-entries while it runs, progress_done to the user menu on
+        completion. A bare sleep cannot fail except by cancellation (flow
+        removed), so no error handling is needed. Repeated clicks are
+        harmless (E-11): while a wait runs, a re-entry re-arms nothing.
         """
-        if self._scan_done:
-            self._scan_done = False
-            return await self.async_step_user()
-
-        async def _async_wait() -> None:
-            try:
-                await asyncio.sleep(SCAN_WAIT_SECONDS)
-            finally:
-                self._scan_done = True
-
-        return self.async_show_progress(
-            step_id="scan",
-            progress_action="scan",
-            progress_task=self.hass.async_create_task(_async_wait()),
-            description_placeholders={"seconds": SCAN_WAIT_SECONDS},
-        )
+        if self._scan_task is None:
+            self._scan_task = self.hass.async_create_task(
+                asyncio.sleep(SCAN_WAIT_SECONDS)
+            )
+        if not self._scan_task.done():
+            return self.async_show_progress(
+                step_id="scan",
+                progress_action="scan",
+                progress_task=self._scan_task,
+                description_placeholders={"seconds": SCAN_WAIT_SECONDS},
+            )
+        self._scan_task = None
+        return self.async_show_progress_done(next_step_id="user")
 
     async def async_step_manual(
         self, user_input: dict[str, Any] | None = None, errors: dict[str, str] | None = None
     ) -> ConfigFlowResult:
         """Manual BLE address entry."""
         errors = errors or {}
+        if user_input is None and self._test_error is not None:
+            # A routed test failure re-renders this form through the
+            # manager (user_input=None): display the stashed error once,
+            # then clear it (specs/004 FR-4 — internal routing no longer
+            # passes errors=; the stash is the only transport).
+            errors = {"base": self._test_error}
+            self._test_error = None
         if user_input is not None:
             address = user_input["address"].strip()
             if not MAC_RE.match(address):
@@ -347,59 +369,79 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_test(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Progress step: live connection test (connect + read 45 registers)."""
-        if self._test_done:
-            self._test_done = False
-            error, self._test_error = self._test_error, None
-            if error is None:
-                return await self.async_step_confirm()
-            # Failed -> back to the form the choice came from, with the
-            # error displayed (AC-7). "manual" returns to the manual form;
-            # "device" (and the dormant bluetooth path, origin="user")
-            # returns to the device list — menus cannot display errors,
-            # and async_step_device itself falls back to the menu if the
-            # history has drained.
-            if self._origin == "manual":
-                return await self.async_step_manual(errors={"base": error})
-            return await self.async_step_device(errors={"base": error})
+        """Progress step: live connection test (connect + read 45 registers).
 
-        async def _async_test() -> None:
-            try:
-                async with asyncio.timeout(TEST_TIMEOUT):
-                    # hass is passed so device resolution prefers the HA
-                    # bluetooth cache before falling back to bleak scanning.
-                    client = AquaTempBleClient(
-                        self._address, name=self._name, hass=self.hass
+        Progress-step contract (specs/004): HA re-enters this step when the
+        progress task completes, and that re-entry may only return
+        async_show_progress or async_show_progress_done — any other
+        result raises ValueError in data_entry_flow and leaves the dialog
+        stuck on the spinner. The task is created once per attempt and kept
+        as the reference; re-entries while it runs return the SAME task
+        object (HA's manager no-ops on an unchanged task).
+        """
+        if self._test_task is None:
+            # New attempt: reset the error stash so a stale error from a
+            # previous attempt can never surface on the next form render.
+            self._test_error = None
+            self._test_task = self.hass.async_create_task(self._async_test())
+
+        if not self._test_task.done():
+            return self.async_show_progress(
+                step_id="test",
+                progress_action="test",
+                progress_task=self._test_task,
+                description_placeholders={"address": self._address or ""},
+            )
+
+        # Task complete -> HA re-entered the step. Clear the reference so
+        # the next attempt starts fresh, then hand routing back to the
+        # manager: it — not this step — calls async_step_<next>(None).
+        # Success -> confirm; failure -> the origin form ("manual" for a
+        # manual entry, the device list otherwise, including the dormant
+        # bluetooth path whose origin is "user": menus cannot display
+        # errors). The stashed _test_error is consumed by that form.
+        self._test_task = None
+        if self._test_error is None:
+            return self.async_show_progress_done(next_step_id="confirm")
+        if self._origin == "manual":
+            return self.async_show_progress_done(next_step_id="manual")
+        return self.async_show_progress_done(next_step_id="device")
+
+    async def _async_test(self) -> None:
+        """Body of the test progress task — created once per attempt.
+
+        Never raises: every failure path stores an error key in
+        _test_error, success stores None. The step's re-entry reads the
+        stash after the task completes; task completion is the only
+        completion signal (no flag to keep in sync).
+        """
+        try:
+            async with asyncio.timeout(TEST_TIMEOUT):
+                # hass is passed so device resolution prefers the HA
+                # bluetooth cache before falling back to bleak scanning.
+                client = AquaTempBleClient(
+                    self._address, name=self._name, hass=self.hass
+                )
+                await client.connect()
+                try:
+                    self._regs = await client.read_registers(
+                        registers.BASE_BLOCK_START, registers.BASE_BLOCK_COUNT
                     )
-                    await client.connect()
-                    try:
-                        self._regs = await client.read_registers(
-                            registers.BASE_BLOCK_START, registers.BASE_BLOCK_COUNT
-                        )
-                    finally:
-                        await client.disconnect()
-            except AquaTempConnectionError:
-                self._test_error = "cannot_connect"
-            except AquaTempTimeoutError:
-                self._test_error = "no_response"
-            except AquaTempResponseError:
-                self._test_error = "crc_error"
-            except TimeoutError:
-                self._test_error = "cannot_connect"
-            except Exception:  # noqa: BLE001
-                _LOGGER.exception("unexpected error during connection test")
-                self._test_error = "cannot_connect"
-            else:
-                self._test_error = None
-            finally:
-                self._test_done = True
-
-        return self.async_show_progress(
-            step_id="test",
-            progress_action="test",
-            progress_task=self.hass.async_create_task(_async_test()),
-            description_placeholders={"address": self._address or ""},
-        )
+                finally:
+                    await client.disconnect()
+        except AquaTempConnectionError:
+            self._test_error = "cannot_connect"
+        except AquaTempTimeoutError:
+            self._test_error = "no_response"
+        except AquaTempResponseError:
+            self._test_error = "crc_error"
+        except TimeoutError:
+            self._test_error = "cannot_connect"
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("unexpected error during connection test")
+            self._test_error = "cannot_connect"
+        else:
+            self._test_error = None
 
     async def async_step_confirm(
         self, user_input: dict[str, Any] | None = None
