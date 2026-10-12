@@ -34,15 +34,16 @@ cycle is the **expected** world, not an error.
 | Heat setpoint display | **proven** (panel diff) | climate target |
 | Power control (on/off) | **proven** (pump heard) | climate Heat/Off buttons |
 | Setpoint control (10.0-40.0 °C, 0.5 steps) | **proven** (mirror followed) | climate target slider |
+| Fault indicator (code when proven) | **proven** (owner E03 diff-revert) | 1 binary sensor |
 | Push stream health | diagnostic | 1 sensor (diagnostic) |
 | Register / power / setpoint probes | calibration instruments | 3 buttons + 3 services |
 
 **Not available — by design, not by omission:** the **mode** is not
 pilotable (heat-only unit; the vendor app locks it, and its write would
-clobber an unpinned pair register); the **fault code** and **firmware
-version** have no identified home in the data report; **binary sensors**
-(compressor/pump/fan/valves/switches) were never pinned and their surface
-was pruned.
+clobber an unpinned pair register); the **firmware version** has no
+identified home in the data report; the **other** binary surfaces
+(compressor/pump/fan/valves/switches) were never pinned and stay pruned —
+the fault IS exposed since spec 023 (register 2074, the E03 diff-revert).
 
 Protocol facts baked into the code (all CRC-verified against the app's own
 frames or proven live):
@@ -223,7 +224,7 @@ data:
 | Unit not listed in the flow | powered off / out of range → power on, stay in range, **Scan again** |
 | Entities unavailable; `cannot_connect` | the vendor app holds the single BLE link — close it completely |
 | `push stream silent after trigger` | no data report within the window (rebooting unit? radio) — the cycle retries; check distance |
-| Fault code / firmware not displayed | no reliable source has been identified in the unit's data report so far (the vendor app's own fault table lives in the APK; see specs/022) |
+| Fault: the "Fault" binary sensor | ON when the fault word (register 2074) is non-zero — proven by the owner's E03 run; the `code` attribute shows the panel code when the raw↔code pair was recorded live (E03 = raw 256 — the vendor app itself labels it "water flow problem"), else "unknown code (raw N)". Firmware: still not displayed (no reliable source identified in the data report; the vendor's own fault table lives in the APK) |
 | `unconfirmed` write, persistent notification | the fresh report never came back — check the panel; the notification says what to do |
 | Log lines at WARNING | the deliberate evidence lines (probe verdicts, block captures, test markers) — read them, they are the diagnostics |
 
