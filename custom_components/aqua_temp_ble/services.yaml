@@ -1,11 +1,15 @@
 probe_registers:
   name: Probe registers
   description: >-
-    Read a raw register block from the heat pump over BLE and log every
-    register (raw value, hex, /10) for label-to-register calibration.
-    Close the vendor app first: the unit accepts a single Bluetooth
-    connection. The log lines appear in home-assistant.log and, when the
-    service is called with a response, are also returned as JSON.
+    Read the heat pump over BLE and log every register (raw value, hex,
+    /10) for label-to-register calibration. The default ("all blocks")
+    triggers the unit's data report and logs every captured register —
+    the pushed blocks on push units (this firmware), the base block
+    7-51 on hypothetical classic units. A numbered block queries one
+    block of the unit's answer burst directly. Close the vendor app
+    first: the unit accepts a single Bluetooth connection. The log
+    lines appear in home-assistant.log and, when the service is called
+    with a response, are also returned as JSON.
   fields:
     device_id:
       name: Device
@@ -17,26 +21,25 @@ probe_registers:
           integration: aqua_temp_ble
     block:
       name: Block
-      description: Register block to read. High blocks are experimental.
+      description: >-
+        Register report to read. "All blocks" triggers the unit's data
+        report and logs the whole store; the numbered blocks query one
+        block of the answer burst.
       required: false
       default: base
       selector:
         select:
           mode: dropdown
           options:
-            - label: "Base block (registers 7-51)"
+            - label: "All blocks (the unit's data report)"
               value: base
-            - label: "High block 1001-1045"
+            - label: "Block 1001-1045"
               value: "1001"
-            - label: "High block 1046-1090"
+            - label: "Block 1046-1090"
               value: "1046"
-            - label: "High block 1091-1135"
-              value: "1091"
-            - label: "High block 1136-1180"
-              value: "1136"
-            - label: "High block 2001-2045"
+            - label: "Block 2001-2045"
               value: "2001"
-            - label: "High block 2046-2090"
+            - label: "Block 2046-2090"
               value: "2046"
 power_write_probe:
   name: Power write probe

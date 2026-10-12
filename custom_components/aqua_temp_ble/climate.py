@@ -202,8 +202,9 @@ class AquaTempClimateEntity(ClimateEntity, AquaTempEntity):
             return None
         if data.power is False:
             return HVACAction.OFF
-        # Real activity (compressor) is only known after the binary registers
-        # are calibrated — do not guess.
+        # Real activity (the compressor) is not observable — the binary
+        # registers were never pinned and the surface was pruned (spec
+        # 021) — do not guess.
         return None
 
     @property

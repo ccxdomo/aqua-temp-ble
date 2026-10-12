@@ -35,8 +35,9 @@ L,B,P,Q,W,E,S):
     S  the security twin (spec 011 FR-9): after the raw session
        closes, reconnect through the integration's OWN client and run
        the HA connection test exactly — first read, acknowledged
-       probe, pairing ladder, one retry, printing the same
-       `security probe:`/`pairing:` verdict lines (contract 011 §3)
+       probe, printing the same `security probe:` verdict lines
+       (contract 011 §3; spec 021: the pairing ladder and its retry
+       were pruned from the integration)
 
 Safety invariants (contract 009 §7): the probe NEVER writes registers
 (FC10 frames in the allowlist are the 8-byte query shape only), never
@@ -476,12 +477,13 @@ def build_dry_run_text(
                 )
         elif spec.name == "S":
             lines.append(
-                "=== PHASE S: security probe + pairing — the HA connection "
+                "=== PHASE S: security probe — the HA connection "
                 "test twin (spec 011 FR-9): after the raw session closes, "
                 "reconnect through the integration's own client and run "
-                "first read → acknowledged probe → pairing ladder → one "
-                "retry, printing the same 'security probe:'/'pairing:' "
-                "verdict lines (contract 011 §3) ==="
+                "first read → acknowledged probe, printing the same "
+                "'security probe:' verdict lines (contract 011 §3; "
+                "spec 021: the pairing ladder was pruned from the "
+                "integration) ==="
             )
     lines.append(
         f"allowlist: every TX frame is one of the {len(FRAME_ALLOWLIST)} "
@@ -1035,9 +1037,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "  S  the security twin (spec 011 FR-9): after the raw session\n"
             "     closes, reconnect through the integration's own client\n"
             "     and run the HA connection test exactly — first read,\n"
-            "     acknowledged probe, pairing ladder, one retry, with the\n"
-            "     same 'security probe:'/'pairing:' verdict lines (contract\n"
-            "     011 §3)\n"
+            "     acknowledged probe, with the same 'security probe:'\n"
+            "     verdict lines (contract 011 §3; the pairing ladder was\n"
+            "     pruned from the integration, spec 021)\n"
             "\n"
             "The probe NEVER writes registers (contract 009 §7); every TX\n"
             "frame is asserted against the allowlist before it goes out.\n"
@@ -1188,14 +1190,15 @@ async def run_security_phase(args: argparse.Namespace) -> int:
 
     The sequence IS the config-flow test's (contract 011 §2):
     connect (two attempts) → first read (the 2 s re-send bounds) → on
-    timeout the acknowledged probe → the pairing ladder on a
-    security-class verdict → exactly one retry. It runs through the
-    integration's OWN client seams — import aqua_client, never copy
-    it (tasks 011 §14): the classifier, the ladder and the
-    `security probe:`/`pairing:` verdict lines are the shipped code,
-    so a developer's terminal run and the operator's HA run cannot
-    drift. The client's log lines are mirrored to stdout so the
-    quickstart's paste-back captures everything.
+    timeout the acknowledged probe. Spec 021: the pairing ladder and
+    its first-read retry were pruned from the integration — the
+    production verdict `att-accepted-silent` (law L5, spec 020) proved
+    no bond is needed. The run goes through the integration's OWN
+    client seams — import aqua_client, never copy it (tasks 011
+    §14): the classifier and the `security probe:` verdict lines are
+    the shipped code, so a developer's terminal run and the
+    operator's HA run cannot drift. The client's log lines are
+    mirrored to stdout so the paste-back captures everything.
     """
     import logging
 
@@ -1203,7 +1206,7 @@ async def run_security_phase(args: argparse.Namespace) -> int:
     import registers
 
     print(
-        "=== PHASE S: security probe + pairing "
+        "=== PHASE S: security probe "
         "(the HA connection test twin, spec 011 FR-9) ==="
     )
     handler = logging.StreamHandler(sys.stdout)
@@ -1226,21 +1229,19 @@ async def run_security_phase(args: argparse.Namespace) -> int:
         )
         return 0
     except aqua_client.AquaTempTimeoutError as first_timeout:
-        regs = await aqua_client.run_security_probe(
-            client, retry_resend_every=2.0, retry_resend_max=3
-        )
+        regs = await aqua_client.run_security_probe(client)
         if regs is None:
             print(
                 "PHASE S verdict: still no answer — paste every "
-                "'security probe:' and 'pairing:' line above into the "
+                "'security probe:' line above into the "
                 "report (quickstart 011 §5); the decision matrix of "
                 "contract 011 §6 is binding for the follow-up"
             )
             return 1
         print(
-            f"PHASE S verdict: ANSWERED AFTER PAIRING ({len(regs)} "
-            "register(s)) — the case-closed line is above; the bond gate "
-            "is proven (enable pair_on_connect per quickstart 011 §3)"
+            f"PHASE S verdict: the acknowledged write ANSWERED "
+            f"({len(regs)} register(s)) — the case-closed line is above; "
+            "the write TYPE is the gate, not a bond (contract 011 §2)"
         )
         return 0
     finally:

@@ -1,5 +1,14 @@
 # Aqua Temp (com.phinx.poolheater4) — BLE Reverse Engineering Findings
 
+> **⚠️ Historical research record (2026-10-10).** Several conclusions below
+> were later corrected by live evidence — notably the write characteristic
+> (`ff01` here; the app actually writes **`ff03`**, see §11.3's correction
+> note and the disassembly re-read in spec 010) and the pushed-block data
+> plane (spec 013/014). The corrected, current protocol reference lives in
+> [`specs/020-integration-reference/`](specs/020-integration-reference/)
+> (`research.md` + `data-model.md`); this file stays as the original
+> analysis record.
+
 Date: 2026-10-10
 Target: Aqua Temp / Piscina Temp — package `com.phinx.poolheater4`
 Goal: understand the BLE protocol of the pool heat pump (PAC) to control it

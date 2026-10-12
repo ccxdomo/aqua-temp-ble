@@ -26,9 +26,14 @@ from .coordinator import AquaTempCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-# Blocks accepted by the probe service (base block + the 6 recovered query
-# blocks). No writes are ever sent to blocks 1001-2090.
-PROBE_BLOCKS = {"base", "1001", "1046", "1091", "1136", "2001", "2046"}
+# Blocks accepted by the probe service (spec 021, tasks.md A3): "base"
+# plus the four blocks of the unit's answer burst. On push entries
+# "base" means trigger + dump of the pushed store (the unit never
+# answers the classic FC03 read — law L1, spec 020); the burst blocks
+# answer a query directly. The app's other recovered query blocks
+# (1091/1136) are never in the burst — a guaranteed timeout — and are
+# gone from the selector. No writes are ever sent to blocks 1001-2090.
+PROBE_BLOCKS = {"base", "1001", "1046", "2001", "2046"}
 
 PROBE_SCHEMA = vol.Schema(
     {

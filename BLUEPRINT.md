@@ -1,5 +1,14 @@
 # Aqua Temp BLE — Home Assistant Custom Integration Blueprint
 
+> **⚠️ SUPERSEDED — read [`specs/020-integration-reference/`](specs/020-integration-reference/)
+> for the current, live-proven reference.** This blueprint is the original
+> 2026-10-10 design document, kept as the historical record; its GATT table
+> ("write ff01", "ff03 role unknown — do not use") was **refuted** by the
+> spec-010 disassembly re-read (service `ff01`, write `ff03`, notify `ff02`),
+> and the read/write plane it assumes (classic FC03 base reads, reg 8/13/14
+> writes) was replaced live by the pushed-block read plane and the 1011/1046
+> control writes (specs 013-019). The body below is deliberately untouched.
+
 Date: 2026-10-10 · Author: Architect (pipeline) · Status: **READY FOR CODER**
 Target: custom integration `aqua_temp_ble` controlling a PHNIX pool heat pump
 ("Aqua Temp" app, `com.phinx.poolheater4`) over BLE, without the vendor cloud.

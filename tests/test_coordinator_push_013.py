@@ -302,7 +302,6 @@ def test_push_cycle_single_trigger_builds_snapshot() -> None:
     assert data.target_temp is None
     assert data.fault_code is None
     assert data.firmware is None
-    assert data.binaries == {}
 
 
 def test_push_cycle_unconfirmed_withholds_raws() -> None:
@@ -370,22 +369,23 @@ def test_push_cycle_reharvest_recovers() -> None:
     assert data.push_counts == {2046: 3}
 
 
-def test_push_cycle_connects_with_pair_option() -> None:
+def test_push_cycle_connects_bare() -> None:
     """AC-4: a disconnected client connects first (the CCCD subscription
     connect() already performs — contract 013 §1.1's only allowed ATT
-    operation), threading the pair_on_connect option exactly like the
-    classic path."""
+    operation). Spec 021: the connect call carries NO pair kwarg — the
+    pair_on_connect option was pruned with the pairing ladder (tasks.md
+    D3; the verdict att-accepted-silent proved no bond is needed)."""
     client = FakePushClient(
         captures={2046: _capture(2046, T_WINDOW_RAWS)}, connected=False
     )
     coord = _make_coordinator(
         client,
         data={"mode": "push"},
-        options={"poll_interval": 30, "pair_on_connect": True},
+        options={"poll_interval": 30},
     )
     with _ClockPatch(1000.0):
         data = asyncio.run(coord._async_update_data())
-    assert client.connect_kwargs == [{"pair": True}], client.connect_kwargs
+    assert client.connect_kwargs == [{}], client.connect_kwargs
     # Spec 014 re-pin (contract 014 §2.1): the trigger follows connect.
     assert client.read_calls == [(7, 45)], client.read_calls
     assert data.mode == "push"
@@ -449,7 +449,7 @@ def main() -> int:
         test_push_cycle_unconfirmed_withholds_raws,
         test_push_cycle_stale_store_update_failed,
         test_push_cycle_reharvest_recovers,
-        test_push_cycle_connects_with_pair_option,
+        test_push_cycle_connects_bare,
         test_classic_mode_single_read_cycle_unchanged,
         test_push_mode_base_capture_is_anomaly_logged_once_and_ignored,
     ]

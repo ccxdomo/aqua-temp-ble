@@ -12,9 +12,10 @@ Pinned by this file:
 - the four production frames (1001, 1046, 2001-mock, 2046×2) land in
   the store with the exact register tables (spot: 1021=1050, 1046=290,
   1056=-70, 2046=32765, 2047 140→145 latest-wins, count=2);
-- the FIRST push per distinct start logs the complete 99-byte hex at
-  WARNING (contract 013 §2.1: `block push captured: start=… qty=…
-  len=… crc=OK hex=…`, ≤ 4 per connect, the U-1 capture mechanism);
+- the FIRST push per distinct start logs a one-line capture at
+  WARNING (contract 013 §2.1, spec 021 C2: `block push captured:
+  start=… qty=… len=… crc=OK`, ≤ 4 per connect — the full 99-byte hex
+  payload rides a DEBUG twin line, the U-1 capture mechanism);
 - repeat pushes keep the 008/009 census grammar byte-identical (INFO);
 - the idle-window summary moved INFO → WARNING (contract 013 §2.2,
   the only level amendment — message byte-identical);
@@ -211,9 +212,10 @@ class _capture_logs:
 def test_four_pinned_pushes_land_in_store_with_capture_lines() -> None:
     """AC-1 — THE vector run: the four pinned frames (1001, 1046,
     2001-mock, 2046×2) fake-notified during a pending read land in the
-    store with the exact register tables; exactly 4 WARNING capture
-    lines (first per distinct start, full 198-char hex); repeats keep
-    the 008/009 census grammar at INFO (byte-identical)."""
+    store with the exact register tables; exactly 4 one-line WARNING
+    capture lines (first per distinct start; the full 198-char hex
+    rides DEBUG — spec 021 C2); repeats keep the 008/009 census grammar
+    at DEBUG (byte-identical)."""
     clock = StepClock(1000.0)
     feed = [
         bytes.fromhex(FRAME_BLOCK_1001),
@@ -262,21 +264,36 @@ def test_four_pinned_pushes_land_in_store_with_capture_lines() -> None:
     # qty/length echo the frame (parse_block_response, contract 013 §3.1)
     assert caps[2046].qty == 45 and caps[2046].length == 99
 
-    # --- the capture lines: exactly 4 WARNING, one per distinct start ---
-    capture = [m for lvl, m in cap.records if m.startswith("block push captured:")]
+    # --- the capture lines: exactly 4 WARNING, one per distinct start
+    #     (spec 021 C2: the one-line evidence; the full hex rides DEBUG) ---
+    capture = [
+        m
+        for lvl, m in cap.records
+        if lvl == logging.WARNING and m.startswith("block push captured:")
+    ]
     assert len(capture) == 4, capture
     assert all(
         lvl == logging.WARNING
         for lvl, m in cap.records
-        if m.startswith("block push captured:")
+        if lvl == logging.WARNING and m.startswith("block push captured:")
     ), [(lvl, m) for lvl, m in cap.records if m.startswith("block push captured:")]
     starts_in_order = [line.split("start=")[1].split()[0] for line in capture]
     assert starts_in_order == ["1001", "1046", "2001", "2046"], capture
     for line in capture:
-        # contract 013 §2.1 byte-exact: start/qty/len/crc=OK + the FULL hex
-        assert " qty=45 len=99 crc=OK hex=" in line, line
-        assert len(line.split("hex=")[1]) == 198, "full 99-byte hex expected"
-    hexes = [line.split("hex=")[1] for line in capture]
+        # contract 013 §2.1 byte-exact, spec 021 C2: start/qty/len/crc=OK
+        # on ONE line — the hex payload moved to the DEBUG twin line
+        assert " qty=45 len=99 crc=OK" in line, line
+        assert "hex=" not in line, line
+    # the FULL hex rides DEBUG, one line per first capture (the U-1 evidence)
+    hex_lines = [
+        m
+        for lvl, m in cap.records
+        if lvl == logging.DEBUG
+        and m.startswith("block push captured: start=")
+        and "hex=" in m
+    ]
+    assert len(hex_lines) == 4, hex_lines
+    hexes = [line.split("hex=")[1] for line in hex_lines]
     assert hexes[0] == FRAME_BLOCK_1001
     assert hexes[3] == FRAME_BLOCK_2046_PUSH1  # the FIRST push of 2046
 

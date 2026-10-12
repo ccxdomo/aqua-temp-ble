@@ -1,6 +1,11 @@
 """Button platform: the diagnostic buttons (§4.1, spec 016 FR-5).
 
-- "Probe registers": read a block and log every register (calibration).
+- "Probe registers": trigger the unit's data report and log every
+  captured register (calibration). On push-mode entries this is
+  trigger + dump of the pushed store — the unit never answers the
+  classic base read with base data (law L1, spec 020), so the old
+  direct base read always timed out; the reroute is the spec-021 fix
+  (tasks.md A1).
 - "Power write probe": run the spec-016 power-write proof probe — a
   DIAGNOSTIC instrument (a measurement, not a control surface): it
   toggles the unit ON then back OFF while watching the pushed mirror
@@ -46,7 +51,10 @@ async def async_setup_entry(
 
 
 class AquaTempProbeButtonEntity(AquaTempEntity, ButtonEntity):
-    """Press to read the base block and log every register (calibration aid)."""
+    """Press to trigger the unit's data report and log every captured
+    register (calibration aid). On push-mode entries the probe is
+    trigger + store dump (the unit never serves the classic base block
+    — law L1, spec 020; the spec-021 fix, tasks.md A1)."""
 
     def __init__(
         self, coordinator: AquaTempCoordinator, entry: ConfigEntry
@@ -57,7 +65,8 @@ class AquaTempProbeButtonEntity(AquaTempEntity, ButtonEntity):
         self._attr_entity_category = EntityCategory.DIAGNOSTIC
 
     async def async_press(self) -> None:
-        """Probe the base block; the log goes to home-assistant.log (§4.3)."""
+        """Run the probe (push entries: trigger + store dump); the log
+        goes to home-assistant.log (§4.3)."""
         _LOGGER.debug("probe button pressed")
         await self.coordinator.async_probe_block("base")
 

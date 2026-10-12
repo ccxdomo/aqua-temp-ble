@@ -5,40 +5,60 @@ the "Aqua Temp" app (`com.phinx.poolheater4`, Piscina Temp, …). It talks to
 the unit directly over **Bluetooth Low Energy** — no vendor cloud, no
 account, no WiFi needed (the unit does not even have WiFi).
 
-The protocol was recovered by static analysis of the Android app:
-**Modbus RTU frames over a BLE GATT characteristic** (slave `0x63`,
-CRC16-Modbus little-endian). Every recovered frame is CRC-verified against
-the app's own constants — see the reverse-engineering notes in
-[`FINDINGS.md`](../FINDINGS.md) and [`BLUEPRINT.md`](../BLUEPRINT.md) in the
-parent directory.
+> **Status: calibrated and owner-proven.** The register map was recovered
+> from the vendor APK disassembly, then verified live on the production
+> unit (photo calibration, panel diffs, diff-revert probes). The complete,
+> current reference lives in
+> [`specs/020-integration-reference/`](specs/020-integration-reference/) —
+> read its `spec.md` first. Unverified data is **never** shown under a
+> label: quantities appear only behind owner-verified gates.
 
-> ⚠️ **Status: pre-calibration.** The register map is ~80% established from
-> static analysis. Everything marked **[P]** below is proven; the few
-> remaining assumptions are isolated in `registers.py` (the single calibration
-> surface) and the built-in **probe tool** closes them in one live session
-> (see `docs/CALIBRATION.md`). Unverified data is **never** shown under a
-> label — entities for unverified registers are simply not created.
+## How it reads: trigger + listen
 
-## Features
+This firmware never answers a classic Modbus read with classic data, and it
+never pushes spontaneously. But it **answers every request** — any valid
+frame — with a burst of four 45-register blocks (1001, 1046, 2001, 2046) on
+the notify characteristic. So the integration sends **one** vendor read
+frame per poll cycle as a *trigger*, listens while the burst arrives, and
+decodes its snapshot from the stored blocks. The 8-second read timeout each
+cycle is the **expected** world, not an error.
+
+## Features (all verified live on the production unit)
 
 | What | Status | Entities |
 |---|---|---|
-| Inlet / outlet / ambient water temperatures | **[P] proven** | 3 sensors (°C, ÷10 scaling, sentinel-aware) |
-| Suction / coil / exhaust temperatures | **[V] registers not pinned yet** | 3 sensors (appear after calibration) |
-| Power on/off, mode heat/cool/auto, setpoint | **[P] read, [V] write to confirm live** | 1 climate entity |
-| Fault code, firmware | **[P] address, [V] semantics** | 2 sensors (diagnostic) |
-| Compressor / circulate pump / high fan / 4-way valve | **[V] registers not pinned yet** | 4 binary sensors (appear after calibration) |
-| HP / LP / flow switch (safety inputs) | **[V] registers not pinned yet** | 3 binary sensors, diagnostic (appear after calibration) |
-| Register probe / calibration tool | **working** | 1 button + 1 service |
+| Inlet / outlet water temperatures | **proven** (photo-calibrated) | 2 sensors |
+| Coil / ambient / exhaust temperatures | **proven** (photo-calibrated) | 3 sensors |
+| Suction temperature (T01) | sensor absent on this unit — shows `unknown` | 1 sensor |
+| Power state (OFF/HEAT display, heat-only rule) | **proven** (app diff-revert) | climate tile |
+| Heat setpoint display | **proven** (panel diff) | climate target |
+| Power control (on/off) | **proven** (pump heard; behind the `write_control` gate) | climate Heat/Off buttons |
+| Setpoint control (10.0-40.0 °C, 0.5 steps) | **proven** (mirror followed; behind the `write_setpoint` gate) | climate target slider |
+| Push stream health | diagnostic | 1 sensor (diagnostic) |
+| Register / power / setpoint probes | calibration instruments | 3 buttons + 3 services |
 
-Protocol facts baked into the code (all CRC-verified against the app):
+**Not available — by design, not by omission:** the **mode** is not
+pilotable (heat-only unit; the vendor app locks it, and its write would
+clobber an unpinned pair register); the **fault code** and **firmware
+version** have no identified home in the data report; **binary sensors**
+(compressor/pump/fan/valves/switches) were never pinned and their surface
+was pruned.
 
-- GATT write `0000ff01-…`, notify `0000ff02-…` (BlueNRG module)
-- Base read: `63 03 0007 002D` → 45 holding registers (7..51), 95-byte response
-- Writes: FC10 with the safe **16-bit H1 layout** (`63 10 addr 0001 02 value`)
+Protocol facts baked into the code (all CRC-verified against the app's own
+frames or proven live):
+
+- GATT: vendor data service `ff01`, **write** `ff03` (without response,
+  app parity), **notify** `ff02`
+- Trigger: the vendor's own base read `63030007002d3c54`; the answer is the
+  four-block burst (99-byte CRC-valid frames, possibly fragmented)
+- Control writes: single-register frames (`63 10 addr 0001 02 value crc`)
+  to register **1011** (power, values 0/1) and **1046** (heat setpoint,
+  raw 100-400 in steps of 5 = 10.0-40.0 °C)
+- Temperature mirror registers: **2046-2051** (T01-T06), power mirror
+  **2011**, mode mirror **2019** (diagnostic only), setpoint **1046**
 - Temperatures: `value = int(degrees × 10)`; "sensor absent" sentinels
-  `-9990` **and** `32765` (`0x7FFD`) — plus a −45…+150 °C plausibility guard —
-  always decode to `unknown`, never to a number
+  `-9990` **and** `32765` (`0x7FFD`) — plus a −45…+150 °C plausibility
+  guard — always decode to `unknown`, never to a number
 
 ## Requirements
 
@@ -46,7 +66,7 @@ Protocol facts baked into the code (all CRC-verified against the app):
   `config_entry`, `SupportsResponse`).
 - A working Bluetooth adapter on the HA host (HA OS/Supervised usually fine;
   for container installs make sure `/var/run/dbus` and bluez are available).
-- `bleak` is provided by HA itself (`requirements` lists it for standalone use).
+- `bleak` is provided by HA itself.
 
 ## Installation
 
@@ -67,14 +87,20 @@ rm -rf aqua-temp-ble-tmp
 
 then restart Home Assistant.
 
-## Pairing / first connection
+## First connection
 
-- The unit must have been paired once with the vendor app (hold the panel
-  button ~5 s until the display shows **`bLE`** blinking 1×/s).
+- **No pairing is needed.** The production verdict (`att-accepted-silent`)
+  proved the unit accepts writes at the ATT layer without any bond — the
+  old pairing lever was removed. Just connect.
 - **Close the vendor app completely before using this integration** — the
-  unit accepts a **single BLE connection**. If the app holds it, HA will show
-  the entities as unavailable and retry politely.
-- The unit advertises as **`BlueNRG-…`** (other models: `HIFLYING…`, `PROV_…`).
+  unit accepts a **single BLE connection**. If the app holds it, HA will
+  show the entities as unavailable and retry politely.
+- The unit advertises as **`BlueNRG-…`** (other models: `WT-…`,
+  `HIFLYING-…`, `PROV_…`). If it does not appear at all, power it on and
+  stay in range; as a last resort, some units can be made to advertise by
+  holding the panel button ~5 s until the display shows **`bLE`** (on some
+  models this is the WiFi-provisioning gesture — it was not needed on the
+  production unit).
 
 ## Configuration
 
@@ -86,222 +112,132 @@ The flow starts with a **menu** offering three choices:
   Home Assistant has seen, in two tiers:
 
   1. **Recognized Aqua Temp units first** — advertised name starting with
-     `BlueNRG-`, `HIFLYING-` or `PROV_`, or the ff01/ff02 GATT service UUIDs;
+     `BlueNRG-`, `WT-`, `HIFLYING-` or `PROV_`, or the ff03/ff02 pipe UUIDs;
   2. then **other nearby devices**, nearest first (RSSI sort).
 
   Already-configured units are excluded, and unnamed devices appear as
   `Unnamed device — <address> — RSSI <value>` — the live connection test
   decides what is really a heat pump, not the advertised name.
 
-- **Scan again** — waits ~8 s so a unit you just put in pairing mode has
-  time to advertise, then rebuilds the menu with fresh counts (put the unit
-  in **pairing mode** first: hold the panel button ~5 s until the display
-  shows **`bLE`** blinking 1×/s);
+- **Scan again** — waits ~8 s so a unit you just powered on has time to
+  advertise, then rebuilds the menu with fresh counts;
 - **Enter the Bluetooth address manually** — type the MAC
   (`XX:XX:XX:XX:XX:XX`) yourself. This stays one click away for
   MAC-changed units.
 
 1. Pick a device (or enter the address manually).
-2. HA performs a live connection test and shows what it read
-   (power, mode, temperatures). A wrong pick simply fails with a clear
-   error and returns to the same list — retry or pick another device.
-3. Name the device — done.
+2. HA performs a live connection test: connect → request → listen for the
+   unit's data report. A wrong pick simply fails with a clear error and
+   returns to the same list — retry or pick another device.
+3. Name the device; the two calibration checkboxes ship **unchecked** (see
+   *The gates* below — do not check them blind).
 
-If nothing at all is discovered, the menu shows the full pairing
-procedure (hold the panel button ~5 s until **`bLE`** blinks 1×/s, close
-the vendor app — the unit accepts a single BLE connection) plus the two
-remaining actions.
+### Options (Configure on the device card)
 
-Options (Configure on the device card):
-
-- **Poll interval**: 10..600 s (default 30). Exactly **one** 45-register read
-  per cycle — the heat pump is never flooded with requests.
+- **Poll interval**: 10..600 s (default 30). Exactly **one** request per
+  cycle — the heat pump is never flooded.
 - **Temperature unit**: °C/°F display only. The wire is always ×10 Celsius;
   °F values are converted at the entity boundary.
+- **The four gates** (see below) — only on push-mode entries.
 
-## Entities
+## The gates (the honesty system)
 
-Entities marked **[V]** are prepared placeholders: the panel observation
-(spec 003) confirmed their labels, but their register indices are not
-proven yet, so **no entity is created until calibration pins them** — no
-unconfirmed data can ever appear under a label.
+Nothing unproven is ever displayed, and nothing unproven is ever written.
+Each surface opens only behind an **owner-verified gate**, opened by your
+own act, never automatically:
 
-| Entity | Register | Notes |
+| Gate (option) | Opens | Required evidence (your own act) |
 |---|---|---|
-| Climate | 8/13/14 (+19-25, 26) | on/off, heat/cool/auto, setpoint (0.5 steps) |
-| Inlet water temperature | 26 | ÷10, sentinel → unknown |
-| Outlet water temperature | 27 | ÷10 |
-| Ambient temperature | 28 | ÷10 |
-| Suction temperature (T01) | **[V]** | appears after calibration |
-| Coil temperature (T04) | **[V]** | appears after calibration |
-| Exhaust temperature (T06) | **[V]** | appears after calibration |
-| Fault code | 47 | 0 = no fault assumed (**[A]**, verify step 6) |
-| Firmware | 48-51 | dot-joined (**[V]** semantics, verify) |
-| Probe registers (button) | — | reads block 7..51 and logs it |
-| Compressor (O01) / Circulate pump (O02) / High fan (O03) / 4-way valve (O04) | **[V]** 29..46 | binary sensors, appear after calibration |
-| HP switch (S01) / LP switch (S02) / Flow switch (S03) | **[V]** | binary sensors, diagnostic; appear after calibration |
+| `push_temp_confirmed` | the 6 temperature sensors | compare the captured values with the vendor app's parameter view — the photo calibration |
+| `push_control_confirmed` | the climate entity (OFF/HEAT display + target) | the power/mode diff-revert against the app's display |
+| `write_control` | power writes (Heat/Off buttons) | the power write probe's `EXECUTED + REVERSIBLE` verdict (the probe physically starts and stops the pump, then reverts) |
+| `write_setpoint` | setpoint writes (target slider) | the setpoint write probe's `EXECUTED + REVERSIBLE` verdict (dip −0.5 °C → revert → verify) |
 
-**Sensor-absent honesty.** The unit uses two "sensor absent" sentinel
-conventions on the wire (`-9990` and `32765`/`0x7FFD`), and any temperature
-raw outside −45…+150 °C is treated as absent. An absent sensor always shows
-`unknown` — the vendor app's own display of an absent sensor as
-**3276.5 °C** is a display bug this integration deliberately does not
-replicate.
+The probes are **diagnostic buttons** on the device — measurement
+instruments, not control surfaces. They always start from a verified
+baseline and always aim to leave the unit unchanged; their verdict line
+(at WARNING, visible on Settings → System → Logs) names the required
+remediation when something could not be verified.
 
-## Calibration (one live session)
+## Entities (push mode)
 
-Before trusting mode writes and enabling the binary sensors, run the
-calibration runbook — it takes ~10 minutes with a phone:
+| Entity | Source | Notes |
+|---|---|---|
+| Climate (behind `push_control_confirmed`) | mirrors 2011 / 1046 / 2047 | `hvac_mode` OFF/HEAT follows the power mirror alone (heat-only unit); `target_temperature` is the setpoint mirror; `current_temperature` is the inlet water; bounds 10.0-40.0 °C, step 0.5 |
+| Inlet water temperature (T02) | pushed 2047 | ÷10, sentinel → `unknown` |
+| Outlet water temperature (T03) | pushed 2048 | ÷10 |
+| Coil temperature (T04) | pushed 2049 | ÷10 |
+| Ambient temperature (T05) | pushed 2050 | ÷10 |
+| Exhaust temperature (T06) | pushed 2051 | ÷10 |
+| Suction temperature (T01) | pushed 2046 | `0x7FFD` sentinel — sensor absent → `unknown` |
+| Push stream (diagnostic) | the block store | `on`/`off` + per-block counts, ages, candidate raws |
+| Probe registers / Power write probe / Setpoint write probe (diagnostic) | — | the calibration instruments |
 
-1. Press **Probe registers** (or call `aqua_temp_ble.probe_registers`)
-2. Compare the log (`home-assistant.log`) with the app's Status page
-3. Pin the few remaining constants in `custom_components/aqua_temp_ble/registers.py`
-4. Restart HA
+**Write confirmation, never optimism.** A write from HA is confirmed by a
+fresh data report that **postdates** it (the mirror must match the request);
+until then the tile does not change. An unconfirmed OFF raises a persistent
+notification — a possibly-running pump is never a silent end state.
 
-Full runbook: **[`docs/CALIBRATION.md`](docs/CALIBRATION.md)**
+**Sensor-absent honesty.** An absent sensor always shows `unknown` — the
+vendor app's own display of an absent sensor as **3276.5 °C** is a display
+bug this integration deliberately does not replicate.
+
+## Calibration / verification on a new unit
+
+The full push-world runbook (photo comparison, diff-revert, the two write
+probes) lives in **[`docs/CALIBRATION.md`](docs/CALIBRATION.md)**; the
+authoritative reference is
+[`specs/020-integration-reference/quickstart.md`](specs/020-integration-reference/quickstart.md)
+§4.
 
 ```yaml
-# service example (Developer Tools → Actions)
+# probe service example (Developer Tools → Actions)
 service: aqua_temp_ble.probe_registers
 data:
-  block: base
+  block: base        # trigger + dump of every captured block
 ```
 
 ## Standalone tools (no HA needed)
 
-- `tools/smoke_client.py` — connect + dump the 45 registers (read-only)
+- `tools/smoke_client.py` — connect, trigger the data report, dump the
+  captured blocks (read-only, requires only `pip install bleak`)
   ```bash
-  pip install bleak
   python3 tools/smoke_client.py XX:XX:XX:XX:XX:XX
   ```
-- `tests/test_modbus.py`, `tests/test_reassembly.py` — protocol + reassembly
-  unit tests (plain python, no extra deps)
-
-## Next steps — make the unit's write refusal visible (specs 011/012)
-
-The leading theory for the silent first read is a transport-level write
-gate: the unit accepts notifications from anyone but only accepts *writes*
-from a **paired** central — the owner's phone is paired, the Pi is not, and
-the vendor's own write type (Write Command) has no error channel, so the
-refusal is invisible by ATT design (`specs/011-android-vs-linux-ble/research.md`
-§2.1/§3). The connection test therefore re-sends the base read as an
-*acknowledged* write on a timeout (a security gate then surfaces as a named
-ATT error in the log instead of silence), tries to **pair** the Pi when the
-error says so, and re-asks once; the `pair_on_connect` option stays OFF
-until that test proves the bond gate. The **0.8.0 build** (spec 012) makes
-that evidence readable where you actually look: the `security probe:` /
-`pairing:` verdict lines are **warnings** now, so they appear directly on
-Settings → System → Logs, and every test starts with a
-`connection test to <address>: build 0.8.0` marker line naming the running
-build. The next no-terminal procedure is
-[`specs/012-probe-not-firing/quickstart.md`](specs/012-probe-not-firing/quickstart.md):
-its §0 recovers the verdict already sitting in your existing
-`home-assistant.log` (the "Download full log" button — the Logs page keeps
-only warnings, which is why the 011 build's verdicts never showed there),
-then §1/§2 run the updated build and read the outcome from the Logs page
-directly (the decision matrix of
-`specs/011-android-vs-linux-ble/contracts/security-probe.md` §6 stays
-binding for the follow-up; the "bLE" choreography and the persistence
-retest remain documented in the 011 quickstart).
-
-## Push mode — reading the unit's own data stream (specs 013-014)
-
-Three production runs proved this unit **never answers** the byte-perfect
-base read (the connection test's `security probe: verdict
-att-accepted-silent` line): the GATT layer accepts our writes, the
-Modbus engine stays silent. The unit, however, **answers every read
-request**: each valid read triggers a burst of four CRC-valid
-45-register blocks on the notify characteristic (0.2-5 s after the
-request, ~2 frames/s — and a request-free window is silent,
-research 014 §0.2): `1001-1045`, `1046-1090`,
-`2001-2045`, `2046-2090`. These are two different data **planes**
-with no register offset between them (research 013 §3):
-
-- **Base plane** (registers 7-51): status/control — power, mode,
-  setpoint, temperatures, fault, firmware. Read by FC03 requests —
-  which this unit ignores.
-- **Pushed plane** (registers 1001-2090): the app's parameter view —
-  the **T-family live temperatures** at 2046-2051 (the absent-sensor
-  sentinel `0x7FFD` at 2046 matches T01 Suction, and 2047 changed
-  live between two pushes), the H-family settings at 1018-1023, the
-  R-family thresholds at 1046-1060. The block `2001-2045` is still
-  **undecoded** — its capture is this spec's main open evidence.
-
-**What build 0.10.0 ships** (`specs/013-pushed-blocks-coverage/` +
-`specs/014-query-high-blocks/`): the connection test ends with a
-**push-harvest stage** — after the read timeout and the silent
-probe, it listens for the pushes for 30 s while sending **zero
-frames** (nothing the firmware's gate could drop). Seeing the
-T-family block (start 2046) makes the test **succeed** with mode
-`push` — the integration stops dead-ending `no_response` against a
-unit that talks constantly. A `push` entry polls with **one read
-request per cycle** — the trigger (the vendor's own base read
-`63030007002d3c54`, the frame the unit demonstrably answers with its
-block burst): the request goes out, its 8-second window logs the
-burst census at INFO, and the cycle reads the unit's block answer
-from the store (freshness-gated; the burst lands 0.2-5 s after the
-trigger — within the cycle). **`push stream silent after trigger`**
-means the proven trigger did not wake the unit within 8 + 30 s — a
-real, diagnosable condition, distinct from 0.9.0's listen-only
-`push stream silent`; the link recycles and the next cycle retries
-with a fresh trigger. The first push of each block is logged at
-WARNING with its **full hex** (`block push captured: start=… hex=…`,
-≤ 4 lines per connection) — that `start=2001` line is the
-never-decoded block's capture; paste it back for analysis. A
-`push_stream` diagnostic sensor reports the per-start push counts
-and ages.
-
-**Honesty rules in push mode:** only monitoring entities exist. The
-temperature sensors appear **only after the one-run calibration
-check** — photograph the app's parameter view (password "66"), kill
-the app, run the connection test within ~2 minutes, compare the
-success summary's `T-window raws:` line with the photo, then check
-"values matched" on the confirm step (or later in the options) and
-reload. Until confirmed, the mirrored keys show `unknown`; a mismatch
-is reported and pins nothing (the mapping is one editable line in
-`registers.py`). The suction sensor stays `unknown` on this unit — its
-T01 sensor is absent; that is the honest state. The control state has
-pinned homes in the pushed 2001 block — power at register **2011**,
-mode at **2019**, owner diff-verified (2026-10-12): check
-**push_control_confirmed** after matching the app's display, reload,
-and the climate appears as **read-only state** (`hvac_mode` follows
-power alone — heat-only unit, spec 018; the mode mirror is a
-diagnostic; no target — no setpoint home is identified; every write
-refused — the write allowlist is unchanged). The fault code and the
-firmware version have **no identified home in the pushes** — those
-entities are simply not created in push mode, and no control is
-promised.
+- `tests/` — the full suite (protocol, reassembly, cycles, probes, flow);
+  `python3 -m pytest tests/ -q`
 
 ## Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
-| Unit not listed in the flow | not in pairing mode / out of range → pairing mode (`bLE` blinking 1×/s), then **Scan again** |
-| Entities unavailable | vendor app holds the single BLE connection — close it |
-| Setup fails `cannot_connect` | unit asleep / out of range / address changed → re-configure |
-| MAC changed after power cycle | name-based fallback reconnects, but re-configure for a clean unique_id |
-| Weird temperature values | byte-order — see CALIBRATION step 2 (`REG_DATA_LITTLE_ENDIAN`) |
-| No reaction to writes | write layout 16/32-bit — see CALIBRATION step 5 (`WRITE_ECHO_EXPECTED`) |
-| Verbose chunk logs | set `DEBUG_RAW = True` in `const.py` |
+| Unit not listed in the flow | powered off / out of range → power on, stay in range, **Scan again** |
+| Entities unavailable; `cannot_connect` | the vendor app holds the single BLE link — close it completely |
+| `push stream silent after trigger` | no data report within the window (rebooting unit? radio) — the cycle retries; check distance |
+| Entities `unknown`/absent | a gate is closed (the honesty rule) — do that gate's verification step |
+| `unconfirmed` write, persistent notification | the fresh report never came back — check the panel; the notification says what to do |
+| Log lines at WARNING | the deliberate evidence lines (probe verdicts, block captures, test markers) — read them, they are the diagnostics |
 
 ## Security / privacy
 
 Local-only BLE; no cloud, no account, no credentials, no data leaves the LAN.
-This integration sends writes only to registers 8 (power), 13 (mode) and 14
-(setpoint) in the base block, and never writes to blocks 1001-2090.
 
-**Installer settings are unreachable from HA** (spec 003 §6): the machine
-settings (**H**), regulation thresholds (**R**) and filtration program
-(**P**) families have **no entity and no service** — an erroneous write to
-the H04 exhaust safety threshold (105.0 °C) or an R limit can damage the
-heat pump or prevent it from starting. The single write funnel
-(`async_write_register`) enforces an allowlist
-(`registers.ensure_writable`): {8, 13, 14}, plus 19/20/21 only behind a
-default-off calibration switch. There is deliberately **no generic
-"write register" service**.
+Writes go **only** to the two proven registers, each behind its gate:
+**1011** (power, values 0/1 only) and **1046** (heat setpoint, raw 100-400
+in steps of 5 — out-of-range or off-step requests are **refused loudly,
+never rounded, never clamped**). The single write funnel
+(`registers.ensure_writable`) enforces the allowlists at every layer.
+
+**Everything else is refused, forever:** the mode write (1012/1013 — a pair
+write that would clobber an unpinned register; the vendor app itself locks
+the mode on this heat-only machine), the mute (1076), and the installer
+families (**H** machine settings, **R** regulation thresholds, **P**
+filtration program) which have **no entity and no service** — an erroneous
+H04 exhaust safety threshold or R-limit write can damage the heat pump.
+There is deliberately **no generic "write register" service**.
 
 ## License & disclaimer
 
 Provided as-is for personal use. This controls a pool heat pump — always
 verify temperatures and behaviour on the device panel after installation,
-especially before the calibration runbook is complete.
+and keep the write gates closed until you have run the probes.

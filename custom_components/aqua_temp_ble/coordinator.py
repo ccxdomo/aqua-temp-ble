@@ -57,11 +57,13 @@ for _value, _name in registers.MODE_VALUE_TO_NAME.items():
 del _value, _name, _hvac
 
 # High-block queries available through the probe tool (start register).
+# Spec 021 (tasks.md A3): only the four blocks of the unit's answer
+# burst are offered — the app's other recovered query blocks (1091/1136)
+# are never in the burst, so querying them is a guaranteed timeout on
+# this firmware.
 HIGH_BLOCKS: dict[str, int] = {
     "1001": 1001,
     "1046": 1046,
-    "1091": 1091,
-    "1136": 1136,
     "2001": 2001,
     "2046": 2046,
 }
@@ -136,10 +138,9 @@ class AquaTempData:
     max_target: float | None         # max(reg23, reg25) / 10
     inlet_temp: float | None         # reg 26 / 10, None if sentinel
     outlet_temp: float | None        # reg 27 / 10
-    ambient_temp: float | None       # reg 28 / 10
+    ambient_temp: float | None        # reg 28 / 10
     fault_code: int | None           # reg 47
     firmware: str | None             # regs 48..51 joined
-    binaries: dict[str, bool | None]  # verified binary regs only
     # --- spec 013 pushed-plane fields (appended WITH defaults; the
     # classic from_regs call site above is untouched) ---
     mode: str = "classic"             # "classic" | "push" (spec 013 FR-3)
@@ -207,15 +208,6 @@ class AquaTempData:
         if all(r is not None and not registers.is_sentinel(r) for r in fw_raw):
             firmware = ".".join(str(r) for r in fw_raw)  # [V] semantics
 
-        binaries: dict[str, bool | None] = {}
-        for d in registers.BINARIES:
-            if d.address is None:
-                continue  # not calibrated -> entity not created, no data shown
-            # Per-RegDef polarity, else the global default (FR-4).
-            binaries[d.key] = registers.decode_flag(
-                regs.get(d.address), registers.resolve_polarity(d)
-            )
-
         return cls(
             registers=regs,
             power=power,
@@ -230,7 +222,6 @@ class AquaTempData:
             ambient_temp=_scaled(regs, registers.REG_AMBIENT_TEMP),
             fault_code=regs.get(registers.REG_FAULT1),
             firmware=firmware,
-            binaries=binaries,
         )
 
     @classmethod
@@ -259,8 +250,8 @@ class AquaTempData:
         => every control key is None — the exact 0.10.0 behaviour
         (FR-11c). The FR-10 diagnostics raws (push_control_raws) ride
         the snapshot GATE-INDEPENDENTLY: they are diagnostics with
-        evidence tags, never entity states. Binaries stay empty (their pushed homes are
-        unknown [V]); fault/firmware have no pushed home [P] — None by
+        evidence tags, never entity states. Fault/firmware have no
+        pushed home [P] — None by
         design (contract 013 §4.4, optimistic state forbidden).
         """
         t_cap = captures.get(registers.PUSH_TEMP_BLOCK_START)
@@ -346,7 +337,6 @@ class AquaTempData:
             ambient_temp=None,
             fault_code=None,
             firmware=None,
-            binaries={},
             mode="push",
             push_confirmed=confirmed,
             push_counts=counts,
@@ -393,7 +383,6 @@ class AquaTempData:
             ambient_temp=base.ambient_temp,
             fault_code=base.fault_code,
             firmware=base.firmware,
-            binaries=base.binaries,
             mode="push",
             push_confirmed=confirmed,
             push_counts=counts,
@@ -459,15 +448,7 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
             return await self._async_update_push()
         async with self._io_lock:
             if not self.client.is_connected:
-                # Spec 011 FR-6: the evidence-gated pairing lever. Default
-                # OFF keeps this byte-identical to the pre-011 behaviour;
-                # only an explicit opt-in after the security probe answered
-                # ("answered after pairing") turns it on.
-                await self.client.connect(
-                    pair=self.config_entry.options.get(
-                        "pair_on_connect", const.DEFAULT_PAIR_ON_CONNECT
-                    )
-                )
+                await self.client.connect()
             try:
                 regs = await self.client.read_registers(
                     registers.BASE_BLOCK_START, registers.BASE_BLOCK_COUNT
@@ -630,11 +611,7 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
         cycle, never re-sent, never re-triggered mid-cycle (§4.1)."""
         async with self._io_lock:
             if not self.client.is_connected:
-                await self.client.connect(
-                    pair=self.config_entry.options.get(
-                        "pair_on_connect", const.DEFAULT_PAIR_ON_CONNECT
-                    )
-                )
+                await self.client.connect()
             # 1. TRIGGER (contract 014 §2): ONE vendor read — the
             #    frame the unit demonstrably answers with its block
             #    burst (research 014 §6). Single shot, no re-sends;
@@ -650,7 +627,11 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
                 # UpdateFailed by itself; the census (frames/bytes/
                 # blocks/first/last) rides verbatim in the exception
                 # message (contract 009 §3 format, unchanged).
-                _LOGGER.info(
+                # Spec 021 (tasks.md C1): demoted to DEBUG — at the 30 s
+                # poll interval this line fired ~2,880 times/day at INFO;
+                # the world is proven, the census stays observable in debug
+                # and in the WARNING verdicts that matter.
+                _LOGGER.debug(
                     "push cycle: trigger read timed out as expected (census: %s)",
                     exc,
                 )
@@ -724,14 +705,28 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
 
     # ---------------------------------------------------------------- probe
     async def async_probe_block(self, block: str = "base") -> dict[str, Any]:
-        """Read a register block and log every register (calibration, §4)."""
+        """Read a register block and log every register (calibration, §4).
+
+        Spec 021 (tasks.md A1/A2): a push-mode entry's "base" probe is a
+        TRIGGER + STORE DUMP — this unit never answers the classic FC03
+        read with base data (law L1, spec 020: the burst blocks never
+        match start=7), so the old direct base read was a guaranteed 8 s
+        timeout on the "Probe registers" button. The probe now sends
+        ONE vendor read (the burst trigger), harvests the pushed blocks,
+        and dumps the whole store with labels — the useful calibration
+        view. A classic-mode entry keeps the direct FC03 base read (the
+        dormant other-firmware plane, spec 020 §5).
+        """
         block = str(block)
         if block != "base" and block not in HIGH_BLOCKS:
             raise ValueError(f"unknown block {block!r}")
+        push_mode = str(self.config_entry.data.get("mode", "classic")) == "push"
         async with self._io_lock:
             if not self.client.is_connected:
                 await self.client.connect()
             if block == "base":
+                if push_mode:
+                    return await self._probe_push_store()
                 try:
                     regs = await self.client.read_registers(
                         registers.BASE_BLOCK_START, registers.BASE_BLOCK_COUNT
@@ -747,6 +742,102 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
                 await self.client.disconnect()
                 raise
             return self._log_raw_probe(block, start, raw)
+
+    async def _probe_push_store(self) -> dict[str, Any]:
+        """The push-mode "base" probe: trigger + dump the store (spec 021,
+        tasks.md A1 — replaces the guaranteed-timeout direct base read).
+
+        ONE vendor base read (the trigger the unit answers with its
+        block burst — its 8 s timeout is the expected world, spec 014
+        M-4), then a bounded harvest of the four burst blocks, then the
+        per-register dump of every captured block with labels (the same
+        line format the classic probe uses). A trigger that is ANSWERED
+        (the never-observed revival) logs the decisive line once per
+        session and its base data is dumped too (the poll cycle's
+        evidence discipline).
+        """
+        address = self.config_entry.data["address"]
+        regs: dict[int, int] | None = None
+        try:
+            regs = await self.client.read_registers(
+                registers.BASE_BLOCK_START, registers.BASE_BLOCK_COUNT
+            )
+        except AquaTempTimeoutError:
+            _LOGGER.debug(
+                "probe [%s]: trigger timed out as expected (the answer is "
+                "the block burst, spec 014 M-4)",
+                address,
+            )
+        except AquaTempError:
+            await self.client.disconnect()
+            raise
+        result: dict[str, Any] = {}
+        if regs is not None:
+            # The revival world (never observed): log the decisive line
+            # once per session, exactly like the poll cycle, and dump the
+            # base answer alongside the store.
+            self._log_trigger_answered_once()
+            result.update(self._log_base_probe(regs))
+        # The store dump: harvest the four burst blocks (instant when the
+        # burst already landed during the trigger window — the typical
+        # case).
+        await self.client.harvest_pushes(
+            const.PUSH_HARVEST_STARTS, const.PUSH_HARVEST_TIMEOUT
+        )
+        captures = dict(self.client.pushed_blocks)
+        if not captures:
+            _LOGGER.warning(
+                "AquaTemp probe: %s store empty after trigger — no block "
+                "burst within the window (unit unreachable? check the "
+                "vendor app is closed)",
+                address,
+            )
+            result[address] = {"block": "store", "crc": "NONE", "registers": {}}
+            return result
+        result.update(self._log_store_dump(address, captures))
+        return result
+
+    def _log_store_dump(
+        self, address: str, captures: dict[int, Any]
+    ) -> dict[str, Any]:
+        """Dump every pushed block in the per-register probe format
+        (spec 021): one header line per block, one line per register
+        with its label — the calibration view that replaces the base
+        block this unit never serves."""
+        out: dict[str, Any] = {"block": "store", "crc": "OK", "blocks": {}}
+        for start in sorted(captures):
+            cap = captures[start]
+            _LOGGER.info(
+                "AquaTemp probe: %s block=%d (pushed capture, start=%d qty=%d "
+                "len=%d count=%d) CRC=OK",
+                address,
+                start,
+                cap.start,
+                cap.qty,
+                cap.length,
+                cap.count,
+            )
+            registers_out: dict[str, Any] = {}
+            for addr in sorted(cap.registers):
+                raw = cap.registers[addr]
+                line = (
+                    f"reg {addr:3d} = {raw:6d} (0x{raw & 0xFFFF:04X}) "
+                    f"| /10 = {raw / 10:7.1f}"
+                )
+                label = registers.KNOWN_LABELS.get(addr)
+                if label:
+                    line += f"  # {label}"
+                _LOGGER.info("  %s", line)
+                entry: dict[str, Any] = {
+                    "raw": raw,
+                    "hex": f"0x{raw & 0xFFFF:04X}",
+                    "tenths": round(raw / 10, 1),
+                }
+                if label:
+                    entry["label"] = label
+                registers_out[str(addr)] = entry
+            out["blocks"][str(start)] = registers_out
+        return {address: out}
 
     def _log_base_probe(self, regs: dict[int, int]) -> dict[str, Any]:
         """Log the base block in the exact probe format (§4.3)."""
@@ -905,11 +996,7 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
         async with self._io_lock:
             try:
                 if not self.client.is_connected:
-                    await self.client.connect(
-                        pair=self.config_entry.options.get(
-                            "pair_on_connect", const.DEFAULT_PAIR_ON_CONNECT
-                        )
-                    )
+                    await self.client.connect()
                 # -- step 1: the baseline — trigger + fresh harvest -----
                 t_mark = _now()
                 await self._trigger_report("power write probe")
@@ -1180,15 +1267,11 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
             value,
             control_allowed=self.write_control_allowed,
         )
-        # 2. Connect if needed (the cycle's connect pattern, the pair
-        #    option respected); transport failures propagate to the
-        #    caller (the entity surfaces the error).
+        # 2. Connect if needed (the cycle's connect pattern); transport
+        #    failures propagate to the caller (the entity surfaces the
+        #    error).
         if not self.client.is_connected:
-            await self.client.connect(
-                pair=self.config_entry.options.get(
-                    "pair_on_connect", const.DEFAULT_PAIR_ON_CONNECT
-                )
-            )
+            await self.client.connect()
         # 3. The audit line (FR-4's exact string, verbatim) — one line
         #    per write, attributable in the owner's log page.
         _LOGGER.info(
@@ -1425,11 +1508,7 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
         async with self._io_lock:
             try:
                 if not self.client.is_connected:
-                    await self.client.connect(
-                        pair=self.config_entry.options.get(
-                            "pair_on_connect", const.DEFAULT_PAIR_ON_CONNECT
-                        )
-                    )
+                    await self.client.connect()
                 # -- step 1: the baseline — trigger + fresh 1046-block --
                 t_mark = _now()
                 cap = await _fresh_block(t_mark)
@@ -1702,15 +1781,11 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
             raw,
             setpoint_allowed=self.write_setpoint_allowed,
         )
-        # 3. Connect if needed (the cycle's connect pattern, the pair
-        #    option respected); transport failures propagate to the
-        #    caller (the entity surfaces the error).
+        # 3. Connect if needed (the cycle's connect pattern); transport
+        #    failures propagate to the caller (the entity surfaces the
+        #    error).
         if not self.client.is_connected:
-            await self.client.connect(
-                pair=self.config_entry.options.get(
-                    "pair_on_connect", const.DEFAULT_PAIR_ON_CONNECT
-                )
-            )
+            await self.client.connect()
         # 4. The audit line (contract 019 §8's audit obligation — the
         #    017 pattern, setpoint-flavored): one line per write,
         #    attributable in the owner's log page.

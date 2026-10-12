@@ -826,13 +826,14 @@ def test_cycle_confirmed_pushes_mirror_snapshot() -> None:
 
 
 def test_cycle_connects_when_disconnected() -> None:
-    """FR-3 step 2: the cycle connects when needed, threading the
-    pair_on_connect option exactly like the poll path."""
+    """FR-3 step 2: the cycle connects when needed (a bare connect call —
+    spec 021: no pair kwarg anymore; the pair_on_connect option was
+    pruned with the pairing ladder)."""
     client, _coord, _cap, result = _run_control(
         [1], value=1, is_connected=False, options=_open_options()
     )
     assert result["verdict"] == "confirmed"
-    assert client.connect_kwargs == {"pair": False}, client.connect_kwargs
+    assert client.connect_kwargs == {}, client.connect_kwargs
 
 
 def test_cycle_mismatch_shows_mirror_and_notifies_off() -> None:

@@ -12,7 +12,7 @@
       },
       "device": {
         "title": "Sélectionnez votre pompe à chaleur",
-        "description": "Les unités Aqua Temp reconnues sont listées en premier, puis les autres appareils Bluetooth à proximité (les plus proches d'abord). Si votre unité n'apparaît pas, mettez-la en mode appairage — maintenez le bouton du panneau environ 5 secondes jusqu'à l'affichage « bLE » clignotant une fois par seconde — puis revenez et relancez le scan.",
+        "description": "Les unités Aqua Temp reconnues sont listées en premier, puis les autres appareils Bluetooth à proximité (les plus proches d'abord). Si votre unité n'apparaît pas, vérifiez qu'elle est allumée et à portée, fermez complètement l'application du fabricant (l'unité n'accepte qu'une seule connexion Bluetooth), puis revenez et relancez le scan. En dernier recours, certaines unités peuvent être rendues visibles en maintenant le bouton du panneau environ 5 secondes jusqu'à l'affichage « bLE ».",
         "data": {
           "address": "Appareil"
         }
@@ -23,7 +23,7 @@
       },
       "no_devices": {
         "title": "Aucune unité Aqua Temp trouvée",
-        "description": "Aucun appareil Bluetooth non configuré n'a été détecté à proximité.\n\nPour rendre votre pompe à chaleur visible :\n\n1. Mettez-la en mode appairage : maintenez le bouton du panneau environ 5 secondes, jusqu'à l'affichage « bLE » clignotant une fois par seconde.\n2. L'unité s'annonce alors sous un nom commençant par « BlueNRG ».\n3. Fermez complètement l'application du fabricant — l'unité n'accepte qu'une seule connexion Bluetooth.\n4. Restez à portée, puis relancez le scan.\n\nSi aucun appareil Bluetooth n'apparaît du tout, vérifiez que Home Assistant dispose d'un adaptateur Bluetooth (Paramètres → Système → Matériel) ou d'un proxy Bluetooth actif.",
+        "description": "Aucun appareil Bluetooth non configuré n'a été détecté à proximité.\n\nPour rendre votre pompe à chaleur visible :\n\n1. Allumez-la et restez à portée — l'unité s'annonce alors sous un nom commençant par « BlueNRG ».\n2. Fermez complètement l'application du fabricant — l'unité n'accepte qu'une seule connexion Bluetooth.\n3. Relancez le scan.\n\nEn dernier recours, certaines unités peuvent être rendues visibles en maintenant le bouton du panneau environ 5 secondes jusqu'à l'affichage « bLE » (sur certains modèles, ce geste active le mode de configuration WiFi).\n\nSi aucun appareil Bluetooth n'apparaît du tout, vérifiez que Home Assistant dispose d'un adaptateur Bluetooth (Paramètres → Système → Matériel) ou d'un proxy Bluetooth actif.",
         "menu_options": {
           "scan": "Relancer le scan",
           "manual": "Saisir l'adresse Bluetooth manuellement"
@@ -31,14 +31,14 @@
       },
       "manual": {
         "title": "Adresse manuelle",
-        "description": "Saisissez l'adresse Bluetooth de l'unité, ex. `XX:XX:XX:XX:XX:XX`. Fermez d'abord l'application du fabricant — l'unité n'accepte qu'une seule connexion.\n\nAstuce : si vous ne connaissez pas l'adresse, mettez l'unité en mode appairage (maintenez le bouton du panneau ~5 s jusqu'à l'affichage « bLE ») et relancez le scan.",
+        "description": "Saisissez l'adresse Bluetooth de l'unité, ex. `XX:XX:XX:XX:XX:XX`. Fermez d'abord l'application du fabricant — l'unité n'accepte qu'une seule connexion.\n\nAstuce : si vous ne connaissez pas l'adresse, vérifiez que l'unité est allumée et à portée, que l'application du fabricant est fermée, puis relancez le scan.",
         "data": {
           "address": "Adresse Bluetooth"
         }
       },
       "test": {
         "title": "Test de connexion",
-        "description": "Connexion a {address} et lecture du bloc de registres de base (7-51). Cela peut prendre environ une minute."
+        "description": "Connexion à {address} et sondage du rapport de données de l'unité (connexion, requête, écoute). Cela peut prendre environ une minute."
       },
       "confirm": {
         "title": "Nommez votre appareil",
@@ -49,7 +49,7 @@
       },
       "confirm_push": {
         "title": "Nommez votre appareil",
-        "description": "Le test de connexion vers {address} a réussi en mode push : l'unité n'a jamais répondu à nos lectures avec des données de base, mais elle répond à chaque requête de lecture par un rapport de données vivantes que l'intégration lit — le mode push émet une requête de lecture par cycle de sondage et lit la réponse en blocs de l'unité.\n\nEn mode push, seules les entités de surveillance sont disponibles — les capteurs de température apparaissent une fois les valeurs capturées confirmées ci-dessous (ou plus tard dans les options). La climatisation apparaît en lecture seule (miroir de l'état de l'unité) une fois la calibration marche/arrêt/mode confirmée ci-dessous (ou plus tard dans les options) ; le contrôle (commandes), le code de défaut et la version du firmware restent absents tant que l'unité ne répond pas aux requêtes.\n\n- Alimentation : {power}\n- Mode : {mode}\n- Température d'eau entrante : {inlet}\n- Température d'eau sortante : {outlet}\n- Température ambiante : {ambient}\n\nChoisissez un nom convivial pour cette pompe à chaleur :",
+        "description": "Le test de connexion vers {address} a réussi en mode push : l'unité ne répond pas aux lectures classiques avec des données de registres, mais elle répond à chaque requête par un rapport de données vivantes que l'intégration lit — une requête par cycle de sondage.\n\nCe que vous obtenez en mode push :\n- Les capteurs de température apparaissent une fois les valeurs capturées confirmées ci-dessous (ou plus tard dans les options).\n- L'entité climate apparaît une fois la calibration marche/arrêt/mode confirmée ci-dessous (ou plus tard dans les options) : elle affiche OFF/HEAT selon l'état d'alimentation de l'unité et la consigne de chauffe actuelle, en lecture seule.\n- Le pilotage marche/arrêt et le contrôle de la consigne peuvent être activés plus tard dans les options de l'intégration, chacun après avoir exécuté sa sonde d'écriture intégrée (un diagnostic qui vérifie que l'écriture est exécutée et réversible).\n- Le code de défaut et la version du firmware ne sont pas disponibles (aucune donnée identifiée dans le rapport).\n\n- Alimentation : {power}\n- Mode : {mode}\n- Température d'eau entrante : {inlet}\n- Température d'eau sortante : {outlet}\n- Température ambiante : {ambient}\n\nChoisissez un nom convivial pour cette pompe à chaleur :",
         "data": {
           "name": "Nom",
           "push_temp_confirmed": "Les températures capturées correspondent à la vue des paramètres de l'application (calibration vérifiée)",
@@ -62,7 +62,7 @@
       "no_response": "L'appareil a accepté la connexion mais n'a pas répondu. Rapprochez-vous et réessayez.",
       "crc_error": "L'appareil a répondu, mais la réponse était corrompue. Réessayez.",
       "invalid_address": "Format d'adresse Bluetooth invalide (attendu : XX:XX:XX:XX:XX:XX).",
-      "not_found": "Home Assistant ne voit plus cet appareil à proximité. Mettez l'unité en mode appairage (maintenez le bouton du panneau environ 5 secondes jusqu'à l'affichage « bLE »), vérifiez qu'elle est allumée, puis scannez de nouveau."
+      "not_found": "Home Assistant ne voit plus cet appareil à proximité. Vérifiez que l'unité est allumée et à portée, fermez l'application du fabricant (l'unité n'accepte qu'une seule connexion Bluetooth), puis scannez de nouveau."
     },
     "abort": {
       "already_configured": "Cette pompe à chaleur est déjà configurée.",
@@ -76,7 +76,6 @@
         "data": {
           "poll_interval": "Intervalle d'interrogation (secondes)",
           "temperature_unit": "Unité de température affichée",
-          "pair_on_connect": "Appairer à la connexion (à activer après preuve)",
           "push_temp_confirmed": "Les températures capturées correspondent à la vue des paramètres de l'application (calibration vérifiée)",
           "push_control_confirmed": "Les registres marche/arrêt et mode capturés correspondent à l'affichage de l'application (calibration par bascule vérifiée)",
           "write_control": "Autoriser le pilotage marche/arrêt (écriture)",
@@ -92,7 +91,7 @@
   "services": {
     "probe_registers": {
       "name": "Sonder les registres",
-      "description": "Lit un bloc de registres bruts via BLE et journalise chaque registre (valeur brute, hex, /10) pour la calibration. Fermez d'abord l'application du fabricant.",
+      "description": "Lit la pompe à chaleur via BLE et journalise chaque registre (valeur brute, hex, /10) pour la calibration. Le bloc par défaut déclenche le rapport de données de l'unité et journalise tous les blocs capturés. Fermez d'abord l'application du fabricant.",
       "fields": {
         "device_id": {
           "name": "Appareil",
@@ -100,7 +99,7 @@
         },
         "block": {
           "name": "Bloc",
-          "description": "Bloc de registres à lire. Les blocs hauts sont expérimentaux."
+          "description": "Rapport de registres à lire. « Tous les blocs » déclenche le rapport de données de l'unité ; les blocs numérotés interrogent directement un bloc du rapport."
         }
       }
     },

@@ -1074,12 +1074,13 @@ def test_probe_executed_reversible() -> None:
 
 
 def test_probe_connects_when_disconnected() -> None:
-    """FR-5 step 1: the probe connects (threading the pair_on_connect
-    option like the poll path) when the client is not connected."""
+    """FR-5 step 1: the probe connects (a bare connect call — spec 021:
+    the pair_on_connect option was pruned with the pairing ladder) when
+    the client is not connected."""
     ladder = dict(LADDER_RAWS)
     blocks = [ladder, dict(ladder), {**ladder, 1046: T_RAW}, dict(ladder)]
     client, result, _cap = _run_probe(blocks, is_connected=False)
-    assert client.connect_kwargs == {"pair": False}, client.connect_kwargs
+    assert client.connect_kwargs == {}, client.connect_kwargs
     assert result["verdict"] == "executed+reversible", result
 
 
@@ -1350,15 +1351,15 @@ def test_cycle_confirmed() -> None:
 
 
 def test_cycle_connects_when_disconnected() -> None:
-    """FR-10 step 3: the cycle connects when needed, threading the
-    pair_on_connect option exactly like the poll path."""
+    """FR-10 step 3: the cycle connects when needed (a bare connect call
+    — spec 021: no pair kwarg anymore)."""
     ladder = dict(LADDER_RAWS)
     client, _coord, _cap, result = _run_cycle(
         [{**ladder, 1046: 300}], celsius=30.0, options=_open_options(),
         is_connected=False,
     )
     assert result["verdict"] == "confirmed", result
-    assert client.connect_kwargs == {"pair": False}, client.connect_kwargs
+    assert client.connect_kwargs == {}, client.connect_kwargs
 
 
 def test_cycle_not_confirmed_shows_mirror() -> None:

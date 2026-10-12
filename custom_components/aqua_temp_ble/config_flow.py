@@ -38,7 +38,6 @@ from .aqua_client import (
     run_security_probe,
 )
 from .const import (
-    DEFAULT_PAIR_ON_CONNECT,
     DEFAULT_POLL_INTERVAL,
     DEFAULT_TEMPERATURE_UNIT,
     DEFAULT_WRITE_CONTROL,
@@ -117,8 +116,9 @@ def _build_device_list(
     - Addresses already configured (compared as upper-cased unique ids) are
       excluded from the list.
     - Tier 1 ("recognized"): the advertised name starts with a NAME_PREFIXES
-      entry (case-insensitive) OR the advertisement exposes the ff01/ff02
-      service UUIDs (opportunistic secondary signal — never hides a device).
+      entry (case-insensitive) OR the advertisement exposes the ff03/ff02
+      UUIDs of the vendor data pipe (opportunistic secondary signal — never
+      hides a device).
     - Tier 2 ("other devices"): everything else, unnamed devices included.
       HA synthesizes `name = local_name or device.name or address`, so a
       device whose name equals its address never advertised a name; it is
@@ -227,10 +227,11 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
 
     def _set_test_stage(self, stage: str) -> None:
         """Stage stamp callback for the security-probe helper (spec 011
-        FR-2, contract 011 §2): the helper reports `security-probe`,
-        `pair` and `first-read-retry` before each stage runs so the
-        test-level failure lines name the stage the cancellation hit
-        (contract 011 §4's pathological budget case)."""
+        FR-2, contract 011 §2; spec 021: the pair / first-read-retry
+        stages were pruned with the pairing ladder): the helper reports
+        `security-probe` before the stage runs so the test-level failure
+        lines name the stage the cancellation hit (contract 011 §4's
+        pathological budget case)."""
         self._stage = stage
 
     async def _async_menu_labels(
@@ -285,9 +286,9 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
         step is therefore never re-entered with user_input.
 
         Empty discovery history -> the same step returns the no-devices
-        presentation (pairing guidance + the two remaining actions,
-        contracts/config-flow-states.md §2 note: no_devices is a menu
-        step_id, not a separate step method).
+        presentation (make-the-unit-visible guidance + the two remaining
+        actions, contracts/config-flow-states.md §2 note: no_devices is a
+        menu step_id, not a separate step method).
         """
         if bluetooth.async_scanner_count(self.hass, connectable=True) == 0:
             return self.async_abort(reason="no_bluetooth_adapter")
@@ -357,7 +358,7 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
 
         HA's scanners already run continuously (research 002 Q3); the flow
         never starts a scan itself — the wait only gives a unit that just
-        entered pairing mode time to advertise. Same progress contract as
+        became discoverable time to advertise. Same progress contract as
         async_step_test (specs/004): one task per attempt, the SAME task on
         re-entries while it runs, progress_done to the user menu on
         completion. A bare sleep cannot fail except by cancellation (flow
@@ -483,22 +484,22 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
         (contract 007 §3.3) — log-only, the UI keys and their mapping
         are unchanged (spec 007 NFR-2).
 
-        Spec 011 FR-2/FR-4 (contract 011 §2): on a first-read timeout the
-        test runs the evidence-driven stages — the security-probe (the
-        SAME base read re-sent as an ATT Write Request, so the unit's
-        silent refusal becomes an ATT error: research 011 §2.1/§12 X1),
-        the pairing ladder ONLY on an att-error-security verdict, then
-        exactly ONE first-read retry after a succeeded/skipped pair.
-        All inside the UNCHANGED TEST_TIMEOUT envelope (contract 011
-        §4); the verdicts live in the log and the UI keys stay
-        untouched (FR-2.5).
+        Spec 011 FR-2 (contract 011 §2): on a first-read timeout the
+        test runs the security-probe stage — the SAME base read
+        re-sent as an ATT Write Request, so the unit's silent refusal
+        becomes a named ATT error (research 011 §2.1/§12 X1). Spec 021:
+        the pairing ladder and its first-read retry were pruned — the
+        production verdict `att-accepted-silent` (law L5, spec 020)
+        proved no bond is needed. All inside the UNCHANGED
+        TEST_TIMEOUT envelope (contract 011 §4); the verdicts live in
+        the log and the UI keys stay untouched (FR-2.5).
         """
         # Test-level stage label + elapsed (spec 007 FR-3, research 007
         # §8): the label advances as the body progresses — "connect"
         # while connect() runs, "first-read" for the base read, and the
-        # spec-011 probe stages (security-probe / pair / first-read-
-        # retry) stamped BEFORE each runs via self._stage (contract 011
-        # §2). The "disconnect" label is set only after the teardown
+        # spec-011 probe stage (security-probe) stamped BEFORE it runs
+        # via self._stage (contract 011 §2). The "disconnect" label is
+        # set only after the teardown
         # completes, so a failure raised by the READ still reports the
         # read's stage (the failure site, not the subsequent cleanup).
         t_test = time.monotonic()
@@ -541,7 +542,7 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
                     )
                 except AquaTempTimeoutError as first_timeout:
                     # Spec 011 FR-2 (contract 011 §2): the first-read
-                    # timeout triggers the probe stages on the SAME live
+                    # timeout triggers the security probe on the SAME live
                     # session (strictly after the read's deadline, before
                     # the disconnect in the finally below). The helper
                     # never raises AquaTempTimeoutError and returns the
@@ -550,8 +551,6 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
                     # advice (FR-2.5: UI keys unchanged).
                     regs = await run_security_probe(
                         client,
-                        retry_resend_every=2.0,
-                        retry_resend_max=3,
                         on_stage=self._set_test_stage,
                     )
                     if regs is None:
@@ -639,10 +638,9 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
             self._test_error = "cannot_connect"
             # Stage = the phase the cancellation hit (contract 007
             # §3.3): "connect" or "first-read" — or, since spec 011,
-            # a probe stage (security-probe / pair / first-read-retry:
-            # contract 011 §4's accepted pathological expiry mid-probe
-            # — the label was current when asyncio.timeout fired,
-            # research 007 §8).
+            # the probe stage (security-probe: contract 011 §4's accepted
+            # pathological expiry mid-probe — the label was current when
+            # asyncio.timeout fired, research 007 §8).
             _LOGGER.warning(
                 "connection test to %s exceeded the %.0f s budget — two "
                 "connect attempts and the read did not complete in time. "
@@ -815,21 +813,16 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 class AquaTempOptionsFlowHandler(OptionsFlow):
-    """Options: poll interval (10..600 s), display temperature unit and
-    the evidence-gated pair_on_connect toggle (spec 011 FR-6).
+    """Options: poll interval (10..600 s), display temperature unit, and
+    (push entries) the calibration + write activation gates.
 
     Changes apply without an entry reload (see __init__ listener); the unit
     is read dynamically by the climate entity.
 
-    pair_on_connect (spec 011 FR-6, default OFF): when enabled, every
-    establish requests pairing (the client's connect(pair=True)
-    threading). It ships OFF and is to be enabled ONLY after a
-    connection test produced the `security probe: answered after
-    pairing` evidence (quickstart 011 §2) — enabling it without that
-    proof is a contract violation (the option exists to be earned,
-    contract 011 §1.5). A backend that cannot pair degrades to a plain
-    connect with a WARNING — the option never breaks the poll path
-    (FR-7).
+    Spec 021: the evidence-gated pair_on_connect toggle was removed with
+    the pairing ladder — the production verdict `att-accepted-silent`
+    (law L5, spec 020) proved the unit's write pipe opens without
+    bonding, so the lever never earned its evidence.
     """
 
     async def async_step_init(
@@ -847,13 +840,6 @@ class AquaTempOptionsFlowHandler(OptionsFlow):
                 "temperature_unit",
                 default=current.get("temperature_unit", DEFAULT_TEMPERATURE_UNIT),
             ): vol.In({"C": "Celsius (°C)", "F": "Fahrenheit (°F)"}),
-            # Spec 011 FR-6: the evidence-gated pairing lever — OFF
-            # until the connection test proved the bond gate (the
-            # `security probe: answered after pairing` line).
-            vol.Required(
-                "pair_on_connect",
-                default=current.get("pair_on_connect", DEFAULT_PAIR_ON_CONNECT),
-            ): bool,
         }
         if str(self.config_entry.data.get("mode", "classic")) == "push":
             # Spec 013 FR-5 (contract 013 §5.3): the calibration gate's

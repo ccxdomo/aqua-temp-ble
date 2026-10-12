@@ -340,13 +340,14 @@ def test_query_cycle_timeout_trigger_harvests_snapshot() -> None:
     assert data.target_temp is None
     assert data.fault_code is None
     assert data.firmware is None
-    assert data.binaries == {}
-    # the INFO expected-timeout line, census verbatim (contract 014 §2.2)
+    # the expected-timeout line, census verbatim (contract 014 §2.2;
+    # spec 021 C1: demoted INFO -> DEBUG — the world is proven, the
+    # line fired ~2,880 times/day at the 30 s poll interval)
     expected = (
         "push cycle: trigger read timed out as expected "
         f"(census: {TRIGGER_CENSUS})"
     )
-    assert (logging.INFO, expected) in cap.records, cap.records
+    assert (logging.DEBUG, expected) in cap.records, cap.records
 
 
 def test_query_cycle_silence_after_trigger_fails_honestly() -> None:
@@ -440,7 +441,6 @@ def test_query_cycle_answered_trigger_merges_base_data() -> None:
     assert data1.ambient_temp == -12.5
     assert data1.fault_code == 0
     assert data1.firmware == "2.2.1.2040"
-    assert data1.binaries == {}
     # the disjoint-window merge: base regs + confirmed T-block raws [P]
     assert data1.registers == {**BASE_REGS, **T_WINDOW_RAWS}, data1.registers
     assert data1.mode == "push"          # the mode stays (contract 014 §5.3)

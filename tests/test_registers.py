@@ -4,10 +4,14 @@
 Covers every vector of
 specs/003-sensor-coverage/contracts/decode-contract.md §6 plus the
 shipped-registry assertions of contracts/entity-contract.md §2/§3/§6:
-sentinel set (both conventions), plausibility guard, binary polarity
-(per-RegDef override), write allowlist, import-time integrity, and the
-placeholder table — new keys present, all new addresses None, existing
-keys/icons/addresses unchanged.
+sentinel set (both conventions), plausibility guard, flag decode
+(used by the pushed power mirror), write allowlist, import-time
+integrity, and the placeholder table — new keys present, all new
+addresses None, existing keys/icons/addresses unchanged.
+
+Spec 021: the binary-sensor registry and its per-RegDef polarity were
+PRUNED (registers were never pinned, no pushed homes — tasks.md D2);
+the tests below pin the surviving surface.
 
 Run standalone:
 
@@ -85,16 +89,10 @@ def test_decode_flag_matrix() -> None:
     assert registers.decode_flag(1, False) is False  # inverted polarity
 
 
-def test_polarity_resolution() -> None:
-    """FR-4/AC-8: a RegDef-level active_when_nonzero=False overrides the global."""
-    d_default = RegDef("x", None, "X", is_binary=True)
-    d_inverted = RegDef("y", None, "Y", is_binary=True, active_when_nonzero=False)
-    d_direct = RegDef("z", None, "Z", is_binary=True, active_when_nonzero=True)
-    assert registers.resolve_polarity(d_default) is registers.BINARY_ACTIVE_WHEN_NONZERO
-    assert registers.resolve_polarity(d_inverted) is False
-    assert registers.resolve_polarity(d_direct) is True
-    # End-to-end: an inverted RegDef reads raw 0 as ON (S03-style, E-4).
-    assert registers.decode_flag(0, registers.resolve_polarity(d_inverted)) is True
+# Spec 021 (tasks.md D2): the per-RegDef binary polarity test was pruned
+# with the binary-sensor registry — no RegDef carries is_binary or
+# active_when_nonzero anymore; decode_flag survives with its explicit
+# polarity argument (the pushed power mirror's decode).
 
 
 # ------------------------------------------------------------ write security
@@ -143,42 +141,30 @@ def test_in_base_block() -> None:
 
 
 def test_registry_integrity() -> None:
-    """FR-11/AC-9: broken registries raise; the shipped ones pass."""
+    """FR-11/AC-9: broken registries raise; the shipped ones pass.
+    (Spec 021: sensors-only — the binary registry was pruned.)"""
     # The shipped registries already passed at import; re-assert explicitly.
     registers.check_registry_integrity()
     good = (
-        RegDef("t1", 30, "T1", is_binary=True),
-        RegDef("t2", 31, "T2", is_binary=True),
+        RegDef("t1", 30, "T1"),
+        RegDef("t2", 31, "T2"),
     )
-    registers.check_registry_integrity(good, ())  # sanity: a clean pair passes
-    # Duplicate key within one registry.
-    dup_key = (RegDef("t1", 30, "T1", is_binary=True),
-               RegDef("t1", 31, "T1b", is_binary=True))
-    assert _raises_value_error(registers.check_registry_integrity, dup_key, ())
-    # Duplicate key across the two registries (keys are globally unique).
-    cross_key = (RegDef("t1", 30, "T1"),)
-    cross_bin = (RegDef("t1", 31, "T1", is_binary=True),)
-    assert _raises_value_error(registers.check_registry_integrity, cross_key, cross_bin)
-    # Duplicate address within one registry.
+    registers.check_registry_integrity(good)  # sanity: a clean registry passes
+    # Duplicate key within the registry.
+    dup_key = (RegDef("t1", 30, "T1"),
+               RegDef("t1", 31, "T1b"))
+    assert _raises_value_error(registers.check_registry_integrity, dup_key)
+    # Duplicate address within the registry.
     dup_addr = (RegDef("a", 30, "A"), RegDef("b", 30, "B"))
-    assert _raises_value_error(registers.check_registry_integrity, dup_addr, ())
-    # Duplicate address across the two registries (shadowing, E-8).
-    cross_addr_s = (RegDef("a", 30, "A"),)
-    cross_addr_b = (RegDef("b", 30, "B", is_binary=True),)
-    assert _raises_value_error(
-        registers.check_registry_integrity, cross_addr_s, cross_addr_b
-    )
+    assert _raises_value_error(registers.check_registry_integrity, dup_addr)
     # Out-of-base-block pin -> loud ValueError mentioning the high-block phase.
     high = (RegDef("h", 1001, "H"),)
-    assert _raises_value_error(registers.check_registry_integrity, high, ())
+    assert _raises_value_error(registers.check_registry_integrity, high)
     try:
-        registers.check_registry_integrity(high, ())
+        registers.check_registry_integrity(high)
     except ValueError as err:
         assert "outside the polled base block" in str(err)
         assert "high-block" in str(err)
-    # Temperature/binary class mismatch.
-    mixed = (RegDef("m", 30, "M", is_binary=True, device_class="temperature"),)
-    assert _raises_value_error(registers.check_registry_integrity, mixed, ())
 
 
 def test_shipped_sensor_registry() -> None:
@@ -218,41 +204,12 @@ def test_shipped_sensor_registry() -> None:
     assert sensors["firmware"].diagnostic is True
     # No entity exists for any H/R/P/D family member (spec §6 / AC-12).
     assert not any(d.family and d.family[0] in ("H", "R", "P", "D")
-                   for d in registers.SENSORS + registers.BINARIES)
+                   for d in registers.SENSORS)
 
 
-def test_shipped_binary_registry() -> None:
-    """entity-contract.md §3: shipped table, key-for-key (AC-3)."""
-    binaries = {d.key: d for d in registers.BINARIES}
-    # Existing O-family placeholders: keys/icons/addresses unchanged,
-    # labels panel-confirmed, now family-tagged.
-    for key, icon, family in (
-        ("compressor", "mdi:engine", "O01"),
-        ("circulate_pump", "mdi:pump", "O02"),
-        ("four_way_valve", "mdi:swap-horizontal", "O04"),
-    ):
-        d = binaries[key]
-        assert d.address is None
-        assert d.icon == icon
-        assert d.family == family
-        assert d.diagnostic is False
-        assert d.active_when_nonzero is None  # global default applies
-    # New placeholders: high_fan operational, S family DIAGNOSTIC.
-    d = binaries["high_fan"]
-    assert d.address is None and d.icon == "mdi:fan" and d.family == "O03"
-    assert d.diagnostic is False and d.active_when_nonzero is None
-    for key, icon, family in (
-        ("hp_switch", "mdi:alert-circle", "S01"),
-        ("lp_switch", "mdi:alert-circle", "S02"),
-        ("flow_switch", "mdi:water", "S03"),
-    ):
-        d = binaries[key]
-        assert d.address is None, f"{key} must ship unpinned"
-        assert d.icon == icon and d.family == family
-        assert d.diagnostic is True  # entity category DIAGNOSTIC
-        assert d.active_when_nonzero is None  # calibrate polarity live (E-4)
-    # No device_class on ANY binary sensor until polarity is proven (AC-8 note).
-    assert all(d.device_class is None for d in registers.BINARIES)
+# Spec 021 (tasks.md D2): the shipped-binary-registry test was pruned
+# with the registry itself — the binary placeholders were never pinned
+# and no pushed home exists, so no binary entity can ever be created.
 
 
 def test_known_labels() -> None:
@@ -289,15 +246,13 @@ def test_pinned_fixture_shape() -> None:
     assert exhaust.unit == "°C"
     assert exhaust.state_class == "measurement"
     assert exhaust.family == "T06"
-    registers.check_registry_integrity(pinned, registers.BINARIES)  # must not raise
+    registers.check_registry_integrity(pinned)  # must not raise
     # AC-5: a high-block pin (e.g. 1001) violates the integrity check.
     high = tuple(
         dataclasses.replace(d, address=1001) if d.key == "exhaust_temp" else d
         for d in registers.SENSORS
     )
-    assert _raises_value_error(
-        registers.check_registry_integrity, high, registers.BINARIES
-    )
+    assert _raises_value_error(registers.check_registry_integrity, high)
 
 
 # --------------------------------------------------------------------- main
@@ -306,12 +261,10 @@ def main() -> int:
         test_sentinel_set,
         test_decode_temp_vectors,
         test_decode_flag_matrix,
-        test_polarity_resolution,
         test_ensure_writable_matrix,
         test_in_base_block,
         test_registry_integrity,
         test_shipped_sensor_registry,
-        test_shipped_binary_registry,
         test_known_labels,
         test_pinned_fixture_shape,
     ]

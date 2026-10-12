@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Spec 011 tests — the security probe, the pairing ladder, the option.
+"""Spec 011 tests — the security probe; spec 021 — the pairing prune.
 
-Covers the three deliverables of specs/011-android-vs-linux-ble:
+Covers the surviving deliverables of specs/011-android-vs-linux-ble plus
+the spec-021 cleanup:
 
 1. FR-1 — the acknowledged-write seam: `force_response=True` writes
    the SAME vendor frame with response=True (the ATT Write Request
@@ -9,31 +10,22 @@ Covers the three deliverables of specs/011-android-vs-linux-ble:
    byte-equality is pinned (AC-2) and the acknowledged failure raises
    AquaTempConnectionError("acknowledged write failed: <chain>") so
    the ATT error text survives to the log (contract 011 §5.1).
-2. FR-2/FR-4 — the probe/pair/retry sequence (contract 011 §2): the
-   config-flow connection test, on a first-read timeout, probes with
-   the acknowledged write, classifies the verdict (§5.1 taxonomy),
-   runs the pairing ladder ONLY on att-error-security, and retries
-   the base read exactly once after a successful/skipped pair.
-3. FR-3 — the pairing ladder: rung A (bleak pair method), rung B
-   (reconnect with pair=True), rung C (minimal NoInputNoOutput BlueZ
-   agent), AlreadyExists → skipped, agent-signature failures → rung C,
-   authentication failures → the bLE choreography guidance, and the
-   bond-state logging (research 011 §10.2).
-4. FR-6/FR-7 — the pair_on_connect option: default OFF, the toggle in
-   the options flow, connect(pair=True) threading, and the AC-4
-   non-regression (with the option off, no probe/pair ever runs on
-   the success path).
-5. Spec 012 (the log-visibility contract, Part 7): the probe/pair
-   evidence lines are at WARNING — the operator's HA log page
+2. FR-2 — the probe sequence (contract 011 §2, amended by spec 021):
+   the config-flow connection test, on a first-read timeout, probes
+   with the acknowledged write and classifies the verdict (§5.1
+   taxonomy). The pairing ladder and its first-read retry were PRUNED
+   (tasks.md D3): the production verdict `att-accepted-silent`
+   (law L5, spec 020) proved the unit's write pipe opens with no
+   bond, so every verdict now routes — the original timeout keeps the
+   UI key.
+3. Spec 021 prune pins: no client pair method, no pair connect kwarg,
+   no pairing constants, no agent module, no pair_on_connect option.
+4. Spec 012 (the log-visibility contract, Part 7): the probe evidence
+   lines are at WARNING — the operator's HA log page
    (Settings → System → Logs, the system_log ring buffer) stores
    WARNING+ only (research 012 §4) — and every connection test starts
    with a build-marker WARNING naming the running version (spec 012
    FR-2/FR-3, contract 012 §2/§3).
-
-Red-first: on the 0b16e0a+010 code none of the seams exist —
-const.PAIR_TIMEOUT, read_registers(force_response=...), pair(),
-run_security_probe and the options toggle are all missing, so every
-test below fails until the implementation lands.
 
 The suite is dual-mode like its siblings: client-level tests import
 aqua_client standalone over a fake bleak (the test_first_read_resend
@@ -51,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import inspect
 import json
 import logging
 import sys
@@ -92,7 +85,6 @@ except ImportError:
 
 sys.path.insert(0, str(COMPONENT_DIR))
 
-import agent  # noqa: E402  (rung C module — imports clean without dbus_fast)
 import aqua_client  # noqa: E402
 import const  # noqa: E402
 import modbus  # noqa: E402
@@ -158,16 +150,15 @@ class _RecordingBleakClientBase:
 
     The AC-2 seam delta is asserted HERE: force_response is visible on
     the wire only as response=True (the frame bytes must be identical
-    either way — contract 011 §1.2).
+    either way — contract 011 §1.2). Deliberately exposes NO pair
+    method (spec 021): a regression that reintroduces client-side
+    pairing would AttributeError on this fake and fail loudly.
 
     Optional behaviors (scriptable per test):
     - ack_error: exception raised on acknowledged writes (response=True)
       — the ATT refusal the probe surfaces;
     - answer_frames/answer_on_write: notification frame(s) fed into the
-      wrapped client's _on_notify on the Nth write (a scripted answer);
-    - backend: a fake BlueZ backend exposing _device_path/_bus for the
-      bond-state logging (contract 011 §3) — read through the client's
-      `_backend` attribute, the name the introspection looks for.
+      wrapped client's _on_notify on the Nth write (a scripted answer).
     """
 
     def __init__(
@@ -176,16 +167,13 @@ class _RecordingBleakClientBase:
         ack_error: BaseException | None = None,
         answer_frames: list[bytes] | None = None,
         answer_on_write: int = 1,
-        backend: object | None = None,
     ) -> None:
         self.is_connected = True
         self.writes: list[tuple[str, bytes, bool]] = []
         self.write_count = 0
-        self.pair_calls = 0
         self.ack_error = ack_error
         self.answer_frames = list(answer_frames or [])
         self.answer_on_write = answer_on_write
-        self._backend = backend
         self.client_ref: aqua_client.AquaTempBleClient | None = None
         self.disconnected = False
         # the app-parity ff03 layout: bucket lookups resolve, the table
@@ -212,58 +200,6 @@ class _RecordingBleakClientBase:
     async def disconnect(self) -> None:
         self.disconnected = True
         self.is_connected = False
-
-
-class RecordingBleakClient(_RecordingBleakClientBase):
-    """The rung-A shape: the bleak client exposes a pair() method."""
-
-    def __init__(self, *, pair_script: list | None = None, **kwargs) -> None:
-        super().__init__(**kwargs)
-        self.pair_script = pair_script
-
-    async def pair(self) -> None:
-        self.pair_calls += 1
-        script = self.pair_script
-        if script is not None:
-            outcome = script[min(self.pair_calls - 1, len(script) - 1)]
-            if isinstance(outcome, BaseException):
-                raise outcome
-
-
-class FakeBluezBackend:
-    """Fake bleak BlueZ backend for the bond-state read (contract §3.6)."""
-
-    def __init__(self, bus: object) -> None:
-        self._device_path = "/org/bluez/hci0/dev_0806_A6_C0_94_1C"
-        self._bus = bus
-
-
-class FakeVariant:
-    """dbus-fast Variant shape (body[0].value)."""
-
-    def __init__(self, value: bool) -> None:
-        self.value = value
-
-
-class FakeDbusBus:
-    """Fake dbus_fast MessageBus: answers Properties.Get(Paired)."""
-
-    def __init__(self, paired: bool, *, variant: bool = False) -> None:
-        self.paired = paired
-        self.variant = variant
-        self.calls: list[object] = []
-
-    async def call(self, message) -> object:
-        self.calls.append(message)
-        body = [FakeVariant(self.paired)] if self.variant else [self.paired]
-        return SimpleNamespace(body=body)
-
-
-class _FakeMessage:
-    """Stand-in for dbus_fast.Message (kwarg-constructed)."""
-
-    def __init__(self, **kwargs) -> None:
-        self.kwargs = kwargs
 
 
 def _make_probe_client(fake: _RecordingBleakClientBase) -> aqua_client.AquaTempBleClient:
@@ -326,44 +262,6 @@ class _patch_const:
 
     def __exit__(self, *_exc) -> bool:
         setattr(const, self.name, self.old)
-        return False
-
-
-class _patch_agent_module:
-    """Patch the rung-C module's registration seams for a test.
-
-    The ladder looks the functions up on the module at call time, so a
-    plain attribute patch is the test seam (no bus is ever opened).
-    """
-
-    def __init__(self, *, available: bool = True, register_error=None) -> None:
-        self.available = available
-        self.register_error = register_error
-        self.registered: list[str] = []
-        self.unregistered: list[str] = []
-
-    async def _fake_register(self) -> object:
-        if self.register_error is not None:
-            raise self.register_error
-        self.registered.append(agent.AGENT_PATH)
-        return object()  # the fake bus token
-
-    async def _fake_unregister(self, bus) -> None:
-        self.unregistered.append(bus)
-
-    def __enter__(self) -> "_patch_agent_module":
-        self._old_available = agent.DBUS_FAST_AVAILABLE
-        self._old_register = agent.register_agent
-        self._old_unregister = agent.unregister_agent
-        agent.DBUS_FAST_AVAILABLE = self.available
-        agent.register_agent = self._fake_register  # type: ignore[method-assign]
-        agent.unregister_agent = self._fake_unregister  # type: ignore[method-assign]
-        return self
-
-    def __exit__(self, *_exc) -> bool:
-        agent.DBUS_FAST_AVAILABLE = self._old_available
-        agent.register_agent = self._old_register  # type: ignore[method-assign]
-        agent.unregister_agent = self._old_unregister  # type: ignore[method-assign]
         return False
 
 
@@ -485,99 +383,92 @@ async def test_acknowledged_write_failure_chain_survives() -> None:
     assert str(exc).startswith("GATT write failed: "), str(exc)
 
 
-async def test_last_request_write_count_tracks_resends() -> None:
-    """The helper's 'answered after pairing (<n> attempt of the window)'
-    line needs the request's write count (contract 011 §3.4) — the
-    counter covers the initial write plus every re-send."""
+async def test_normal_read_cycle_no_acknowledged_writes() -> None:
+    """The poll path keeps the vendor parity (spec 010): a normal read
+    cycle sends its frames without-response only — no acknowledged
+    writes, no probe machinery (the spec 021 world: and no pairing
+    surface exists at all)."""
     fake = _RecordingBleakClientBase(
-        answer_frames=[ANSWER_BLOCK], answer_on_write=3
+        answer_frames=[ANSWER_BLOCK], answer_on_write=1
     )
     client = _make_probe_client(fake)
-    await client.read_registers(7, 45, resend_every=0.05, resend_max=5)
-    assert client.last_request_write_count == 3, client.last_request_write_count
-    await asyncio.sleep(0.01)
-    assert not _leaked_tasks(), _leaked_tasks()
+    regs = await client.read_registers(7, 45)
+    assert regs[26] == 243
+    assert [r for _u, _d, r in fake.writes] == [False], fake.writes
 
 
 # ---------------------------------------------------------------------------
-# Part 3 — FR-2/FR-4: the probe/pair/retry sequence (run_security_probe)
+# Part 3 — the spec-021 prune pins (tasks.md D3)
 # ---------------------------------------------------------------------------
 
 
-async def test_probe_security_verdict_pair_then_retry_answers() -> None:
-    """The case-closed path, client level: probe → att-error-security
-    verdict → pair (rung A) → ONE retry read → answered → the
-    'answered after pairing' line + the regs returned (contract §2/§3.4)."""
-    fake = RecordingBleakClient(
+async def test_pairing_surface_pruned() -> None:
+    """Spec 021 (tasks.md D3): the pairing surface is GONE — no client
+    pair method, no pair kwarg on connect(), no pairing constants, no
+    agent module; run_security_probe carries no retry bounds (the
+    ladder and its first-read-retry were pruned with the lever)."""
+    assert not hasattr(aqua_client.AquaTempBleClient, "pair"), "pair() must be gone"
+    for name in ("PAIR_TIMEOUT", "DEFAULT_PAIR_ON_CONNECT", "PAIR_ENABLE_PROP"):
+        assert not hasattr(const, name), f"const.{name} must be gone"
+    assert not (COMPONENT_DIR / "agent.py").exists(), "agent.py must be gone"
+    client = _make_probe_client(_RecordingBleakClientBase())
+    try:
+        await client.connect(pair=True)  # type: ignore[call-arg]
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("connect() must not accept a pair kwarg anymore")
+    params = inspect.signature(aqua_client.run_security_probe).parameters
+    assert "retry_resend_every" not in params, params
+    assert "retry_resend_max" not in params, params
+    assert not hasattr(client, "last_request_write_count")
+
+
+# ---------------------------------------------------------------------------
+# Part 4 — FR-2: the probe sequence (run_security_probe)
+# ---------------------------------------------------------------------------
+
+
+async def test_probe_security_verdict_routes_none_no_pairing() -> None:
+    """Spec 021: an att-error-security verdict is classified and logged
+    at WARNING, then the probe returns None — NO pairing attempt, NO
+    retry read (the ladder was pruned; law L5, spec 020 proved no bond
+    is needed). The original timeout keeps the caller's UI key."""
+    fake = _RecordingBleakClientBase(
         ack_error=RuntimeError(
             "BleakGATTProtocolError: Insufficient Authentication"
-        ),
-        answer_frames=[ANSWER_BLOCK],
-        answer_on_write=2,  # write 1 = probe (refused), write 2 = retry
-    )
-    client = _make_probe_client(fake)
-    with _capture_logs() as cap:
-        regs = await aqua_client.run_security_probe(
-            client, retry_resend_every=2.0, retry_resend_max=3
         )
-    assert regs is not None and regs[26] == 243, regs
-    assert fake.pair_calls == 1, "the ladder must run exactly once"
-    infos = [m for m in cap.messages if m.startswith("security probe:") or m.startswith("pairing:")]
-    assert any(
-        m == f"security probe: re-sending base read as acknowledged write (response=True) on {UUID_WRITE} to {ADDRESS}"
-        for m in infos
-    ), infos
-    assert any(
-        m.startswith("security probe: verdict att-error-security: ")
-        and "Insufficient Authentication" in m
-        for m in infos
-    ), infos
-    assert any(m.startswith("pairing: attempting via rung A") for m in infos), infos
-    assert any(
-        m.startswith("security probe: answered after pairing (") for m in infos
-    ), infos
-    # the retry is the SAME base read, re-send bounds passed through
-    assert fake.write_count == 2, fake.write_count
-    await asyncio.sleep(0.01)
-    assert not _leaked_tasks(), _leaked_tasks()
-
-
-async def test_probe_security_verdict_pair_fails_no_retry() -> None:
-    """A failed pair means NO retry read (FR-4: the retry follows
-    success/skipped only) — the original timeout routing stays."""
-    fake = RecordingBleakClient(
-        ack_error=RuntimeError("BleakGATTProtocolError: Insufficient Encryption"),
-        pair_script=[RuntimeError("org.bluez.Error.AuthenticationFailed: failed")],
     )
     client = _make_probe_client(fake)
     with _capture_logs() as cap:
         regs = await aqua_client.run_security_probe(client)
     assert regs is None
-    assert fake.pair_calls == 1
-    assert fake.write_count == 1, "no retry read may follow a failed pair"
-    infos = [m for m in cap.messages if m.startswith("security probe:") or m.startswith("pairing:")]
+    assert fake.write_count == 1, "no retry read may follow the verdict"
+    infos = [m for m in cap.messages if m.startswith("security probe:")]
     assert any(
-        m.startswith("security probe: verdict att-error-security: ") for m in infos
+        m.startswith("security probe: verdict att-error-security: ")
+        and "Insufficient Authentication" in m
+        for m in infos
     ), infos
-    assert any(m.startswith("pairing: failed: ") for m in infos), infos
-    # the bLE choreography guidance rides on the authentication failure
+    # the probe entry line names the pipe under test (contract 011 §3.1)
     assert any(
-        m.startswith("pairing: failed: ") and "bLE" in m for m in infos
+        m == f"security probe: re-sending base read as acknowledged write (response=True) on {UUID_WRITE} to {ADDRESS}"
+        for m in infos
     ), infos
 
 
-async def test_probe_non_security_verdict_skips_pair() -> None:
-    """Contract §2: only att-error-security runs the ladder — a
-    permission verdict logs and stops (the resolver/cache column of
-    the decision matrix)."""
-    fake = RecordingBleakClient(
+async def test_probe_non_security_verdict_logged() -> None:
+    """Contract §2: a non-security verdict (permission here) logs its
+    classified line and routes — the resolver/cache column of the
+    decision matrix; nothing else runs."""
+    fake = _RecordingBleakClientBase(
         ack_error=RuntimeError("BleakGATTProtocolError: Write Not Permitted")
     )
     client = _make_probe_client(fake)
     with _capture_logs() as cap:
         regs = await aqua_client.run_security_probe(client)
     assert regs is None
-    assert fake.pair_calls == 0, "no pair attempt may follow a non-security verdict"
+    assert fake.write_count == 1
     infos = [m for m in cap.messages if m.startswith("security probe:")]
     assert any(
         m.startswith("security probe: verdict att-error-permission: ") for m in infos
@@ -588,12 +479,11 @@ async def test_probe_accepted_silent_verdict() -> None:
     """The ack-accepted-but-silent case: the write succeeded at the ATT
     layer and the engine ignored it — att-accepted-silent with the
     census in the line (contract §5.1 row 4; the H-APP-GATE branch)."""
-    fake = RecordingBleakClient()  # acknowledged write accepted, no answer
+    fake = _RecordingBleakClientBase()  # acknowledged write accepted, no answer
     client = _make_probe_client(fake)
     with _patch_const("REQUEST_TIMEOUT", 0.2), _capture_logs() as cap:
         regs = await aqua_client.run_security_probe(client)
     assert regs is None
-    assert fake.pair_calls == 0
     infos = [m for m in cap.messages if m.startswith("security probe:")]
     assert any(
         m.startswith(
@@ -608,14 +498,14 @@ async def test_probe_answers_directly() -> None:
     """Contract §2 row 3: the acknowledged write itself WAKES the
     engine — the probe's read answers, which is decisive evidence and
     a success (the helper returns the regs)."""
-    fake = RecordingBleakClient(
+    fake = _RecordingBleakClientBase(
         answer_frames=[ANSWER_BLOCK], answer_on_write=1
     )
     client = _make_probe_client(fake)
     with _capture_logs() as cap:
         regs = await aqua_client.run_security_probe(client)
     assert regs is not None and regs[26] == 243, regs
-    assert fake.pair_calls == 0, "an answering probe needs no pair"
+    assert fake.write_count == 1, "an answering probe needs no second read"
     assert any(
         "security probe: acknowledged write answered" in m for m in cap.messages
     ), cap.messages
@@ -630,7 +520,7 @@ async def test_probe_modbus_exception_frame_logged() -> None:
         bytes([modbus.SLAVE_ID, 0x83, 0x02])
         + modbus.crc16_modbus(bytes([modbus.SLAVE_ID, 0x83, 0x02])).to_bytes(2, "little")
     )
-    fake = RecordingBleakClient(
+    fake = _RecordingBleakClientBase(
         answer_frames=[exception_frame], answer_on_write=1
     )
     client = _make_probe_client(fake)
@@ -642,356 +532,8 @@ async def test_probe_modbus_exception_frame_logged() -> None:
     ), cap.messages
 
 
-async def test_probe_pair_stage_bounded_no_retry_after_wedge() -> None:
-    """Contract §4 / tasks 011 §5: the rung-A pair() call is bounded by
-    PAIR_TIMEOUT — a wedged D-Bus Pair logs 'pairing: failed:' and the
-    sequence ends WITHOUT the retry (FR-4), never a hang. (The helper's
-    own whole-ladder bound — 'pairing budget' — is covered at the flow
-    level by test_flow_pair_stage_wedge_is_bounded_and_skips_retry.)"""
-
-    async def wedged_pair() -> None:
-        await asyncio.sleep(5.0)
-
-    client = _make_probe_client(
-        RecordingBleakClient(
-            ack_error=RuntimeError(
-                "BleakGATTProtocolError: Insufficient Authentication"
-            )
-        )
-    )
-    client._client.pair = wedged_pair  # type: ignore[method-assign]
-    with _patch_const("PAIR_TIMEOUT", 0.2):
-        with _capture_logs() as cap:
-            regs = await aqua_client.run_security_probe(client)
-    assert regs is None
-    # The whole-ladder bound fired (the helper's wait_for starts before
-    # the rung's, so with equal budgets the OUTER one cancels first —
-    # contract 011 §4's inner bound, the wedged Pair never hangs).
-    assert any("pairing budget" in m for m in cap.messages), cap.messages
-    assert not any("pairing: succeeded" in m for m in cap.messages)
-    assert client._client.write_count == 1, "no retry read after a wedged pair"
-
-
 # ---------------------------------------------------------------------------
-# Part 4 — FR-3: the pairing ladder
-# ---------------------------------------------------------------------------
-
-
-async def test_pair_rung_a_success_and_bond_lines() -> None:
-    """Rung A: the bleak pair method exists → one bounded call → the
-    succeeded line plus the bond-state before/after lines (contract §3)."""
-    fake = RecordingBleakClient()
-    client = _make_probe_client(fake)
-    with _capture_logs() as cap:
-        result = await client.pair()
-    assert result == "succeeded", result
-    infos = [m for m in cap.messages if m.startswith("pairing:")]
-    assert any(m.startswith("pairing: attempting via rung A") for m in infos), infos
-    assert any(m == "pairing: bond state before: unknown" for m in infos), infos
-    assert any(m == "pairing: succeeded" for m in infos), infos
-    assert any(m == "pairing: bond state after: unknown" for m in infos), infos
-
-
-async def test_pair_rung_a_already_exists_skipped() -> None:
-    """BlueZ AlreadyExists → 'pairing: skipped: already bonded' (the X3
-    fast no-op verification, contract §5.2) — status skipped."""
-    fake = RecordingBleakClient(
-        pair_script=[RuntimeError("org.bluez.Error.AlreadyExists: Already exists")]
-    )
-    client = _make_probe_client(fake)
-    with _capture_logs() as cap:
-        result = await client.pair()
-    assert result == "skipped", result
-    assert any(
-        m == "pairing: skipped: already bonded"
-        for m in cap.messages
-        if m.startswith("pairing:")
-    ), cap.messages
-
-
-async def test_pair_rung_a_authentication_failure_gets_ble_guidance() -> None:
-    """AuthenticationFailed chains log the bLE choreography guidance
-    (contract §5.2) and do NOT trigger rung C."""
-    fake = RecordingBleakClient(
-        pair_script=[RuntimeError("org.bluez.Error.AuthenticationFailed: refused")]
-    )
-    client = _make_probe_client(fake)
-    with _capture_logs() as cap:
-        result = await client.pair()
-    assert result == "failed", result
-    infos = [m for m in cap.messages if m.startswith("pairing:")]
-    assert any(
-        m.startswith("pairing: failed: ") and "bLE" in m for m in infos
-    ), infos
-    assert not any("rung C" in m for m in infos), infos
-
-
-async def test_pair_rung_c_registers_agent_and_retries() -> None:
-    """The agent-signature failure (contract §5.2 row 1: the documented
-    no-agent Pair() failure, research 011 §10.2) triggers rung C: the
-    minimal agent registers, rung A retries ONCE, the agent is released
-    in the finally."""
-    fake = RecordingBleakClient(
-        pair_script=[
-            RuntimeError("org.bluez.Error.Failed: No agent is registered"),
-            None,  # the retry succeeds
-        ]
-    )
-    client = _make_probe_client(fake)
-    with _patch_agent_module() as patched:
-        with _capture_logs() as cap:
-            result = await client.pair()
-    assert result == "succeeded", result
-    assert fake.pair_calls == 2, "rung C retries rung A exactly once"
-    assert patched.registered == [agent.AGENT_PATH], patched.registered
-    assert patched.unregistered, "the agent must always be released"
-    infos = [m for m in cap.messages if m.startswith("pairing:")]
-    assert any(m.startswith("pairing: attempting via rung C") for m in infos), infos
-
-
-async def test_pair_rung_c_unavailable_without_dbus_fast() -> None:
-    """AC-8: the dbus_fast import is guarded — when the library is
-    absent (non-Linux / stripped hosts) rung C reports unavailable, the
-    ladder never crashes (ImportError is a verdict, not an exception)."""
-    fake = RecordingBleakClient(
-        pair_script=[RuntimeError("org.bluez.Error.Failed: No agent is registered")]
-    )
-    client = _make_probe_client(fake)
-    with _patch_agent_module(available=False):
-        with _capture_logs() as cap:
-            result = await client.pair()
-    assert result == "unavailable", result
-    assert fake.pair_calls == 1, "no retry without the agent"
-    infos = [m for m in cap.messages if m.startswith("pairing:")]
-    assert any(m.startswith("pairing: unavailable: ") for m in infos), infos
-
-
-async def test_pair_rung_b_reconnects_with_pair_true() -> None:
-    """Rung B (bleak >= 1.0 shape: no pair method): the connection is
-    torn down and re-established with pairing requested, then the
-    normal post-connect setup re-runs (research 011 §10.1)."""
-    establish_calls: list[bool] = []
-
-    class RungBClient(aqua_client.AquaTempBleClient):
-        async def _resolve_device(self) -> object:
-            return object()  # a fake BLEDevice
-
-        async def _establish_connection(self, device, *, max_attempts, pair=False):
-            establish_calls.append(bool(pair))
-            return RecordingBleakClient()
-
-        async def _post_connect_setup(self, client, device, *, t0, t_resolve, t_connect):
-            self._client = client  # the setup "ran"
-
-    pairless = _RecordingBleakClientBase()
-    client = RungBClient(ADDRESS)
-    client._client = pairless
-    # capability: the raw BleakClient constructor accepts pair=
-    old_cls = aqua_client.BleakClient
-
-    class _PairCapableBleakClient:  # the bleak >= 1.0 constructor shape
-        def __init__(self, device, *, disconnected_callback=None, timeout=None, pair=False):
-            pass
-
-    aqua_client.BleakClient = _PairCapableBleakClient
-    try:
-        with _capture_logs() as cap:
-            result = await client.pair()
-    finally:
-        aqua_client.BleakClient = old_cls
-    assert result == "succeeded", result
-    assert establish_calls == [True], establish_calls
-    assert pairless.disconnected, "rung B must tear the old link down first"
-    infos = [m for m in cap.messages if m.startswith("pairing:")]
-    assert any(m.startswith("pairing: attempting via rung B") for m in infos), infos
-
-
-async def test_pair_unavailable_when_backend_cannot_pair() -> None:
-    """No rung at all: no pair method and no pair kwarg anywhere →
-    'pairing: unavailable: <reason>' — the connection is NOT touched
-    (contract §3.3, research 011 §10.1)."""
-    pairless = _RecordingBleakClientBase()
-    client = _make_probe_client(pairless)
-    with _capture_logs() as cap:
-        result = await client.pair()
-    assert result == "unavailable", result
-    assert pairless.disconnected is False, "unavailable must not tear the link"
-    assert not hasattr(pairless, "establish_called")
-    infos = [m for m in cap.messages if m.startswith("pairing:")]
-    assert any(m.startswith("pairing: unavailable: ") for m in infos), infos
-
-
-async def test_pair_bond_state_read_via_backend() -> None:
-    """The best-effort Paired property read (contract §3.6): both the
-    plain-bool and the dbus-fast Variant reply shapes render the
-    paired/not-paired state; failures degrade to unknown."""
-    old_message = aqua_client._dbus_fast_message
-
-    def _fake_message():
-        return _FakeMessage
-
-    aqua_client._dbus_fast_message = _fake_message
-    try:
-        for paired in (True, False):
-            for variant in (False, True):
-                bus = FakeDbusBus(paired, variant=variant)
-                # RecordingBleakClient (not the pairless base): the ladder
-                # needs its pair method so rung A succeeds and the bond
-                # state is read around it.
-                fake = RecordingBleakClient(backend=FakeBluezBackend(bus))
-                client = _make_probe_client(fake)
-                with _capture_logs() as cap:
-                    result = await client.pair()
-                assert result == "succeeded", result
-                state = (
-                    "pairing: bond state after: paired"
-                    if paired
-                    else "pairing: bond state after: not paired"
-                )
-                assert state in cap.messages, (paired, variant, cap.messages)
-                assert bus.calls, "the Properties.Get message was never sent"
-    finally:
-        aqua_client._dbus_fast_message = old_message
-
-
-async def test_pair_bond_state_unknown_without_dbus_fast() -> None:
-    """dbus_fast absent → the guarded read degrades to unknown (DEBUG),
-    never an exception (AC-8)."""
-    fake = RecordingBleakClient()
-    client = _make_probe_client(fake)
-    with _capture_logs() as cap:
-        result = await client.pair()
-    assert result == "succeeded", result
-    assert "pairing: bond state before: unknown" in cap.messages
-
-
-# ---------------------------------------------------------------------------
-# Part 5 — FR-6/FR-7: connect(pair=...) threading + the option
-# ---------------------------------------------------------------------------
-
-
-class FakeBrc:
-    """Fake bleak_retry_connector module object (establish_connection
-    with **kwargs — the VAR_KEYWORD capability path)."""
-
-    def __init__(self, *, connected_fake: _RecordingBleakClientBase) -> None:
-        self.connected_fake = connected_fake
-        self.calls: list[dict] = []
-
-    async def establish_connection(self, client_class, device, **kwargs):
-        self.calls.append(kwargs)
-        return self.connected_fake
-
-
-class _ConnectClient(aqua_client.AquaTempBleClient):
-    """Client over the fakes: the real connect() body runs."""
-
-    def __init__(self, brc) -> None:
-        super().__init__(ADDRESS)
-        self._brc = brc
-
-    async def _resolve_device(self) -> object:
-        return SimpleNamespace(address=ADDRESS, name="BlueNRG-C0941C")
-
-    def _load_retry_connector(self):
-        return self._brc
-
-
-def _record_sleeps(events: list) -> object:
-    """Patch asyncio.sleep to record the delay instead of waiting."""
-    real_sleep = asyncio.sleep
-
-    async def recording_sleep(delay, *_args, **_kwargs):
-        events.append(("sleep", delay))
-
-    asyncio.sleep = recording_sleep
-    return real_sleep
-
-
-async def test_connect_threads_pair_into_establish() -> None:
-    """FR-6: connect(pair=True) requests pairing at the establish call
-    (brc pair=True — the capability-checked kwarg, research 011 §10.1)
-    and logs the contract §3.5 DEBUG marker; connect() bare passes no
-    pair at all (FR-7: today's behavior byte-identical)."""
-    events: list = []
-    fake = _RecordingBleakClientBase()
-    brc = FakeBrc(connected_fake=fake)
-    client = _ConnectClient(brc)
-    real_sleep = _record_sleeps(events)
-    try:
-        with _capture_logs() as cap:
-            cap_cap = cap
-            await client.connect(max_attempts=2, pair=True)
-            pair_calls = [c for c in brc.calls]
-            await client.disconnect()
-            brc.calls.clear()
-            await client.connect(max_attempts=2)
-            plain_calls = [c for c in brc.calls]
-    finally:
-        asyncio.sleep = real_sleep
-    assert any(c.get("pair") is True for c in pair_calls), pair_calls
-    assert all("pair" not in c for c in plain_calls), plain_calls
-    assert any(
-        m == "connect with pairing requested (option pair_on_connect)"
-        for m in cap_cap.messages
-    ), cap_cap.messages
-
-
-async def test_connect_pair_unsupported_degrades_with_warning() -> None:
-    """The option must never break the poll path: a backend that cannot
-    pair logs a WARNING and connects WITHOUT pairing (FR-6/FR-7)."""
-
-    class _PairlessBrc:
-        def __init__(self, connected_fake):
-            self.connected_fake = connected_fake
-            self.calls = []
-
-        async def establish_connection(
-            self, client_class, device, *, name, max_attempts, timeout,
-            disconnected_callback=None,
-        ):
-            self.calls.append(name)
-            return self.connected_fake
-
-    fake = _RecordingBleakClientBase()
-    brc = _PairlessBrc(fake)
-    client = _ConnectClient(brc)
-    events: list = []
-    real_sleep = _record_sleeps(events)
-    try:
-        with _capture_logs() as cap:
-            await client.connect(max_attempts=2, pair=True)
-    finally:
-        asyncio.sleep = real_sleep
-    assert brc.calls, "the connect must proceed despite the unsupported pair"
-    assert any(
-        m.startswith("pairing was requested") for m in cap.messages
-    ), cap.messages
-
-
-async def test_const_pair_values() -> None:
-    """Block 1 constants: PAIR_TIMEOUT bounds one D-Bus Pair attempt
-    (contract 011 §4), the option ships OFF (FR-6) and the plumbing
-    constant names the establish kwarg."""
-    assert const.PAIR_TIMEOUT == 25.0, const.PAIR_TIMEOUT
-    assert const.DEFAULT_PAIR_ON_CONNECT is False
-    assert const.PAIR_ENABLE_PROP == "pair"
-
-
-async def test_option_off_no_probe_no_pair_on_normal_reads() -> None:
-    """AC-4 (client half): a full normal read cycle with the option OFF
-    sends no acknowledged writes and never pairs — the poll path is
-    today's behavior (FR-7)."""
-    fake = RecordingBleakClient(answer_frames=[ANSWER_BLOCK], answer_on_write=1)
-    client = _make_probe_client(fake)
-    regs = await client.read_registers(7, 45)
-    assert regs[26] == 243
-    assert fake.pair_calls == 0
-    assert [r for _u, _d, r in fake.writes] == [False], fake.writes
-
-
-# ---------------------------------------------------------------------------
-# Part 6 — the config-flow stages (FR-2, contract 011 §2) — stubbed HA
+# Part 5 — the config-flow stages (FR-2, contract 011 §2) — stubbed HA
 # ---------------------------------------------------------------------------
 
 PKG = "_aqua_flow_011"  # synthetic package name (distinct from siblings)
@@ -1006,7 +548,7 @@ def _install_stubs() -> None:
 
     class _VolRequired:
         """Stub vol.Required that RECORDS its kwargs — the options-flow
-        test asserts the pair_on_connect default through it."""
+        test asserts the gates' defaults through it."""
 
         def __init__(self, key, **kwargs):
             self.key = key
@@ -1262,36 +804,31 @@ class FakeProbeClient:
     """Duck-typed AquaTempBleClient for the flow's test task.
 
     Scriptable per-call read outcomes (dict = success, Exception =
-    raise, "hang" = never returns), scriptable pair result, and a
-    recorder for every read's kwargs — the probe's force_response and
-    the re-send bounds are asserted through it.
-    """
+    raise, "hang" = never returns) and a recorder for every read's
+    kwargs — the probe's force_response and the re-send bounds are
+    asserted through it. Deliberately exposes NO pair method (spec 021:
+    the flow must never be able to pair)."""
 
     instances: list["FakeProbeClient"] = []
     script: list = []
-    pair_result = "succeeded"
-    pair_error: BaseException | None = None
 
     @classmethod
     def reset(cls) -> None:
         cls.instances = []
         cls.script = []
-        cls.pair_result = "succeeded"
-        cls.pair_error = None
 
     def __init__(self, address, name=None, hass=None):
         self.address = address
         self.name = name
         self.hass = hass
         self.reads: list[dict] = []
-        self.pair_calls = 0
         self.harvest_calls = 0  # spec 013: the push-harvest stage seam
         self.disconnected = False
         self.connect_kwargs = None
         type(self).instances.append(self)
 
-    async def connect(self, max_attempts=None, pair=False):
-        self.connect_kwargs = {"max_attempts": max_attempts, "pair": pair}
+    async def connect(self, max_attempts=None):
+        self.connect_kwargs = {"max_attempts": max_attempts}
         return None
 
     async def read_registers(
@@ -1315,12 +852,6 @@ class FakeProbeClient:
             raise outcome
         return dict(outcome)
 
-    async def pair(self):
-        self.pair_calls += 1
-        if type(self).pair_error is not None:
-            raise type(self).pair_error
-        return type(self).pair_result
-
     async def harvest_pushes(self, wanted_starts=None, timeout=None):
         # Spec 013 (contract 013 §2): the push-harvest stage after a
         # probe-None verdict — none of the 011 worlds script pushes, so
@@ -1333,8 +864,7 @@ class FakeProbeClient:
         self.disconnected = True
 
 
-def _make_flow(hass=None, client_cls=FakeProbeClient, script=None,
-               pair_result="succeeded", pair_error=None):
+def _make_flow(hass=None, client_cls=FakeProbeClient, script=None):
     """Build a fresh flow bound to the fake hass. The fake's class state
     is reset FIRST, then the script is applied — reset() clears it, so
     the ordering here is the contract (the walkthrough's fault-after-
@@ -1342,8 +872,6 @@ def _make_flow(hass=None, client_cls=FakeProbeClient, script=None,
     client_cls.reset()
     if script is not None:
         client_cls.script = list(script)
-    client_cls.pair_result = pair_result
-    client_cls.pair_error = pair_error
     cf.AquaTempBleClient = client_cls
     flow = cf.AquaTempConfigFlow()
     flow.hass = hass or FlowHass(infos=[FlowInfo(ADDRESS, "BlueNRG-C0941C", -50)])
@@ -1368,9 +896,9 @@ SECURITY_CHAIN = (
 )
 
 
-async def test_flow_success_path_runs_no_probe_no_pair() -> None:
-    """AC-4: a first read that SUCCEEDS runs NO probe, NO pair attempt,
-    no extra read calls — zero new INFO lines on the success path."""
+async def test_flow_success_path_runs_no_probe() -> None:
+    """AC-4: a first read that SUCCEEDS runs NO probe, no extra read
+    calls — zero new probe lines on the success path."""
     flow = _make_flow(script=[dict(FLOW_REGS)])
     with _flow_logs() as log:
         result = await flow.async_step_device(user_input={"address": ADDRESS})
@@ -1381,74 +909,22 @@ async def test_flow_success_path_runs_no_probe_no_pair() -> None:
     assert client.reads[0]["force_response"] is False
     assert client.reads[0]["resend_every"] == 2.0
     assert client.reads[0]["resend_max"] == 3
-    assert client.pair_calls == 0
     assert client.disconnected
     assert not any(
-        m.startswith("security probe:") or m.startswith("pairing:")
-        for m in log.messages
+        m.startswith("security probe:") for m in log.messages
     ), log.messages
 
 
-async def test_flow_case_closed_probe_pair_retry_answered() -> None:
-    """The case-closed walkthrough: first-read timeout → probe
-    (acknowledged) → security verdict → pair success → ONE retry with
-    the re-send bounds → answered → confirm form. The log carries the
-    contract §3 lines verbatim."""
+async def test_flow_security_verdict_routes_no_response() -> None:
+    """Spec 021: a security-class verdict at the flow level logs the
+    classified line, runs the push-harvest stage (spec 013) and routes
+    to the ORIGINAL no_response — the pairing ladder and its retry are
+    gone, so the flow's reads stay at exactly two."""
     flow = _make_flow(
         script=[
             cf.AquaTempTimeoutError(FIRST_TIMEOUT),
             cf.AquaTempConnectionError(SECURITY_CHAIN),
-            dict(FLOW_REGS),
         ],
-        pair_result="succeeded",
-    )
-    with _flow_logs() as log:
-        result = await flow.async_step_device(user_input={"address": ADDRESS})
-        result = await _drive_progress(flow, result)
-    assert result["type"] == "form" and result["step_id"] == "confirm", result
-    placeholders = result["description_placeholders"]
-    assert placeholders["inlet"] == "24.5 °C", placeholders
-    client = FakeProbeClient.instances[-1]
-    # the three reads, exactly: first (re-send bounds) / probe
-    # (acknowledged, no re-send) / retry (re-send bounds unchanged)
-    assert len(client.reads) == 3, client.reads
-    assert client.reads[0] == {
-        "start": 7, "count": 45, "resend_every": 2.0, "resend_max": 3,
-        "force_response": False,
-    }, client.reads[0]
-    assert client.reads[1] == {
-        "start": 7, "count": 45, "resend_every": None, "resend_max": 0,
-        "force_response": True,
-    }, client.reads[1]
-    assert client.reads[2] == {
-        "start": 7, "count": 45, "resend_every": 2.0, "resend_max": 3,
-        "force_response": False,
-    }, client.reads[2]
-    assert client.pair_calls == 1
-    assert client.disconnected
-    assert any(
-        m.startswith("security probe: verdict att-error-security: ")
-        for m in log.messages
-    ), log.messages
-    assert any(
-        m.startswith("security probe: answered after pairing (")
-        for m in log.messages
-    ), log.messages
-    # UI keys unchanged: a success is a success — no new error key
-    assert flow._test_error is None
-
-
-async def test_flow_still_silent_after_pairing_routes_no_response() -> None:
-    """FR-4's still-silent outcome: pair succeeded, the retry timed out
-    → 'still silent after pairing (census: ...)' and the ORIGINAL
-    no_response routing (UI keys unchanged)."""
-    flow = _make_flow(
-        script=[
-            cf.AquaTempTimeoutError(FIRST_TIMEOUT),
-            cf.AquaTempConnectionError(SECURITY_CHAIN),
-            cf.AquaTempTimeoutError(FIRST_TIMEOUT),
-        ],
-        pair_result="succeeded",
     )
     with _flow_logs() as log:
         result = await flow.async_step_device(user_input={"address": ADDRESS})
@@ -1456,17 +932,17 @@ async def test_flow_still_silent_after_pairing_routes_no_response() -> None:
     assert result["type"] == "form" and result["step_id"] == "device", result
     assert result["errors"] == {"base": "no_response"}, result
     client = FakeProbeClient.instances[-1]
-    assert client.pair_calls == 1
-    assert len(client.reads) == 3, client.reads
+    assert len(client.reads) == 2, client.reads
+    assert client.harvest_calls == 1, "the push harvest stage still runs"
     assert any(
-        m.startswith("security probe: still silent after pairing (census: ")
+        m.startswith("security probe: verdict att-error-security: ")
         for m in log.messages
     ), log.messages
 
 
-async def test_flow_non_security_verdict_skips_pair_routes_no_response() -> None:
-    """A permission verdict logs and routes; NO pair attempt (contract
-    §2) — the UI key stays no_response (the original timeout)."""
+async def test_flow_non_security_verdict_routes_no_response() -> None:
+    """A permission verdict logs and routes — the UI key stays
+    no_response (the original timeout)."""
     flow = _make_flow(
         script=[
             cf.AquaTempTimeoutError(FIRST_TIMEOUT),
@@ -1481,7 +957,6 @@ async def test_flow_non_security_verdict_skips_pair_routes_no_response() -> None
     assert result["type"] == "form" and result["step_id"] == "device", result
     assert result["errors"] == {"base": "no_response"}, result
     client = FakeProbeClient.instances[-1]
-    assert client.pair_calls == 0
     assert len(client.reads) == 2, client.reads
     assert any(
         m.startswith("security probe: verdict att-error-permission: ")
@@ -1491,7 +966,7 @@ async def test_flow_non_security_verdict_skips_pair_routes_no_response() -> None
 
 async def test_flow_accepted_silent_verdict_routes_no_response() -> None:
     """att-accepted-silent: the write was accepted, the engine ignored
-    it — the verdict line with the census, no pair, no_response."""
+    it — the verdict line with the census, no_response."""
     flow = _make_flow(
         script=[
             cf.AquaTempTimeoutError(FIRST_TIMEOUT),
@@ -1503,7 +978,7 @@ async def test_flow_accepted_silent_verdict_routes_no_response() -> None:
         result = await _drive_progress(flow, result)
     assert result["errors"] == {"base": "no_response"}, result
     client = FakeProbeClient.instances[-1]
-    assert client.pair_calls == 0
+    assert len(client.reads) == 2, client.reads
     assert any(
         m.startswith(
             "security probe: verdict att-accepted-silent "
@@ -1527,7 +1002,7 @@ async def test_flow_probe_answers_directly_reaches_confirm() -> None:
         result = await _drive_progress(flow, result)
     assert result["type"] == "form" and result["step_id"] == "confirm", result
     client = FakeProbeClient.instances[-1]
-    assert client.pair_calls == 0
+    assert len(client.reads) == 2, client.reads
     assert any(
         "security probe: acknowledged write answered" in m for m in log.messages
     ), log.messages
@@ -1560,111 +1035,36 @@ async def test_flow_budget_expiry_mid_probe_routes_cannot_connect() -> None:
     ), log.messages
 
 
-async def test_flow_pair_stage_wedge_is_bounded_and_skips_retry() -> None:
-    """Contract §4's inner bound at the flow level: a wedged pair
-    hits the PAIR_TIMEOUT bound (patched small), logs it, skips the
-    retry and routes the ORIGINAL no_response — never a hang."""
-    FakeProbeClient.script = [
-        cf.AquaTempTimeoutError(FIRST_TIMEOUT),
-        cf.AquaTempConnectionError(SECURITY_CHAIN),
-    ]
-
-    class HangingPairClient(FakeProbeClient):
-        async def pair(self):
-            self.pair_calls += 1
-            await asyncio.sleep(30.0)
-            return "succeeded"
-
-    HangingPairClient.reset()
-    flow = _make_flow(
-        client_cls=HangingPairClient,
-        script=[
-            cf.AquaTempTimeoutError(FIRST_TIMEOUT),
-            cf.AquaTempConnectionError(SECURITY_CHAIN),
-        ],
-    )
-    stub_const = sys.modules[f"{PKG}.const"]
-    original_pair_timeout = stub_const.PAIR_TIMEOUT
-    stub_const.PAIR_TIMEOUT = 0.2
-    try:
-        with _flow_logs() as log:
-            result = await flow.async_step_device(user_input={"address": ADDRESS})
-            result = await _drive_progress(flow, result)
-    finally:
-        stub_const.PAIR_TIMEOUT = original_pair_timeout
-    assert result["type"] == "form" and result["step_id"] == "device", result
-    assert result["errors"] == {"base": "no_response"}, result
-    client = HangingPairClient.instances[-1]
-    assert client.pair_calls == 1
-    assert len(client.reads) == 2, "no retry read may follow the wedged pair"
-    assert any("pairing budget" in m for m in log.messages), log.messages
-
-
-async def test_flow_pair_failure_routes_no_response_never_crashes() -> None:
-    """A pair that fails (or even raises) never breaks the test: no
-    retry, the original no_response routing, the chain in the log."""
-    flow = _make_flow(
-        script=[
-            cf.AquaTempTimeoutError(FIRST_TIMEOUT),
-            cf.AquaTempConnectionError(SECURITY_CHAIN),
-        ],
-        pair_error=RuntimeError("org.bluez.Error.AuthenticationFailed"),
-    )
-    with _flow_logs() as log:
-        result = await flow.async_step_device(user_input={"address": ADDRESS})
-        result = await _drive_progress(flow, result)
-    assert result["type"] == "form" and result["step_id"] == "device", result
-    assert result["errors"] == {"base": "no_response"}, result
-    client = FakeProbeClient.instances[-1]
-    assert client.pair_calls == 1
-    assert len(client.reads) == 2
-    assert any("pairing: failed:" in m for m in log.messages), log.messages
-
-
-async def test_options_flow_pair_on_connect_toggle() -> None:
-    """FR-6: the options flow gains the boolean toggle, default
-    DEFAULT_PAIR_ON_CONNECT (OFF), and submits it into the options."""
+async def test_options_flow_has_no_pair_toggle() -> None:
+    """Spec 021 (tasks.md D3): the evidence-gated pair_on_connect
+    toggle is GONE from the options schema (pruned with the pairing
+    ladder); the push-mode gates remain."""
     flow = cf.AquaTempOptionsFlowHandler()
-    # data={} — the real ConfigEntry always carries .data; the options
-    # flow reads the entry mode from it (spec 013 FR-5 push gate).
-    flow.config_entry = types.SimpleNamespace(options={}, data={})
+    flow.config_entry = types.SimpleNamespace(options={}, data={"mode": "push"})
     result = await flow.async_step_init(None)
     assert result["type"] == "form" and result["step_id"] == "init", result
-    schema = result["data_schema"]
-    pair_entry = next(
-        entry for entry in schema if getattr(entry, "key", None) == "pair_on_connect"
-    )
-    assert pair_entry.kwargs.get("default") is cf.DEFAULT_PAIR_ON_CONNECT
-    assert cf.DEFAULT_PAIR_ON_CONNECT is False  # ships OFF (FR-6)
-    # an already-ON entry keeps its value as the default
-    flow.config_entry = types.SimpleNamespace(
-        options={"pair_on_connect": True}, data={}
-    )
-    result = await flow.async_step_init(None)
-    pair_entry = next(
-        entry for entry in result["data_schema"]
-        if getattr(entry, "key", None) == "pair_on_connect"
-    )
-    assert pair_entry.kwargs.get("default") is True
-    # submitting stores it
-    result = await flow.async_step_init(
-        {"poll_interval": 30, "temperature_unit": "C", "pair_on_connect": True}
-    )
-    assert result["type"] == "create_entry", result
-    assert result["data"]["pair_on_connect"] is True, result
+    keys = [getattr(entry, "key", None) for entry in result["data_schema"]]
+    assert "pair_on_connect" not in keys, keys
+    for key in (
+        "push_temp_confirmed",
+        "push_control_confirmed",
+        "write_control",
+        "write_setpoint",
+    ):
+        assert key in keys, keys
 
 
 # ---------------------------------------------------------------------------
-# Part 7 — spec 012: the log-level visibility contract (contract 012 §2/§3)
+# Part 6 — spec 012: the log-level visibility contract (contract 012 §2/§3)
 # ---------------------------------------------------------------------------
 
 
-async def _drive_probe_flow(script, *, pair_result="succeeded", pair_error=None):
+async def _drive_probe_flow(script):
     """One flow walkthrough over a scripted probe outcome, returning the
     routing result and the captured (message, levelname) pairs (spec 012
     FR-3: the caps record levels since this part — the suite asserts the
     operator-visible LEVEL, not just the message string)."""
-    flow = _make_flow(script=script, pair_result=pair_result, pair_error=pair_error)
+    flow = _make_flow(script=script)
     with _flow_logs() as log:
         result = await flow.async_step_device(user_input={"address": ADDRESS})
         result = await _drive_progress(flow, result)
@@ -1674,8 +1074,8 @@ async def _drive_probe_flow(script, *, pair_result="succeeded", pair_error=None)
 async def test_flow_probe_evidence_lines_are_warning() -> None:
     """Spec 012 FR-1/AC-2 (contract 012 §2): the att-accepted-silent
     walkthrough — the probe entry line and the verdict line are at
-    WARNING, and ZERO `security probe:`/`pairing:` records exist at any
-    other level. The operator's system_log panel stores WARNING+ only
+    WARNING, and ZERO `security probe:` records exist at any other
+    level. The operator's system_log panel stores WARNING+ only
     (research 012 §4): below WARNING the evidence is operator-invisible."""
     result, records = await _drive_probe_flow(
         [cf.AquaTempTimeoutError(FIRST_TIMEOUT), cf.AquaTempTimeoutError(FIRST_TIMEOUT)]
@@ -1684,7 +1084,7 @@ async def test_flow_probe_evidence_lines_are_warning() -> None:
     evidence = [
         (m, lvl)
         for m, lvl in records
-        if m.startswith("security probe:") or m.startswith("pairing:")
+        if m.startswith("security probe:")
     ]
     assert evidence, records
     assert all(lvl == "WARNING" for _m, lvl in evidence), evidence
@@ -1701,26 +1101,24 @@ async def test_flow_probe_evidence_lines_are_warning() -> None:
 
 async def test_flow_all_probe_evidence_lines_are_warning() -> None:
     """Spec 012 FR-1 (contract 012 §2): EVERY probe evidence line the
-    flow can emit — the entry line, the classified verdict, the
-    accepted-silent verdict, the Modbus-exception frame, the answered
-    write, the probe pair-catch failure, still-silent-after-pairing and
-    answered-after-pairing — is at WARNING in every walkthrough that
-    exercises it (zero probe/pair records at any other level)."""
+    flow can emit — the entry line, the classified verdicts, the
+    accepted-silent verdict, the Modbus-exception frame and the answered
+    write — is at WARNING in every walkthrough that exercises it (zero
+    probe records at any other level)."""
     scenarios = [
-        ("accepted-silent", [cf.AquaTempTimeoutError(FIRST_TIMEOUT), cf.AquaTempTimeoutError(FIRST_TIMEOUT)], {}),
-        ("case-closed", [cf.AquaTempTimeoutError(FIRST_TIMEOUT), cf.AquaTempConnectionError(SECURITY_CHAIN), dict(FLOW_REGS)], {}),
-        ("modbus-exception", [cf.AquaTempTimeoutError(FIRST_TIMEOUT), cf.AquaTempResponseError("Modbus exception frame")], {}),
-        ("pair-catch-failure", [cf.AquaTempTimeoutError(FIRST_TIMEOUT), cf.AquaTempConnectionError(SECURITY_CHAIN)], {"pair_error": RuntimeError("org.bluez.Error.Failed: boom")}),
-        ("still-silent", [cf.AquaTempTimeoutError(FIRST_TIMEOUT), cf.AquaTempConnectionError(SECURITY_CHAIN), cf.AquaTempTimeoutError(FIRST_TIMEOUT)], {}),
-        ("answers-directly", [cf.AquaTempTimeoutError(FIRST_TIMEOUT), dict(FLOW_REGS)], {}),
+        ("accepted-silent", [cf.AquaTempTimeoutError(FIRST_TIMEOUT), cf.AquaTempTimeoutError(FIRST_TIMEOUT)]),
+        ("security-verdict", [cf.AquaTempTimeoutError(FIRST_TIMEOUT), cf.AquaTempConnectionError(SECURITY_CHAIN)]),
+        ("permission-verdict", [cf.AquaTempTimeoutError(FIRST_TIMEOUT), cf.AquaTempConnectionError("acknowledged write failed: BleakGATTProtocolError: Write Not Permitted")]),
+        ("modbus-exception", [cf.AquaTempTimeoutError(FIRST_TIMEOUT), cf.AquaTempResponseError("Modbus exception frame")]),
+        ("answers-directly", [cf.AquaTempTimeoutError(FIRST_TIMEOUT), dict(FLOW_REGS)]),
     ]
     seen: list[str] = []
-    for name, script, kwargs in scenarios:
-        result, records = await _drive_probe_flow(script, **kwargs)
+    for name, script in scenarios:
+        result, records = await _drive_probe_flow(script)
         evidence = [
             (m, lvl)
             for m, lvl in records
-            if m.startswith("security probe:") or m.startswith("pairing:")
+            if m.startswith("security probe:")
         ]
         assert evidence, (name, records)
         assert all(lvl == "WARNING" for _m, lvl in evidence), (name, evidence)
@@ -1729,155 +1127,13 @@ async def test_flow_all_probe_evidence_lines_are_warning() -> None:
     prefixes = (
         "security probe: re-sending base read as acknowledged write",
         "security probe: verdict att-error-security: ",
+        "security probe: verdict att-error-permission: ",
         "security probe: verdict att-accepted-silent",
         "security probe: acknowledged write answered by a Modbus exception frame",
         "security probe: acknowledged write answered — the Write",
-        "pairing: failed: ",
-        "security probe: still silent after pairing",
-        "security probe: answered after pairing",
     )
     for prefix in prefixes:
         assert any(m.startswith(prefix) for m in seen), prefix
-
-
-async def test_pairing_ladder_lines_are_warning() -> None:
-    """Spec 012 FR-1 (contract 012 §2): every pairing-ladder evidence
-    line — bond states before/after, the rung A/B/C attempt lines,
-    succeeded / skipped / failed / unavailable — is at WARNING. The
-    ladder runs on the REAL client (the flow's FakeProbeClient.pair
-    replaces it, so these lines are client-level only)."""
-    evidence: list[tuple[str, str]] = []
-
-    async def _run_pair(client) -> str:
-        with _capture_logs() as cap:
-            result = await client.pair()
-        evidence.extend(
-            (m, lvl)
-            for m, lvl in zip(cap.messages, cap.levels)
-            if m.startswith("pairing:")
-        )
-        return result
-
-    # Rung A: success / AlreadyExists-skip / authentication failure.
-    assert await _run_pair(_make_probe_client(RecordingBleakClient())) == "succeeded"
-    assert await _run_pair(
-        _make_probe_client(
-            RecordingBleakClient(
-                pair_script=[RuntimeError("org.bluez.Error.AlreadyExists: exists")]
-            )
-        )
-    ) == "skipped"
-    assert await _run_pair(
-        _make_probe_client(
-            RecordingBleakClient(
-                pair_script=[
-                    RuntimeError("org.bluez.Error.AuthenticationFailed: refused")
-                ]
-            )
-        )
-    ) == "failed"
-    # No rung at all (no pair method, no pair kwarg): unavailable without
-    # touching the link (contract 011 §3.3).
-    assert (
-        await _run_pair(_make_probe_client(_RecordingBleakClientBase()))
-        == "unavailable"
-    )
-    # Rung C, dbus_fast absent: the guarded import reports unavailable.
-    with _patch_agent_module(available=False):
-        rung_c_client = _make_probe_client(
-            RecordingBleakClient(
-                pair_script=[
-                    RuntimeError("org.bluez.Error.Failed: No agent is registered")
-                ]
-            )
-        )
-        assert await _run_pair(rung_c_client) == "unavailable"
-    # Rung C, registration refused (register_agent -> None): unavailable.
-    with _patch_agent_module():
-
-        async def _register_none():
-            return None
-
-        agent.register_agent = _register_none  # type: ignore[method-assign]
-        rung_c_client = _make_probe_client(
-            RecordingBleakClient(
-                pair_script=[
-                    RuntimeError("org.bluez.Error.Failed: No agent is registered")
-                ]
-            )
-        )
-        assert await _run_pair(rung_c_client) == "unavailable"
-    # Rung B (the bleak >= 1.0 shape): success / AlreadyExists-skip /
-    # generic failure during the re-establish.
-    def _rung_b_client(establish_error: BaseException | None):
-        class RungBClient(aqua_client.AquaTempBleClient):
-            async def _resolve_device(self) -> object:
-                return object()  # a fake BLEDevice
-
-            async def _establish_connection(self, device, *, max_attempts, pair=False):
-                if establish_error is not None:
-                    raise establish_error
-                return RecordingBleakClient()
-
-            async def _post_connect_setup(self, client, device, *, t0, t_resolve, t_connect):
-                self._client = client  # the setup "ran"
-
-        client = RungBClient(ADDRESS)
-        client._client = _RecordingBleakClientBase()  # the pairless old link
-        return client
-
-    old_cls = aqua_client.BleakClient
-
-    class _PairCapableBleakClient:  # the bleak >= 1.0 constructor shape
-        def __init__(self, device, *, disconnected_callback=None, timeout=None, pair=False):
-            pass
-
-    aqua_client.BleakClient = _PairCapableBleakClient
-    try:
-        assert await _run_pair(_rung_b_client(None)) == "succeeded"
-        assert (
-            await _run_pair(
-                _rung_b_client(RuntimeError("org.bluez.Error.AlreadyExists: exists"))
-            )
-            == "skipped"
-        )
-        assert (
-            await _run_pair(
-                _rung_b_client(RuntimeError("org.bluez.Error.NetworkUnreachable: gone"))
-            )
-            == "failed"
-        )
-    finally:
-        aqua_client.BleakClient = old_cls
-
-    assert evidence, "no pairing lines were captured"
-    bad = [(m, lvl) for m, lvl in evidence if lvl != "WARNING"]
-    assert not bad, bad
-    # every contract 012 §2 ladder line shape was exercised at WARNING
-    prefixes = (
-        "pairing: bond state before: ",
-        "pairing: attempting via rung A",
-        "pairing: attempting via rung B",
-        "pairing: attempting via rung C",
-        "pairing: skipped: already bonded",
-        "pairing: succeeded",
-        "pairing: failed: ",
-        "pairing: bond state after: ",
-    )
-    for prefix in prefixes:
-        assert any(m.startswith(prefix) for m, _lvl in evidence), prefix
-    # the three distinct 'unavailable' verdicts (capability / dbus_fast
-    # absent / registration refused) all ran at WARNING
-    unavailable = [m for m, _lvl in evidence if m.startswith("pairing: unavailable: ")]
-    assert len(unavailable) >= 3, unavailable
-    assert any(
-        m.startswith("pairing: unavailable: no pairing agent could be registered")
-        for m in unavailable
-    ), unavailable
-    assert any(
-        m.startswith("pairing: unavailable: agent registration failed")
-        for m in unavailable
-    ), unavailable
 
 
 async def test_census_lines_stay_debug_counterexample() -> None:
@@ -1940,40 +1196,22 @@ def main() -> int:
         test_classifier_table_every_contract_row,
         test_probe_bytes_equal_and_response_only_delta,
         test_acknowledged_write_failure_chain_survives,
-        test_last_request_write_count_tracks_resends,
-        test_probe_security_verdict_pair_then_retry_answers,
-        test_probe_security_verdict_pair_fails_no_retry,
-        test_probe_non_security_verdict_skips_pair,
+        test_normal_read_cycle_no_acknowledged_writes,
+        test_pairing_surface_pruned,
+        test_probe_security_verdict_routes_none_no_pairing,
+        test_probe_non_security_verdict_logged,
         test_probe_accepted_silent_verdict,
         test_probe_answers_directly,
         test_probe_modbus_exception_frame_logged,
-        test_probe_pair_stage_bounded_no_retry_after_wedge,
-        test_pair_rung_a_success_and_bond_lines,
-        test_pair_rung_a_already_exists_skipped,
-        test_pair_rung_a_authentication_failure_gets_ble_guidance,
-        test_pair_rung_c_registers_agent_and_retries,
-        test_pair_rung_c_unavailable_without_dbus_fast,
-        test_pair_rung_b_reconnects_with_pair_true,
-        test_pair_unavailable_when_backend_cannot_pair,
-        test_pair_bond_state_read_via_backend,
-        test_pair_bond_state_unknown_without_dbus_fast,
-        test_connect_threads_pair_into_establish,
-        test_connect_pair_unsupported_degrades_with_warning,
-        test_const_pair_values,
-        test_option_off_no_probe_no_pair_on_normal_reads,
-        test_flow_success_path_runs_no_probe_no_pair,
-        test_flow_case_closed_probe_pair_retry_answered,
-        test_flow_still_silent_after_pairing_routes_no_response,
-        test_flow_non_security_verdict_skips_pair_routes_no_response,
+        test_flow_success_path_runs_no_probe,
+        test_flow_security_verdict_routes_no_response,
+        test_flow_non_security_verdict_routes_no_response,
         test_flow_accepted_silent_verdict_routes_no_response,
         test_flow_probe_answers_directly_reaches_confirm,
         test_flow_budget_expiry_mid_probe_routes_cannot_connect,
-        test_flow_pair_stage_wedge_is_bounded_and_skips_retry,
-        test_flow_pair_failure_routes_no_response_never_crashes,
-        test_options_flow_pair_on_connect_toggle,
+        test_options_flow_has_no_pair_toggle,
         test_flow_probe_evidence_lines_are_warning,
         test_flow_all_probe_evidence_lines_are_warning,
-        test_pairing_ladder_lines_are_warning,
         test_census_lines_stay_debug_counterexample,
         test_flow_build_marker_logged_once_first,
         test_build_version_matches_manifest,

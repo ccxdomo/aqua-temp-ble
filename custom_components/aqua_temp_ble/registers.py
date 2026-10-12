@@ -10,7 +10,7 @@ editing one entry below + restarting Home Assistant.
 Spec 003 (specs/003-sensor-coverage/) extends this surface with the seven
 parameter families observed in the vendor app's parameter view
 (T/H/R/P/S/O/D — see FAMILIES below). The decode rules (sentinel set,
-plausibility guard, binary polarity) and the write allowlist
+plausibility guard) and the write allowlist
 (ensure_writable) are normative in the spec's contracts; the H/R/P installer
 families are deliberately NOT exposed as entities and never writable.
 
@@ -53,16 +53,12 @@ REG_FIRMWARE_FIRST = 48       # 48..51 [V] semantics
 REG_FIRMWARE_LAST = 51
 
 # --- [V] TO-VERIFY placeholders: set the register number after calibration
-# (docs/CALIBRATION.md §8, spec 003 calibration-contract.md). None = entity
+# (docs/CALIBRATION.md, spec 003 calibration-contract.md). None = entity
 # not created yet, so no unverified data can ever be displayed under a name.
 # Family codes refer to the vendor app's parameter view (FAMILIES below).
-REG_COMPRESSOR: int | None = None       # O01 Compressor, expected in 29..46
-REG_CIRCULATE_PUMP: int | None = None   # O02 Circulate pump, expected in 29..46
-REG_FOUR_WAY_VALVE: int | None = None   # O04 4-way valve, expected in 29..46
-REG_HIGH_FAN: int | None = None         # O03 High fan, expected in 29..46
-REG_HP_SWITCH: int | None = None        # S01 HP switch (diagnostic entity)
-REG_LP_SWITCH: int | None = None        # S02 LP switch (diagnostic entity)
-REG_FLOW_SWITCH: int | None = None      # S03 Flow switch (diagnostic entity)
+# Temperature placeholders only: the binary-sensor family (O/S switches)
+# was pruned in the spec-021 cleanup — their base registers were never
+# pinned and no pushed home exists, so no entity can ever be created.
 REG_SUCTION_TEMP: int | None = None     # T01 Suction, x10, signed
 REG_COIL_TEMP: int | None = None        # T04 Coil, x10, signed
 REG_EXHAUST_TEMP: int | None = None     # T06 Exhaust, x10, signed
@@ -101,14 +97,15 @@ TEMP_PLAUSIBLE_MAX_RAW = 1500   # -> +150.0 degC
 # --- calibration switches (flip after live verification, then restart HA) ---
 WRITE_ECHO_EXPECTED = True         # False if the device sends no FC10 echo (runbook step W)
 WRITE_MODE_SETPOINT_TOO = False    # True if the app also writes reg 19/20/21 on setpoint change (step S)
-BINARY_ACTIVE_WHEN_NONZERO = True  # [A] polarity default of the binary sensors
 REG_DATA_LITTLE_ENDIAN = False     # [A] register data byte order; flip if the probe
 # shows byte-swapped values (e.g. 0xF300 instead of 0x00F3 for 24.3 degC).
 
 # --- pushed plane (spec 013, data-model 013 §6) ---------------------------
-# The unit pushes four CRC-valid 45-register blocks spontaneously
-# (1001/1046/2001/2046 — [P, research 013 §2]) while NEVER answering our
-# byte-perfect base reads (att-accepted-silent, [P]). Block 2046-2090
+# The unit never pushes spontaneously: it ANSWERS every valid request
+# (FC03 read, block query, control write — law L2, spec 020) with a burst
+# of four CRC-valid 45-register blocks (1001/1046/2001/2046 — [P, research
+# 013 §2]) while NEVER answering our byte-perfect base reads
+# (att-accepted-silent, [P]). Block 2046-2090
 # carries the T-family live temperatures at 2046-2051: the T01 sentinel
 # anchor at 2046 (this unit's only absent sensor [P panel]) and the
 # live-proven 2047 (14.0 -> 14.5 degC between two pushes [P]). The
@@ -552,22 +549,8 @@ class RegDef:
     state_class: str | None = None
     icon: str | None = None
     diagnostic: bool = False
-    is_binary: bool = False
-    # --- spec 003 fields (appended; existing positional uses keep working) ---
-    active_when_nonzero: bool | None = None  # None -> BINARY_ACTIVE_WHEN_NONZERO
+    # --- spec 003 field (appended; existing positional uses keep working) ---
     family: str | None = None                # "T01", "S03", ... doc/probe tag
-
-
-def resolve_polarity(regdef: RegDef) -> bool:
-    """Per-RegDef binary polarity (FR-4/AC-8).
-
-    The entry's `active_when_nonzero` when set, else the global
-    BINARY_ACTIVE_WHEN_NONZERO default — so calibration can flip one S/O
-    entry without touching code or the global switch.
-    """
-    if regdef.active_when_nonzero is not None:
-        return regdef.active_when_nonzero
-    return BINARY_ACTIVE_WHEN_NONZERO
 
 
 SENSORS: tuple[RegDef, ...] = (
@@ -592,26 +575,9 @@ SENSORS: tuple[RegDef, ...] = (
            diagnostic=True),  # special-case: joins regs 48..51
 )
 
-BINARIES: tuple[RegDef, ...] = (
-    # O family (outputs) — labels panel-confirmed [P panel]; keys/icons are
-    # stable ids and stay unchanged.
-    RegDef("compressor", REG_COMPRESSOR, "Compressor", is_binary=True,
-           icon="mdi:engine", family="O01"),
-    RegDef("circulate_pump", REG_CIRCULATE_PUMP, "Circulate pump", is_binary=True,
-           icon="mdi:pump", family="O02"),
-    RegDef("high_fan", REG_HIGH_FAN, "High fan", is_binary=True,
-           icon="mdi:fan", family="O03"),
-    RegDef("four_way_valve", REG_FOUR_WAY_VALVE, "4-way valve", is_binary=True,
-           icon="mdi:swap-horizontal", family="O04"),
-    # S family (safety inputs) — DIAGNOSTIC entities; polarity stays None
-    # (global default) until the live calibration proves it (research.md §9).
-    RegDef("hp_switch", REG_HP_SWITCH, "HP switch", is_binary=True,
-           icon="mdi:alert-circle", diagnostic=True, family="S01"),
-    RegDef("lp_switch", REG_LP_SWITCH, "LP switch", is_binary=True,
-           icon="mdi:alert-circle", diagnostic=True, family="S02"),
-    RegDef("flow_switch", REG_FLOW_SWITCH, "Flow switch", is_binary=True,
-           icon="mdi:water", diagnostic=True, family="S03"),
-)
+# The binary-sensor registry (O/S switches) was pruned in the spec-021
+# cleanup: their base registers were never pinned and no pushed home
+# exists, so no binary entity can ever be created (spec 020 §5).
 
 # --- pushed-plane registries (spec 013 FR-5, data-model 013 §6) ----------
 # PUSHED_MIRRORS: the base-pinned keys with their pushed registers — the
@@ -670,15 +636,9 @@ KNOWN_LABELS: dict[int, str] = {
 
 # Placeholder labels ([V]) are only meaningful once their register is pinned
 # down; the family tag documents the panel-observed group (entity-contract.md
-# §2/§3).
+# §2/§3). Temperature placeholders only — the binary placeholders were
+# pruned with their registry (spec 021).
 for _reg, _label in (
-    (REG_COMPRESSOR, "Compressor [V] (O01)"),
-    (REG_CIRCULATE_PUMP, "Circulate pump [V] (O02)"),
-    (REG_HIGH_FAN, "High fan [V] (O03)"),
-    (REG_FOUR_WAY_VALVE, "4-way valve [V] (O04)"),
-    (REG_HP_SWITCH, "HP switch [V] (S01)"),
-    (REG_LP_SWITCH, "LP switch [V] (S02)"),
-    (REG_FLOW_SWITCH, "Flow switch [V] (S03)"),
     (REG_SUCTION_TEMP, "SuctionTemp [V] (T01)"),
     (REG_COIL_TEMP, "Coil [V] (T04)"),
     (REG_EXHAUST_TEMP, "Exhaust [V] (T06)"),
@@ -740,8 +700,9 @@ FAMILIES: dict[str, dict[str, str]] = {
     "P": {"meaning": "filtration program (P01-P04)",
           "exposure": "NONE — never writable from HA (spec 003 §6)"},
     "S": {"meaning": "safety inputs / switches (S01-S06)",
-          "exposure": "binary sensors, DIAGNOSTIC"},
-    "O": {"meaning": "outputs (O01-O04)", "exposure": "binary sensors"},
+          "exposure": "NONE — never pinned; no entity (binary surface pruned, spec 021)"},
+    "O": {"meaning": "outputs (O01-O04)",
+          "exposure": "NONE — never pinned; no entity (binary surface pruned, spec 021)"},
     "D": {"meaning": "digital states (D01-D06)",
           "exposure": "NONE — known but unmapped, no speculation"},
 }
@@ -754,7 +715,6 @@ def in_base_block(address: int) -> bool:
 
 def check_registry_integrity(
     sensors: tuple[RegDef, ...] = SENSORS,
-    binaries: tuple[RegDef, ...] = BINARIES,
     pushed_temps: dict[str, int] | None = None,
     pushed_control: dict[str, int | None] | None = None,
 ) -> None:
@@ -762,12 +722,11 @@ def check_registry_integrity(
 
     A mis-calibration must fail loudly at import instead of silently
     shadowing one label with another's register. Raises ValueError on:
-    - duplicate entity keys (across both registries);
-    - duplicate non-None addresses (across both registries);
+    - duplicate entity keys within the registry;
+    - duplicate non-None addresses within the registry;
     - a pinned address outside the polled base block 7..51 (high-block
       polling is not implemented — spec 003 §8; leave such a register
       unpinned until phase B);
-    - a binary RegDef carrying a temperature device_class (or vice versa);
     - a pushed-plane violation (spec 013 FR-7, contract 013 §7.1): a
       pushed key that is not a shipped TEMPERATURE entity key (H/R/P
       are never entities — spec 003 §6), a pushed address outside
@@ -790,34 +749,28 @@ def check_registry_integrity(
     """
     seen_keys: set[str] = set()
     seen_addresses: dict[int, str] = {}
-    for registry_name, registry in (("SENSORS", sensors), ("BINARIES", binaries)):
-        for regdef in registry:
-            if regdef.key in seen_keys:
-                raise ValueError(
-                    f"duplicate entity key {regdef.key!r} in the registries (FR-11)"
-                )
-            seen_keys.add(regdef.key)
-            if regdef.is_binary and regdef.device_class == "temperature":
-                raise ValueError(
-                    f"binary RegDef {regdef.key!r} must not carry a temperature "
-                    "device_class (FR-11)"
-                )
-            if regdef.address is None:
-                continue
-            if not in_base_block(regdef.address):
-                raise ValueError(
-                    f"{registry_name} entry {regdef.key!r} pins register "
-                    f"{regdef.address}, outside the polled base block "
-                    f"{BASE_BLOCK_START}..{BASE_BLOCK_START + BASE_BLOCK_COUNT - 1}; "
-                    "high-block polling is not implemented (spec 003 §8) — "
-                    "leave the register unpinned (docs/CALIBRATION.md §8.4)"
-                )
-            if regdef.address in seen_addresses:
-                raise ValueError(
-                    f"register {regdef.address} pinned for both "
-                    f"{seen_addresses[regdef.address]!r} and {regdef.key!r} (FR-11)"
-                )
-            seen_addresses[regdef.address] = regdef.key
+    for regdef in sensors:
+        if regdef.key in seen_keys:
+            raise ValueError(
+                f"duplicate entity key {regdef.key!r} in the registries (FR-11)"
+            )
+        seen_keys.add(regdef.key)
+        if regdef.address is None:
+            continue
+        if not in_base_block(regdef.address):
+            raise ValueError(
+                f"SENSORS entry {regdef.key!r} pins register "
+                f"{regdef.address}, outside the polled base block "
+                f"{BASE_BLOCK_START}..{BASE_BLOCK_START + BASE_BLOCK_COUNT - 1}; "
+                "high-block polling is not implemented (spec 003 §8) — "
+                "leave the register unpinned (docs/CALIBRATION.md §8.4)"
+            )
+        if regdef.address in seen_addresses:
+            raise ValueError(
+                f"register {regdef.address} pinned for both "
+                f"{seen_addresses[regdef.address]!r} and {regdef.key!r} (FR-11)"
+            )
+        seen_addresses[regdef.address] = regdef.key
 
     # --- pushed plane (spec 013 FR-7, contract 013 §7.1) -------------------
     pushed = dict(pushed_temps) if pushed_temps is not None else dict(PUSHED_TEMPS)

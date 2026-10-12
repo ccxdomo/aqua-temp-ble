@@ -7,8 +7,10 @@ unit tests can import this module outside HA.
 DOMAIN = "aqua_temp_ble"
 
 # Platform names — identical to homeassistant.const.Platform values. Plain
-# strings are used on purpose (see module docstring).
-PLATFORMS = ["climate", "sensor", "binary_sensor", "button"]
+# strings are used on purpose (see module docstring). The binary_sensor
+# platform was pruned in the spec-021 cleanup: its registers were never
+# pinned and no pushed home exists, so no binary entity can ever be created.
+PLATFORMS = ["climate", "sensor", "button"]
 
 # GATT characteristics — the vendor app's OWN buckets, read from the
 # disassembled Dart session manager (research 010 §1: the discovery
@@ -62,31 +64,15 @@ MAX_RX_BUFFER = 512
 DEFAULT_POLL_INTERVAL = 30  # seconds (options: 10..600)
 DEFAULT_TEMPERATURE_UNIT = "C"  # display only; wire is always x10 Celsius [P]
 
-# Spec 011 (the security probe + pairing ladder): the pairing budget and
-# the evidence-gated production lever (research 011 §10 / contract 011
-# §4). D-Bus Pair() can legitimately take seconds — PIN windows, then
-# service discovery after bonding — and bleak's own docs advise
-# generous timeouts when pairing; the config test bounds the WHOLE
-# ladder with it inside the unchanged 70 s flow budget (contract 011
-# §4 arithmetic). Never bounds a poll read (contract 009 §5 untouched).
-PAIR_TIMEOUT = 25.0
-# Evidence-gated option (spec 011 FR-6): OFF until a connection test
-# produced the `security probe: answered after pairing` line (the X2
-# proof, quickstart 011 §2) — enabling it without that evidence is a
-# contract violation (quickstart 011 discipline). With the option ON,
-# every establish requests pairing; with it OFF the production path is
-# byte-for-byte today's behavior (FR-7).
-DEFAULT_PAIR_ON_CONNECT = False
-# The establish kwarg that requests pairing across bleak generations
-# (spec 011 FR-3 rung B / FR-6): bleak-retry-connector's
-# establish_connection(pair=...) and bleak's BleakClient(pair=...)
-# (bleak >= 1.0 moved pairing into the constructor — research 011
-# §10.1); capability-checked with inspect.signature, never assumed.
-PAIR_ENABLE_PROP = "pair"
+# Spec 013 note: the pairing lever (pair_on_connect) and its constants were
+# pruned in the spec-021 cleanup — the production verdict
+# `att-accepted-silent` proved the unit's write pipe is open at the ATT
+# layer without bonding (law L5, spec 020), so the lever never earned its
+# evidence and the poll path never used it.
 
 # Spec 013 (the pushed-block harvest — the listen-only read plane): the
-# harvest listens for the unit's spontaneous block pushes and sends
-# NOTHING (contract 013 §1 — zero TX; nothing the firmware's
+# harvest listens for the unit's answer burst on the subscribed notify pipe
+# and sends NOTHING (contract 013 §1 — zero TX; nothing the firmware's
 # application-layer gate could drop). The 30 s window: all four
 # observed starts appeared within two consecutive 8 s request windows
 # (~16 s) in production (research 013 §5.4) — wide margin. The default

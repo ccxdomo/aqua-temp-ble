@@ -782,11 +782,11 @@ def test_probe_executed_reversible() -> None:
 
 
 def test_probe_connects_when_disconnected() -> None:
-    """FR-4 step 1: the probe connects (the normal path, threading the
-    pair_on_connect option like the poll path) when the client is not
-    already connected."""
+    """FR-4 step 1: the probe connects (a bare connect call — spec 021:
+    the pair_on_connect option was pruned with the pairing ladder) when
+    the client is not already connected."""
     client, result, _cap = _run_probe([0, 1, 0], is_connected=False)
-    assert client.connect_kwargs == {"pair": False}, client.connect_kwargs
+    assert client.connect_kwargs == {}, client.connect_kwargs
     assert result["verdict"] == "executed+reversible"
 
 

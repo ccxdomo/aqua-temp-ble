@@ -12,7 +12,7 @@
       },
       "device": {
         "title": "Select your heat pump",
-        "description": "Recognized Aqua Temp units are listed first, followed by other nearby Bluetooth devices (nearest first). If your unit is missing, put it in pairing mode — hold the panel button for about 5 seconds until the display shows \"bLE\" blinking once per second — then go back and scan again.",
+        "description": "Recognized Aqua Temp units are listed first, followed by other nearby Bluetooth devices (nearest first). If your unit is missing, make sure it is powered on and within range, close the vendor app completely (the unit accepts a single Bluetooth connection), then go back and scan again. As a last resort, some units can be made to advertise by holding the panel button for about 5 seconds until the display shows \"bLE\".",
         "data": {
           "address": "Device"
         }
@@ -23,7 +23,7 @@
       },
       "no_devices": {
         "title": "No Aqua Temp unit found",
-        "description": "No unconfigured Bluetooth device was seen nearby.\n\nTo make your heat pump visible:\n\n1. Put it in pairing mode: press and hold the panel button for about 5 seconds, until the display shows \"bLE\" blinking once per second.\n2. The unit then advertises under a name starting with \"BlueNRG\".\n3. Close the vendor app completely — the unit accepts only one Bluetooth connection.\n4. Stay within range, then scan again.\n\nIf no Bluetooth device appears at all, check that Home Assistant has a Bluetooth adapter (Settings → System → Hardware) or an active Bluetooth proxy.",
+        "description": "No unconfigured Bluetooth device was seen nearby.\n\nTo make your heat pump visible:\n\n1. Power it on and stay within range — the unit then advertises under a name starting with \"BlueNRG\".\n2. Close the vendor app completely — the unit accepts only one Bluetooth connection.\n3. Scan again.\n\nAs a last resort, some units can be made to advertise by holding the panel button for about 5 seconds until the display shows \"bLE\" (on some models this is the WiFi-provisioning gesture).\n\nIf no Bluetooth device appears at all, check that Home Assistant has a Bluetooth adapter (Settings → System → Hardware) or an active Bluetooth proxy.",
         "menu_options": {
           "scan": "Scan again",
           "manual": "Enter the Bluetooth address manually"
@@ -31,14 +31,14 @@
       },
       "manual": {
         "title": "Manual address",
-        "description": "Enter the Bluetooth address of the unit, e.g. `XX:XX:XX:XX:XX:XX`. Make sure the vendor app is closed first — the unit accepts a single connection.\n\nTip: if you do not know the address, put the unit in pairing mode (hold the panel button ~5 s until the display shows \"bLE\") and scan again.",
+        "description": "Enter the Bluetooth address of the unit, e.g. `XX:XX:XX:XX:XX:XX`. Make sure the vendor app is closed first — the unit accepts a single connection.\n\nTip: if you do not know the address, make sure the unit is powered on and within range, that the vendor app is closed, and scan again.",
         "data": {
           "address": "Bluetooth address"
         }
       },
       "test": {
         "title": "Testing the connection",
-        "description": "Connecting to {address} and reading the base register block (7-51). This can take about a minute."
+        "description": "Connecting to {address} and probing the unit's data report (connect, request, listen). This can take about a minute."
       },
       "confirm": {
         "title": "Name your device",
@@ -49,7 +49,7 @@
       },
       "confirm_push": {
         "title": "Name your device",
-        "description": "The connection test to {address} succeeded in push mode: the unit never answered our reads with base data, but it answers each poll request with a live-data report that the integration reads — push mode sends one read request per poll cycle and reads the unit's block answer.\n\nIn push mode, only monitoring entities are available — the temperature sensors appear once the captured values are confirmed below (or later in the options). The climate appears as a read-only mirror of the unit's state once the power/mode calibration is confirmed below (or later in the options); climate control (writes), the fault code and the firmware version stay absent until the unit answers requests again.\n\n- Power: {power}\n- Mode: {mode}\n- Inlet water temperature: {inlet}\n- Outlet water temperature: {outlet}\n- Ambient temperature: {ambient}\n\nChoose a friendly name for this heat pump:",
+        "description": "The connection test to {address} succeeded in push mode: the unit does not answer classic reads with register data, but it answers every request with a live-data report that the integration reads — one request per poll cycle.\n\nWhat you get in push mode:\n- The temperature sensors appear once the captured values are confirmed below (or later in the options).\n- The climate entity appears once the power/mode calibration is confirmed below (or later in the options): it shows OFF/HEAT following the unit's power state and the current heat target, read-only.\n- Power control (on/off) and setpoint control can be enabled later in the integration's options, each after running its built-in write probe (a diagnostic that verifies the write is executed and reversible).\n- The fault code and the firmware version are not available (no data home was identified in the report).\n\n- Power: {power}\n- Mode: {mode}\n- Inlet water temperature: {inlet}\n- Outlet water temperature: {outlet}\n- Ambient temperature: {ambient}\n\nChoose a friendly name for this heat pump:",
         "data": {
           "name": "Name",
           "push_temp_confirmed": "The captured temperatures match the app's parameter view (calibration verified)",
@@ -62,7 +62,7 @@
       "no_response": "The device accepted the connection but did not answer. Move closer and try again.",
       "crc_error": "The device replied, but the response was corrupted. Try again.",
       "invalid_address": "Invalid Bluetooth address format (expected XX:XX:XX:XX:XX:XX).",
-      "not_found": "Home Assistant can no longer see this device nearby. Put the unit in pairing mode (hold the panel button for about 5 seconds until the display shows \"bLE\"), make sure it is powered on, then scan again."
+      "not_found": "Home Assistant can no longer see this device nearby. Make sure the unit is powered on and within range, close the vendor app (the unit accepts a single Bluetooth connection), then scan again."
     },
     "abort": {
       "already_configured": "This heat pump is already configured.",
@@ -76,7 +76,6 @@
         "data": {
           "poll_interval": "Polling interval (seconds)",
           "temperature_unit": "Display temperature unit",
-          "pair_on_connect": "Pair on connect (evidence-gated)",
           "push_temp_confirmed": "The captured temperatures match the app's parameter view (calibration verified)",
           "push_control_confirmed": "The captured power/mode registers match the app's display (diff-toggle calibration verified)",
           "write_control": "Allow power control (write)",
@@ -92,7 +91,7 @@
   "services": {
     "probe_registers": {
       "name": "Probe registers",
-      "description": "Reads a raw register block over BLE and logs every register (raw value, hex, /10) for calibration. Close the vendor app first.",
+      "description": "Reads the heat pump over BLE and logs every register (raw value, hex, /10) for calibration. The default block triggers the unit's data report and logs every captured block. Close the vendor app first.",
       "fields": {
         "device_id": {
           "name": "Device",
@@ -100,7 +99,7 @@
         },
         "block": {
           "name": "Block",
-          "description": "Register block to read. High blocks are experimental."
+          "description": "Register report to read. \"All blocks\" triggers the unit's data report; the numbered blocks query one block of the answer burst directly."
         }
       }
     },

@@ -1,350 +1,251 @@
-# Calibration runbook — closing the last 20% of the register map
+# Calibration & verification runbook — the push world
 
-The label→register map was recovered from static analysis of the vendor APK
-(FINDINGS.md §11.4/§12) and is ~80% certain. The indices are built at runtime
-inside the app, so the remaining items **cannot be known without one live
-session with the unit**. This runbook converts every `[V]`/`[A]` item into a
-verified fact; every correction lands in
-`custom_components/aqua_temp_ble/registers.py` **only** — edit one entry and
-restart Home Assistant.
+This runbook explains how to verify (and, where needed, correct) the
+register mapping **live on a unit**, and how to open the integration's
+four owner-verified gates. The authoritative, current reference is
+[`specs/020-integration-reference/`](../specs/020-integration-reference/)
+— start with its `quickstart.md` §4 (the calibration + verification
+sequence performed and recorded on the production unit on 2026-10-12)
+and its `data-model.md` (the complete register → quantity map).
 
-Status legend: **[P]** proven (static), **[A]** assumed default,
-**[V]** to-verify live.
+Status legend: **[P]** proven (live on the production unit, or
+byte-exact from the vendor APK disassembly), **[A]** assumed default,
+**[V]** to-verify on other units.
 
-## 0. Prerequisites
+## 0. The world you are calibrating for
 
-- The unit paired once with the vendor app (hold the panel button ~5 s until
-  the display shows `bLE` blinking 1×/s).
+This firmware (the production unit, BlueNRG module) **never answers the
+classic Modbus base read** with register data (law L1, spec 020) and
+**never pushes spontaneously** — it *answers every request* with a burst
+of four 45-register blocks (1001/1046/2001/2046; law L2). The integration
+reads that world (trigger + listen) and the calibration runbook below is
+written for it.
+
+Prerequisites:
+
+- **No pairing is needed** — the write pipe opens at the ATT layer with
+  no bond (the `att-accepted-silent` verdict [P]). The old "put the unit
+  in pairing mode (bLE)" advice is wrong for this unit: that gesture is
+  the WiFi-provisioning mode on some models, at best a last resort to
+  make the unit advertise.
 - **Close the vendor app completely** — the unit accepts a single BLE
   connection. HA will politely wait and show unavailable otherwise.
 - Enable file logging if needed:
   `logger.set_level` → `custom_components.aqua_temp_ble: debug`
-  (`homeassistant.log` gets the probe output).
+  (`home-assistant.log` gets the probe output).
 
-## The probe surfaces
+## 1. The probe surfaces
 
-- **Button** `Probe registers` (diagnostic entity on the device) — reads the
-  base block (registers 7..51) and logs it.
-- **Service** `aqua_temp_ble.probe_registers` — also reads the experimental
-  high blocks; optionally returns the values as a service response:
+- **Button** `Probe registers` (diagnostic entity) — triggers the unit's
+  data report and logs **every captured register** with labels (on
+  push-mode entries: one trigger read, the burst lands, the whole store
+  is dumped — the classic base read this unit never serves was rerouted
+  in the spec-021 cleanup).
+- **Service** `aqua_temp_ble.probe_registers` — same trigger + dump with
+  `block: base`; a numbered block queries one block of the answer burst
+  directly (these answer: 1001/1046/2001/2046); optionally returns the
+  values as a service response:
 
 ```yaml
 service: aqua_temp_ble.probe_registers
 data:
-  block: base        # base | 1001 | 1046 | 1091 | 1136 | 2001 | 2046
+  block: base        # base | 1001 | 1046 | 2001 | 2046
 ```
 
 Log format (one line per register — RAW is the signed int16, hex is the
 unsigned 16-bit view):
 
 ```
-AquaTemp probe: XX:XX:XX:XX:XX:XX block=base (FC03 start=7 count=45) len=95 CRC=OK
-  reg   7 =      0 (0x0000) | /10 =     0.0
-  reg   8 =      1 (0x0001) | /10 =     0.1  # Power [P]
-  reg  13 =      1 (0x0001) | /10 =     0.1  # Mode [P]
-  reg  26 =    325 (0x0145) | /10 =    32.5  # InletWaterTemp [P]
+AquaTemp probe: XX:XX:XX:XX:XX:XX block=2001 (pushed capture, start=2001 qty=45 len=99 count=2) CRC=OK
+  reg 2001 =      0 (0x0000) | /10 =     0.0
+  reg 2011 =      1 (0x0001) | /10 =     0.1  # Power (pushed control) [P owner diff 2026-10-12]
   ...
 ```
 
 Standalone (no HA): `python3 tools/smoke_client.py XX:XX:XX:XX:XX:XX`
-(read-only, requires only `pip install bleak`).
+(read-only trigger + store dump, requires only `pip install bleak`).
 
-## 1. Live read
+## 2. The verification sequence (the four gates)
 
-Press the probe button. Expect the `base` block log. If nothing arrives
-within `REQUEST_TIMEOUT` (8 s) → check the phone app is disconnected
-(single-connection device), raise the timeout in `const.py`, retry.
-This one step validates transport, fragmentation handling and endianness.
+Every step below was performed and recorded on the production unit
+(2026-10-12). On a new unit, redo them in order — each step's evidence
+opens one gate:
 
-## 2. Endianness
+### 2.1 Temperatures → `push_temp_confirmed` [P done]
 
-Compare a known temperature (e.g. the app shows inlet 24.3 °C):
-`reg 26 = 243 (0x00F3)` → big-endian confirmed (default). If you see
-`0xF300` instead, set in `registers.py`:
+1. Open the vendor app's parameter view (see *Extra aid* below) and
+   photograph the T-family page; note the time.
+2. Kill the app, run one connection test (or one poll), then press
+   **Probe registers** — the T-block dump (start 2046) prints
+   `2046=… 2047=… … 2051=…`.
+3. Compare with the photo: values must match (a 0.1-0.2 °C drift between
+   the photo and the read is fine; a different *pattern* is not).
+4. Match → check **push_temp_confirmed** (confirm step or options) →
+   the sensors show live values. Mismatch → correct the ONE line in
+   `registers.PUSHED_TEMPS` (a permuted T-window is a one-line edit) and
+   re-verify. Never check the box on a mismatch.
 
-```python
-REG_DATA_LITTLE_ENDIAN = True   # one constant; the parse flips
+### 2.2 Power/mode display → `push_control_confirmed` [P done]
+
+1. With the app open, toggle the app's power slide once, then back.
+2. Capture before/after (probe or the `block push captured` log lines)
+   and DIFF: register **2011** must flip 0↔1 with the slide; **2019**
+   moves with the mode flow (0/4 observed). Reversibility is the pinning
+   rule — a one-way change pins nothing.
+3. Match the app's display → check **push_control_confirmed** → the
+   climate appears: `hvac_mode` follows power alone (OFF/HEAT —
+   heat-only unit, spec 018), the target shows the setpoint mirror.
+   Live alternative: the `push_stream` diagnostic's `control_candidates`
+   attribute exposes the candidate raws with their evidence tags.
+
+### 2.3 Power control → `write_control` [P done]
+
+Unit OFF, vendor app closed → press **Power write probe** (or call
+`aqua_temp_ble.power_write_probe`). The probe writes the vendor's own
+ON frame, verifies mirror 2011 follows, writes OFF, verifies the revert,
+and logs ONE verdict line at WARNING. Expected:
+
+```
+power write probe: EXECUTED + REVERSIBLE (mirror 2011 followed 0→1→0) — write char …
 ```
 
-## 3. Mode map (step M)
+That verdict is your evidence → check **write_control** in the options →
+the climate's Heat/Off buttons now really start and stop the pump. Any
+other verdict: leave the gate closed and read the verdict line — it
+always names the state and the remediation. The probe only writes the
+two disassembly-pinned frames and always aims to leave the unit OFF.
 
-In the vendor app, switch mode Cool → Heat → Auto, pressing probe each
-time; note reg 13's raw value for each. Update in `registers.py`:
+### 2.4 Setpoint control → `write_setpoint` [P done]
 
-```python
-MODE_VALUE_TO_NAME = {0: "cool", 1: "heat", 2: "auto"}   # adjust order if needed
+Press **Setpoint write probe** (or call
+`aqua_temp_ble.setpoint_write_probe`). Phase A writes the register's
+OWN current value (a true no-op) and verifies the whole 1046-block is
+unchanged (the neighbor alarm); phase B dips the heat setpoint −0.5 °C,
+verifies mirror 1046 follows, reverts, verifies again. Physical effect:
+the pool's heat target dips half a degree for ~2 minutes. Expected:
+
+```
+setpoint write probe: EXECUTED + REVERSIBLE (mirror 1046 followed <S>→<T>→<S>) — write char …
 ```
 
-Current order is the [A] default: the sequential register allocation follows
-Cool→Heat→Auto (regs 19/20/21), so the Mode enum likely shares that order.
+That verdict is your evidence → check **write_setpoint** → the target
+slider really sets the heat setpoint (10.0-40.0 °C, 0.5 steps; requests
+outside the range or off the step are refused loudly, never rounded).
 
-## 4. Binary registers
+### 2.5 The setpoint home (why 1046)
 
-While the app Status page shows Compressor / Circulate pump / 4-way valve:
+The panel-diff calibration (2026-10-12): changing the setpoint at the
+panel moved the first register of the pushed 1046-block (290 → 300 for
++1.0 °C) — register **1046** is the heat setpoint [P]. The write target
+and the read home coincide (a parameter register the vendor app itself
+reads and writes). The ladder candidates around it (1049/1050/1051/
+1054/1068) are bounds/other-mode homes and installer thresholds —
+**never writable**.
 
-- run the heat pump: compressor + pump active → probe, note which regs
-  29..46 are `1`
-- switch heat ↔ cool to flip the 4-way valve → probe again
+## 3. What is NOT available (by design)
 
-Set in `registers.py` (None = entity not created yet):
+- **The mode** is not pilotable: this unit is heat-only, the vendor app
+  itself locks the mode, and the vendor's mode write is a pair write
+  (1012+1013) whose 1013 value is unpinned — writing it would clobber
+  an unknown register. The climate exposes OFF/HEAT only (both pure
+  power writes).
+- **Fault code & firmware**: no home was ever identified in the pushed
+  blocks — no entity is created (never guessed).
+- **Binary sensors** (compressor/pump/fan/valve/switches): their base
+  registers were never pinned and no pushed home exists — the surface
+  was pruned in the spec-021 cleanup.
 
-```python
-REG_COMPRESSOR = 29        # example — replace with the verified value
-REG_CIRCULATE_PUMP = 30
-REG_FOUR_WAY_VALVE = 31
-```
+## 4. Classic-plane runbook (other-firmware units ONLY)
 
-Verify polarity; if inverted set `BINARY_ACTIVE_WHEN_NONZERO = False`.
-Restart HA → the three binary_sensor entities appear.
+Kept for the dormant classic plane (spec 020 §5: hypothetical units that
+would answer the classic FC03 base read 7-51; unreachable on this
+machine). **On the production unit every step below is moot — the base
+block never answers.**
 
-## 5. Write frames (step W) — two options, cheapest first
+- **Endianness**: compare a known temperature (app shows inlet 24.3 °C):
+  `reg 26 = 243 (0x00F3)` → big-endian confirmed (default). If you see
+  `0xF300` instead, set `REG_DATA_LITTLE_ENDIAN = True` in
+  `registers.py` (one constant; the parse flips).
+- **Mode map** (reg 13, [A] default `{0: cool, 1: heat, 2: auto}`):
+  switch the app's mode Cool → Heat → Auto, probing each time; correct
+  `registers.MODE_VALUE_TO_NAME` if the order differs.
+- **Write frames**: capture the app's own writes with
+  `adb logcat | grep -aE "address|6310|指令"` on a paired phone — the
+  app logs every outgoing frame in cleartext. This pins the write
+  layout (the 16-bit H1 shape ships as the safe default) and the real
+  addresses. If no FC10 echo ever arrives on ff02, set
+  `WRITE_ECHO_EXPECTED = False` (writes become fire-and-forget).
+- **Firmware & fault** (regs 47-51): note reg 47 with a fault active vs
+  none (0 = OK assumed [A]); probe the hex of 48-51 and adjust the
+  join format if needed.
 
-### a. logcat capture (zero risk)
+## 5. The seven families (T/H/R/P/S/O/D)
 
-With the vendor app connected to the unit, run on a paired Android phone:
-
-```bash
-adb logcat -c
-adb logcat | grep -aE "address|6310|指令"
-```
-
-then toggle power / mode / setpoint **in the app** — it logs every outgoing
-frame in cleartext (`日志:指令 6310 …`) and the target register
-(`参数选择修改 ----- index = X address = Y`). Paste the observed frames in
-your notes. This pins:
-
-- the **write layout**: H1 16-bit (`…0001 02 value`) vs H2 32-bit
-  (`…0002 04 value…`) — the integration ships H1 (safe default: an
-  under-length frame can at worst be ignored, never clobber a neighbour)
-- the real register addresses for power/mode/setpoint
-- whether the app also writes the per-mode setpoint (regs 19/20/21) on a
-  setpoint change → flip `WRITE_MODE_SETPOINT_TOO = True`
-
-### b. HA write test
-
-With the device already ON (so a reg 8 write is idempotent):
-
-1. HA: turn_on the climate → probe → confirm `reg 8 == 1` and nothing else moved.
-2. One real mode switch → probe → confirm reg 13 only.
-3. One setpoint change → probe → check whether reg 19/20/21 mirror it.
-
-If no FC10 echo ever arrives on ff02 (write errors in HA), set:
-
-```python
-WRITE_ECHO_EXPECTED = False   # writes become fire-and-forget
-```
-
-## 6. Firmware & fault
-
-- Probe hex of regs 48-51: decimal groups (`2.2.1.2040`)? ASCII? Adjust the
-  `firmware` formatting in `sensor.py` once.
-- Note reg 47 with a fault active vs none (0 = OK assumed [A]).
-
-## 7. High blocks (optional, phase 2)
-
-Probe blocks `1001`…`2046` to map the Status/Control parameter pages
-(5×45 + 2×45 registers). Expected homes: Suction/Coil/Exhaust Temp., fans,
-switches (1001-1180), control parameters like Cooling/Heating/Auto Set,
-Defrost, EEV Mode (2001-2090). Response shapes are unknown [V] — the probe
-logs raw hex and never crashes on odd answers. **No writes to 2001-2090.**
-
-## 8. Spec 003 — the seven families (T/H/R/P/S/O/D)
-
-The vendor app's parameter view (debug password `66`, see the aid below)
-exposes the complete parameter table in seven families. The panel
-observation (2026-10, `specs/003-sensor-coverage/data-model.md`) proves the
-labels and displayed values — **never the numeric register indices**. New
-entities appear **only** after pinning; never guess an index
-(`address=None` ⇒ no entity).
+The vendor app's parameter view (debug password `66`, see below) shows
+the complete parameter table in seven families. The panel observation
+(proven 2026-10) fixes the labels and displayed values — **never the
+numeric register indices**.
 
 | Family | Meaning | HA exposure |
 |---|---|---|
-| T (T01–T06) | live temperatures | temperature sensors — 26/27/28 pinned [P]; T01/T04/T06 placeholders |
+| T (T01–T06) | live temperatures | temperature sensors (pushed mirrors 2046-2051) |
 | H (H01–H06, H70–H72) | machine settings | **none — never writable from HA** |
 | R (R01–R11) | regulation thresholds (installer) | **none — never writable from HA** |
 | P (P01–P04) | filtration program | **none — never writable from HA** |
-| S (S01–S06) | safety inputs | binary sensors, DIAGNOSTIC (placeholders) |
-| O (O01–O04) | outputs | binary sensors (placeholders) |
+| S (S01–S06) | safety inputs | **none — never pinned; surface pruned (spec 021)** |
+| O (O01–O04) | outputs | **none — never pinned; surface pruned (spec 021)** |
 | D (D01–D06) | digital states | **none** — page not photographed, no speculation |
 
 > 🔒 **Read-only policy for H/R/P (spec 003 §6).** H04 Exhaust Temp. High
 > (105.0 °C) is a **safety shutdown threshold**; R01–R11 are installer
 > regulation limits; P01–P04 drive the filtration program. They are
 > **never writable from Home Assistant**: no entity, no service, and the
-> single write funnel (`coordinator.async_write_register`) starts with
-> `registers.ensure_writable()`, which raises `ValueError` for anything
-> outside {8, 13, 14} (+19/20/21 behind the default-off
-> `WRITE_MODE_SETPOINT_TOO` switch). Record their addresses in your notes if
-> the probe reveals them — do not pin them as entities, never write them.
+> single write funnel (`registers.ensure_writable`) refuses anything
+> outside the proven allowlists (power 1011 with 0/1; setpoint 1046 with
+> 100-400 step 5; the classic {8, 13, 14} plane stays dormant). Record
+> their addresses in your notes if a probe reveals them — never write
+> them.
 
-### 8.1 Panel worksheet (calibration anchors)
+### 5.1 Panel worksheet (comparison anchors)
 
 With the vendor app open in the parameter view, photograph every family
-page (including **D** — still missing) and note the time; the unit state
-must match during the probe. Idle-state predicted raws (displayed ×10 [A]):
-
-| Member | Displayed | Predicted raw (hex) |
-|---|---|---|
-| T01 Suction | 3276.5 (absent) | `32765 / 0x7FFD` **or** `−9990 / 0xD8FA` — whichever appears is this register's sentinel convention |
-| T02 Inlet | 17.0 | `170 / 0x00AA` (expect reg 26) |
-| T03 Outlet | 19.5 | `195 / 0x00C3` (expect reg 27) |
-| T04 Coil | 19.5 | `195 / 0x00C3` (the other one) |
-| T05 Ambient | 18.0 | `180 / 0x00B4` (expect reg 28) |
-| T06 Exhaust | 17.5 | `175 / 0x00AF` |
-| H03 Comp. stop | 0.0 | `0` (mapping note only) |
-| H04 Exhaust high | 105.0 | `1050 / 0x041A` (mapping note only) |
-| S01 / S02 / S03 | OFF / OFF / ON | `0` / `0` / `1` [A] |
-| O01–O04 | all OFF | `0` [A] |
-| P02 / P03 / P04 | 0 / 3 / 0 | `0` / `3` / `0` [A] |
-| R01–R11 | 0.5–40.0 range | `5–400` (mapping note only) |
-
-Temperatures drift — re-photograph the T page at probe time if the session
-is not back-to-back (a 0.1–0.2 °C drift is fine; a different *pattern* is
-not).
-
-### 8.2 Pinning the T family
-
-Probe `base` + all six high blocks within a few minutes of the photos
-(§1/§7 above), then:
-
-1. **Confirm the scale + existing identities**: regs 26/27/28 must read
-   `170 / 195 / 180` if the panel showed T02=17.0, T03=19.5, T05=18.0 at
-   probe time → T02≡26, T03≡27, T05≡28 confirmed. Byte-swapped
-   (`0xAA00`-style)? → step 2 (endianness) first.
-2. **T06 Exhaust**: look for raw `175`. Prefer a base-block (7..51) match —
-   entities are only created for the polled base block (FR-7).
-3. **T04 Coil**: the remaining `195` (T03 is reg 27). Disambiguate with a
-   state change: probe again while heating — coil and outlet diverge.
-4. **T01 Suction**: look for the sentinel — `32765` (`0x7FFD`) or `−9990`
-   (`0xD8FA`). Record **which convention** this register uses. The suction
-   sensor is absent on this unit: the entity will honestly show `unknown` —
-   HA never displays 3276.5 °C.
-5. Pin in `registers.py` (new constants next to the existing placeholders):
-
-```python
-REG_SUCTION_TEMP = <addr>   # T01
-REG_COIL_TEMP = <addr>      # T04
-REG_EXHAUST_TEMP = <addr>   # T06
-```
-
-### 8.3 Pinning the S and O families — the two-state method
-
-One idle dump is **not** enough (~25 unmapped base registers read 0):
-
-1. **Idle probe**: O candidates = registers reading `0`; S01/S02
-   candidates = `0`; S03 candidates = `1` [A].
-2. **Heating probe (required)**: probe again with the compressor + pump +
-   fan running. Registers flipping `0 → nonzero` map to the O family;
-   correlate fan vs pump vs 4-way valve (the valve changes only on a mode
-   change, if ever). A flow-switch candidate flips when pool circulation
-   stops/starts.
-3. **Polarity**: set each entry's `active_when_nonzero` so the entity
-   matches the **panel** OFF/ON text in both observed states (S03 Flow
-   reading ON at idle is expected — keep the panel semantics, not a guess).
-4. Pin in `registers.py` (+ per-entry polarity where inverted):
-
-```python
-REG_COMPRESSOR = <addr>      # O01
-REG_CIRCULATE_PUMP = <addr>  # O02
-REG_HIGH_FAN = <addr>        # O03
-REG_FOUR_WAY_VALVE = <addr>  # O04
-REG_HP_SWITCH = <addr>       # S01
-REG_LP_SWITCH = <addr>       # S02
-REG_FLOW_SWITCH = <addr>     # S03
-```
-
-### 8.4 Restart & verify
-
-Restart HA. New entities appear for every member pinned inside 7..51
-(exact names per `specs/003-sensor-coverage/contracts/entity-contract.md`).
-A member found **only in a high block** stays absent — high-block polling
-is **phase B**, a future spec; note the block in your runbook notes and
-leave the register unpinned (pinning it fails the import-time integrity
-check loudly). Cross-check each new entity against a **fresh panel photo**:
-values within one poll interval, sentinels shown as `unknown` (never
-3276.5), S/O states matching the panel text.
-
-Failure modes: two labels pinned to one register → the import-time
-integrity check raises at startup (re-run the disambiguation); a predicted
-raw matching many registers → use the two-state method, never pin on a
-single coincidence; binary states inverted vs the panel → flip that
-entry's `active_when_nonzero`, no code change.
-
-## 9. Spec 015 — the control diff (power / mode, push mode)
-
-The pushed block `2001-2045` carries the unit's control state. Its homes
-were pinned by the owner's **toggle-and-diff calibration** (2026-10-12,
-`specs/015-control-data/research.md` §8.1):
-
-| quantity | home | the diff evidence | status |
-|---|---|---|---|
-| Power (read) | **2011** | 0 (off) → 1 (on) → 0 (off) across the app's power slide + revert | [P] |
-| Mode (read) | **2019** | 0 → 4 → 0 across the same toggle | [P] |
-| Setpoint | none identified | no setpoint-shaped value in any push; the 1046-ladder candidates (1046/1049/1051/1055/1068) stay unconfirmed | [V] |
-
-The mode VALUE mapping (`4` → heat) is an **assumption** — this unit is
-heat-only, so "heat" is the only mode it can run; an unmapped value
-renders `unknown` and logs one warning.
-
-### 9.1 Re-running the diff (verify the mapping)
-
-1. **Baseline**: note the app's displayed on/off state, run one connection
-   test, save the four `block push captured` WARNING hex lines.
-2. **Toggle ONE control** in the app (power slide) → capture again →
-   DIFF the hex: register **2011** must flip 0↔1, **2019** 0↔4.
-3. **Toggle back** → capture → the registers must follow the revert
-   (reversibility is the pinning rule — a one-way change pins nothing).
-4. Watch it live instead of a terminal: the `push_stream` diagnostic
-   sensor exposes the candidate raws in its `control_candidates`
-   attribute (2011/2019/2012 + the 1046-ladder five), each with its
-   evidence tag. The `probe_registers` service (block `2001`) prints
-   the same registers with labels.
-
-### 9.2 Opening the gate (the read-only climate)
-
-Check **push_control_confirmed** in the integration's options (push
-entries only — or at the setup confirm step), then **reload** the
-integration. `climate.aqua_temp_heat_pump` appears as **READ-ONLY**:
-
-- `hvac_mode` reflects the unit's state (off / heat from power+mode);
-- `hvac_action` is `off` when powered down, `unknown` when running
-  (the compressor state is not calibrated — no optimistic activity);
-- **no target temperature** — no setpoint home is identified;
-- **no controls at all**: writes (set_hvac_mode, set_temperature, turn_on,
-  turn_off) are refused with a clear error. A read-diff proves what a
-  register REFLECTS, never what writing it controls — and the write
-  allowlist (`ensure_writable`: {8, 13, 14} + 19-21 behind the switch) is
-  unchanged by this spec.
-
-A mismatch → uncheck the option, re-run the diff, and correct the ONE
-line in `registers.PUSHED_CONTROL` (a mis-pin is recoverable, never
-masked). Until the box is checked, nothing control-related is created or
-displayed — the shipped default is the honest closed gate.
+page and note the time; the unit state must match during the probe. The
+pushed T-family raws (displayed ×10): T02 Inlet `170/0x00AA`-style
+values, the absent T01 → `32765/0x7FFD` (or `−9990/0xD8FA`), H04 →
+`1050/0x041A`, etc. Compare the probe dump against the photos — the
+match opens the temperature gate (§2.1). Temperatures drift —
+re-photograph the T page at probe time if the session is not
+back-to-back.
 
 ## Extra aid: debug password "66"
 
-In the vendor app, entering **`66`** in the settings/parameter view switches
-the UI from *status parameters* to the **control parameters** view
-(`查看控制参数` vs `查看状态参数`), exposing raw values including `H70/H71/H72`.
-This gives direct read access to raw registers from inside the official app,
-without any instrumentation — handy to correlate with probe logs.
+In the vendor app, entering **`66`** in the settings/parameter view
+switches the UI from *status parameters* to the **control parameters**
+view (`查看控制参数` vs `查看状态参数`), exposing raw values including
+`H70/H71/H72`. This gives direct read access to raw values from inside
+the official app, without any instrumentation — handy to correlate with
+probe logs.
 
 ## Appendix: verified frames (regression vectors)
-
-| Purpose | Frame (hex) |
-|---|---|
-| Read base block 7..51 | `63030007002D3C54` |
-| Query block 1001-1045 | `631003E9002DD9E6` |
-| Query block 1046-1090 | `63100416002DE8A2` |
-| Query block 1091-1135 | `63100443002DF8B2` |
-| Query block 1136-1180 | `63100470002D08BD` |
-| Query block 2001-2045 | `631007D1002D591B` |
-| Query block 2046-2090 | `631007FE002D68D2` |
-| Write reg 8 = 1 (power on) | `631000080001020001D7BA` |
-| Write reg 8 = 0 (power off) | `631000080001020000167A` |
-| Write reg 13 = 0/1/2 (mode) | `6310000D0001020000162F` / `…01D7EF` / `…0297EE` |
-| Write reg 14 = 325 (32.5 °C) | `6310000E0001020145D67F` |
 
 All of these are asserted byte-exact in `tests/test_modbus.py` and
 `modbus.py`'s built-in self-test
 (`python3 custom_components/aqua_temp_ble/modbus.py`).
+
+| Purpose | Frame (hex) |
+|---|---|
+| Base read 7..51 — the poll TRIGGER (the unit answers it with the block burst, never with base data) | `63030007002D3C54` |
+| Query block 1001-1045 | `631003E9002DD9E6` |
+| Query block 1046-1090 | `63100416002DE8A2` |
+| Query block 2001-2045 | `631007D1002D591B` |
+| Query block 2046-2090 | `631007FE002D68D2` |
+| Power ON (write 1011 = 1) | `631003F30001020001F131` |
+| Power OFF (write 1011 = 0) | `631003F3000102000030F1` |
+| Setpoint 30.0 °C (write 1046 = 300) | `63100416000102012C5049` |
+| Setpoint 29.5 °C (write 1046 = 295) | `631004160001020127118E` |
+
+The classic-plane write vectors (reg 8/13/14, recovered from the APK and
+pinned by the modbus self-test) remain in `tests/test_modbus.py` as
+regression vectors for the dormant classic plane — they are unreachable
+on this unit (the base block never answers, and the control plane writes
+1011/1046 only).

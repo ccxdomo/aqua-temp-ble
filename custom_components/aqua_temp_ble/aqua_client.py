@@ -37,9 +37,7 @@ Standalone use (outside Home Assistant, e.g. tools/smoke_client.py):
 from __future__ import annotations
 
 import asyncio
-import inspect
 import logging
-import re
 import struct
 import time
 from collections import Counter, namedtuple
@@ -133,8 +131,10 @@ def _now() -> float:
 
 
 # --------------------------------------------------------------------------
-# Spec 011 — the security-probe seam and the pairing ladder (research 011
-# §2.1/§10, contract 011 §5). An ATT Write Command has NO error channel
+# Spec 011 — the security-probe seam (research 011 §2.1, contract 011
+# §5.1; the pairing ladder was pruned in the spec-021 cleanup — the
+# production verdict att-accepted-silent proved the unit needs NO
+# bond, law L5 spec 020). An ATT Write Command has NO error channel
 # (Core Spec 5.4 Part F §3.4.9: response "none", ATT_ERROR_RSP "No") — a
 # server that refuses our write cannot say so (research 011 §2.1 [P]). The
 # acknowledged twin (Write Request) MUST be answered, and the answer
@@ -192,92 +192,12 @@ def _classify_ack_write_failure(exc_chain_text: str) -> str:
     return "local-failure"
 
 
-def _pairing_already_bonded(chain_lower: str) -> bool:
-    """BlueZ AlreadyExists / already-paired chains (contract 011 §5.2):
-    the X3 fast no-op — a Pair() against an existing bond."""
-    compact = chain_lower.replace(" ", "")
-    return (
-        "alreadyexists" in compact
-        or "alreadypaired" in compact
-        or "already bonded" in chain_lower
-    )
-
-
-def _pairing_agent_signature(chain: str) -> bool:
-    """True for the missing-agent Pair() failure signatures (contract
-    011 §5.2 row 1, research 011 §10.2/§14.6): 'no … agent' chains and
-    the org.bluez.Error.Failed + agent-mention pattern (the documented
-    failure of an agent-less bluetoothd, research 011 §3.3).
-    Authentication* chains are NOT agent signatures — they carry the
-    bLE choreography guidance instead (contract 011 §5.2)."""
-    lowered = chain.lower()
-    if re.search(r"no [a-z0-9_ ]*agent", lowered):
-        return True
-    return "agent" in lowered and "org.bluez.error.failed" in lowered
-
-
-def _pairing_ble_guidance(chain: str) -> str:
-    """The bLE choreography hint for authentication failures (contract
-    011 §5.2 action): the unit likely wants its pairing mode — hold the
-    panel button 5 s until the display shows 'bLE' blinking (quickstart
-    011 §2). Appended to the failure line so the operator's pasted log
-    carries the next step."""
-    lowered = chain.lower()
-    if any(
-        needle in lowered
-        for needle in (
-            "authenticationfailed",
-            "authenticationrejected",
-            "authenticationtimeout",
-            "authentication failed",
-            "authentication rejected",
-            "authentication timeout",
-        )
-    ):
-        return " — retry while the panel shows bLE (hold the panel button 5 s)"
-    return ""
-
-
-def _kwargs_accepts(func: Any, name: str) -> bool:
-    """True when func accepts a `name` parameter (spec 011 FR-3/FR-6
-    capability check, research 011 §10.1: the pair plumbing moved across
-    bleak/brc API generations, so it is detected with
-    inspect.signature, never assumed). An explicit parameter or a
-    **kwargs sink both count; a broken signature is a polite False."""
-    try:
-        parameters = inspect.signature(func).parameters
-    except (TypeError, ValueError):
-        return False
-    if name in parameters:
-        return True
-    return any(
-        param.kind is inspect.Parameter.VAR_KEYWORD
-        for param in parameters.values()
-    )
-
-
-def _package_version(name: str) -> str:
-    """Installed package version for the ladder's log lines (contract
-    011 §3.3), 'unknown' when absent or unresolvable — guarded, never
-    raises (the version is context, not a gate)."""
-    try:
-        from importlib import metadata
-
-        return metadata.version(name)
-    except Exception:  # noqa: BLE001 — PackageNotFoundError et al.
-        return "unknown"
-
-
-def _dbus_fast_message() -> Any | None:
-    """The dbus_fast Message class, or None when the library is absent
-    (spec 011 FR-3 rung C / the bond-state read — guarded import, never
-    a requirement; AC-8; test seam for the 011 suite)."""
-    try:
-        from dbus_fast import Message
-
-        return Message
-    except ImportError:
-        return None
+# Spec 021: the pairing helpers (_pairing_already_bonded,
+# _pairing_agent_signature, _pairing_ble_guidance, _kwargs_accepts,
+# _package_version, _dbus_fast_message) were removed with the pairing
+# ladder — the classifier above is the surviving security-probe seam;
+# the production verdict `att-accepted-silent` (law L5, spec 020)
+# proved the unit's write pipe opens with no bond at all.
 
 
 @dataclass
@@ -452,10 +372,6 @@ class AquaTempBleClient:
         self._idle_pushes: list[tuple[int, float]] = []
         self._t_subscribe: float | None = None
         self._idle_summary_logged = False  # one idle summary per connection
-        # Spec 011 FR-4: writes sent for the pending request (the initial
-        # write + every re-send) — the `answered after pairing (<n>
-        # attempt of the window)` line reads it (contract 011 §3.4).
-        self._req_writes = 0
         # Spec 013 FR-1 (contract 013 §3.1): the per-connect pushed-block
         # store — every CRC-valid block frame (idle or in-flight) is
         # decoded and kept here; nothing is discarded unread anymore
@@ -486,14 +402,6 @@ class AquaTempBleClient:
         return self._write_uuid or const.UUID_WRITE
 
     @property
-    def last_request_write_count(self) -> int:
-        """Writes sent for the most recent request (spec 011 FR-4): the
-        `security probe: answered after pairing (<n> attempt of the
-        window)` line reads it (contract 011 §3.4) — the initial write
-        plus every re-send that went out before the answer."""
-        return self._req_writes
-
-    @property
     def pushed_blocks(self) -> dict[int, PushCapture]:
         """A snapshot of the per-connect pushed-block store (spec 013
         FR-1/FR-4, contract 013 §3.1): {start: PushCapture} for every
@@ -521,7 +429,7 @@ class AquaTempBleClient:
             return None
         return bleak_retry_connector
 
-    async def connect(self, max_attempts: int = 2, pair: bool = False) -> None:
+    async def connect(self, max_attempts: int = 2) -> None:
         """Resolve the device, connect and subscribe to the notify characteristic.
 
         max_attempts is the bleak-retry-connector attempt budget: the
@@ -534,13 +442,10 @@ class AquaTempBleClient:
         SETTLE_AFTER_SUBSCRIBE after subscribing (spec 006 FR-1), so
         callers' budget math must count both.
 
-        pair (spec 011 FR-6, contract 011 §3.5): requests pairing at the
-        establish call — the pair_on_connect option's threading, OFF by
-        default and earned only by the connection test's X2/X3 evidence
-        (quickstart 011 §2). A backend that cannot pair logs a WARNING
-        and connects WITHOUT pairing: the option must never break the
-        poll path (FR-7); with pair=False the behavior is
-        byte-for-byte today's.
+        Spec 021: the pair parameter (the pair_on_connect option's
+        threading) was removed with the pairing ladder — the production
+        verdict `att-accepted-silent` (law L5, spec 020) proved the
+        write pipe opens with no bond at all.
 
         Home Assistant path: bleak_retry_connector.establish_connection() —
         retried connects with per-failure backoff, stale bluez connection
@@ -566,12 +471,6 @@ class AquaTempBleClient:
         """
         if self.is_connected:
             return
-        if pair:
-            # Contract 011 §3.5: the option path's DEBUG marker — the
-            # pair_on_connect evidence-gated lever (spec 011 FR-6).
-            _LOGGER.debug(
-                "connect with pairing requested (option pair_on_connect)"
-            )
         # Stage "resolve" boundaries (spec 007 FR-1, research 007 §8):
         # t0 is connect()'s entry, t_resolve the moment the device was
         # obtained — the summary's first stage duration.
@@ -583,13 +482,12 @@ class AquaTempBleClient:
                 f"no Aqua Temp device found for address {self._address}"
             )
         try:
-            # Spec 011: the establish half lives in _establish_connection
-            # (capability-checked pair threading, research 011 §10.1);
-            # the brc/raw branches and their attempt-window INFO lines
-            # (contract 007 §2.1) moved there VERBATIM — same code, same
-            # log formats, one extra caller (the pairing ladder's rung B).
+            # The establish half lives in _establish_connection; the
+            # brc/raw branches and their attempt-window INFO lines
+            # (contract 007 §2.1) live there VERBATIM — same code, same
+            # log formats.
             client: BleakClient = await self._establish_connection(
-                device, max_attempts=max_attempts, pair=pair
+                device, max_attempts=max_attempts
             )
         except Exception as exc:  # noqa: BLE001
             # Connect-stage failure (spec 007 FR-1, contract 007 §3.1,
@@ -609,46 +507,19 @@ class AquaTempBleClient:
         # Stage "connect" completed (spec 007 FR-1, research 007 §8):
         # link + BlueZ GATT discovery inside bleak's window are done.
         t_connect = _now()
-        # Spec 011 FR-3: the post-connect half lives in _post_connect_setup
-        # (contract 009 §1 order, the 007 stage/summary lines verbatim) —
-        # one more caller needs it: the pairing ladder's rung B, which
-        # re-establishes the link with pairing and must run the SAME
-        # setup (research 011 §10.1).
+        # The post-connect half lives in _post_connect_setup
+        # (contract 009 §1 order, the 007 stage/summary lines verbatim).
         await self._post_connect_setup(
             client, device, t0=t0, t_resolve=t_resolve, t_connect=t_connect
         )
 
     async def _establish_connection(
-        self, device: Any, *, max_attempts: int, pair: bool = False
+        self, device: Any, *, max_attempts: int
     ) -> BleakClient:
         """The establish half of connect() — brc inside Home Assistant,
         raw BleakClient standalone (contract 007 §2.1 lines verbatim).
-
-        Spec 011 FR-3 rung B / FR-6: pair=True requests pairing at the
-        establish call when the installed backend accepts the kwarg
-        (capability check with inspect.signature, research 011 §10.1 —
-        never assumed across API generations); a backend that cannot
-        pair logs a WARNING and connects WITHOUT pairing — the option
-        must never break the poll path (contract 011 §7).
         """
         brc = self._load_retry_connector()
-        pair_supported = False
-        if pair:
-            target = brc.establish_connection if brc is not None else BleakClient
-            pair_supported = _kwargs_accepts(target, const.PAIR_ENABLE_PROP)
-            if pair_supported:
-                _LOGGER.debug(
-                    "establish path accepts the %s kwarg (research 011 §10.1)",
-                    const.PAIR_ENABLE_PROP,
-                )
-            else:
-                _LOGGER.warning(
-                    "pairing was requested (option pair_on_connect) but the "
-                    "installed %s does not accept the pair parameter — "
-                    "connecting WITHOUT pairing (spec 011 FR-6/FR-7; "
-                    "research 011 §10.1)",
-                    "bleak-retry-connector" if brc is not None else "bleak",
-                )
         if brc is not None:
             # max_attempts is the caller's probe budget (2 for the
             # coordinator, 2 for the config-flow test since spec 006
@@ -679,8 +550,6 @@ class AquaTempBleClient:
                 max_attempts=max_attempts,
                 timeout=const.CONNECT_TIMEOUT,
             )
-            if pair and pair_supported:
-                kwargs[const.PAIR_ENABLE_PROP] = True
             return await brc.establish_connection(BleakClient, device, **kwargs)
         # Attempt-window line, standalone twin (spec 007 FR-2,
         # research 007 §4): the raw fallback loops exactly twice,
@@ -692,9 +561,7 @@ class AquaTempBleClient:
             self._address,
             const.CONNECT_TIMEOUT,
         )
-        return await self._connect_with_raw_client(
-            device, pair=pair and pair_supported
-        )
+        return await self._connect_with_raw_client(device)
 
     async def _post_connect_setup(
         self,
@@ -706,14 +573,13 @@ class AquaTempBleClient:
         t_connect: float,
     ) -> None:
         """The post-connect half of connect(): enumerate → subscribe →
-        write-char resolve → settle (contract 009 §1 order, spec 011 FR-3).
+        write-char resolve → settle (contract 009 §1 order).
 
-        Factored out so the pairing ladder's rung B can re-run the
-        IDENTICAL setup after a pair-enabled re-establishment — same
-        code, same 007 stage/summary log formats (spec 011 FR-7:
-        byte-identical, still greppable). Raises on failure after
-        tearing the half-open client down, exactly as connect() always
-        did; connect() wraps the establish half, this owns the rest.
+        Factored out of connect() so both halves stay independently
+        readable — same code, same 007 stage/summary log formats (still
+        greppable). Raises on failure after tearing the half-open client
+        down, exactly as connect() always did; connect() wraps the
+        establish half, this owns the rest.
         """
         self._client = client
         # Post-connect stage boundaries (spec 007 FR-1, contract 007
@@ -828,15 +694,11 @@ class AquaTempBleClient:
         )
 
     async def _connect_with_raw_client(
-        self, device: Any, pair: bool = False
+        self, device: Any
     ) -> BleakClient:
         """Standalone fallback: raw BleakClient with the historic 2-attempt
         loop. Used only when bleak_retry_connector is not installed
         (standalone tools / tests, no Home Assistant).
-
-        Spec 011 FR-3 rung B / FR-6: pair=True flows into the bleak
-        constructor when this bleak generation accepts it (the caller
-        capability-checked — research 011 §10.1).
         """
         last_exc: Exception | None = None
         for attempt in (1, 2):
@@ -844,8 +706,6 @@ class AquaTempBleClient:
                 disconnected_callback=self._on_disconnect,
                 timeout=const.CONNECT_TIMEOUT,
             )
-            if pair:
-                ctor_kwargs[const.PAIR_ENABLE_PROP] = True
             client = BleakClient(device, **ctor_kwargs)
             try:
                 # Constructor timeout is the canonical path in bleak
@@ -924,260 +784,14 @@ class AquaTempBleClient:
         self._cancel_silence_timer()
         self._fail_pending(AquaTempConnectionError(f"connection to {self._address} lost"))
 
-    # -------------------------------------------- pairing ladder (spec 011)
-    async def pair(self) -> str:
-        """The pairing ladder (spec 011 FR-3, contract 011 §3).
-
-        Rungs, least intrusive first, each logged (research 011 §10.1):
-          A — the bleak client's pair() method (the bleak < 1.0 shape);
-          B — re-establish the connection with pairing requested
-              (brc establish_connection(pair=True) / BleakClient(pair=True),
-              the bleak >= 1.0 shape) + the normal post-connect setup;
-          C — register the minimal NoInputNoOutput BlueZ agent (module
-              agent.py over dbus_fast, bleak's own D-Bus dependency) and
-              retry the taken rung exactly once — the documented fix for
-              the agent-less bluetoothd Pair() failure (research 011
-              §10.2/§3.3).
-
-        Returns one of "succeeded" | "skipped" (already bonded) |
-        "failed" | "unavailable" and NEVER raises: a pairing failure
-        must not break the caller (contract 011 §2/§7 — the config test
-        routes on the status and the retry read follows success/skipped
-        only, FR-4). The bond state is logged before/after (best-effort,
-        contract 011 §3.6). Only ever called from the config-test stages
-        or behind the pair_on_connect option — never from a poll loop
-        (contract 011 §1.5). Evidence lines are WARNING (contract 012
-        §2): the operator's HA log page keeps only WARNING+.
-        """
-        bleak_version = _package_version("bleak")
-        brc = self._load_retry_connector()
-        brc_version = (
-            _package_version("bleak-retry-connector") if brc is not None else None
-        )
-        # WARNING (contract 012 §2): the bond-state lines are decisive-once
-        # evidence — the operator's system_log panel stores WARNING+ only
-        # (research 012 §4).
-        _LOGGER.warning("pairing: bond state before: %s", await self._read_bond_state())
-        pair_method = None
-        if self._client is not None:
-            candidate = getattr(self._client, "pair", None)
-            pair_method = candidate if callable(candidate) else None
-        chain = ""
-        if pair_method is not None:
-            # WARNING (contract 012 §2): the rung line is evidence the
-            # routing decision reads (research 012 §4 — panel = WARNING+).
-            _LOGGER.warning(
-                "pairing: attempting via rung A (bleak pair method) "
-                "(bleak=%s, brc=%s)",
-                bleak_version,
-                brc_version or "absent",
-            )
-            result, chain = await self._call_pair_method_once(pair_method)
-        else:
-            # WARNING (contract 012 §2): the rung line is evidence the
-            # routing decision reads (research 012 §4 — panel = WARNING+).
-            _LOGGER.warning(
-                "pairing: attempting via rung B (reconnect with pair=True) "
-                "(bleak=%s, brc=%s)",
-                bleak_version,
-                brc_version or "absent",
-            )
-            result, chain = await self._pair_via_reconnect()
-        if result == "failed" and _pairing_agent_signature(chain):
-            result, chain = await self._rung_c_retry(
-                pair_method,
-                bleak_version=bleak_version,
-                brc_version=brc_version,
-            )
-        # WARNING (contract 012 §2): the bond-state lines are decisive-once
-        # evidence — the operator's system_log panel stores WARNING+ only
-        # (research 012 §4).
-        _LOGGER.warning("pairing: bond state after: %s", await self._read_bond_state())
-        return result
-
-    async def _call_pair_method_once(self, pair_method: Any) -> tuple[str, str]:
-        """Rung A: ONE bounded bleak pair() call (const.PAIR_TIMEOUT — a
-        D-Bus Pair() can legitimately take seconds, research 011 §10.1).
-        The failure chain is logged verbatim (the §5.2 signatures are
-        read from it); AlreadyExists-class outcomes are the X3 no-op.
-        """
-        try:
-            await asyncio.wait_for(pair_method(), const.PAIR_TIMEOUT)
-        except Exception as exc:  # noqa: BLE001 — the chain IS the datum
-            chain = exc_chain(exc)
-            if _pairing_already_bonded(chain.lower()):
-                # WARNING (contract 012 §2): the X3 no-op proof is evidence
-                # — the panel keeps WARNING+ only (research 012 §4).
-                _LOGGER.warning("pairing: skipped: already bonded")
-                return "skipped", chain
-            # WARNING (contract 012 §2): the failure chain is evidence the
-            # routing decision reads (research 012 §4 — panel = WARNING+).
-            _LOGGER.warning(
-                "pairing: failed: %s%s", chain, _pairing_ble_guidance(chain)
-            )
-            return "failed", chain
-        # WARNING (contract 012 §2): the decisive success line (research
-        # 012 §4 — the panel keeps WARNING+ only).
-        _LOGGER.warning("pairing: succeeded")
-        return "succeeded", ""
-
-    async def _pair_via_reconnect(self) -> tuple[str, str]:
-        """Rung B: tear down, re-establish with pairing requested, then
-        re-run the normal post-connect setup (spec 011 FR-3 rung 2,
-        research 011 §10.1 — bleak >= 1.0 moved pairing into the
-        establish call). The capability check runs BEFORE any teardown:
-        an incapable backend is 'unavailable', never a broken link.
-        """
-        brc = self._load_retry_connector()
-        supported = _kwargs_accepts(
-            brc.establish_connection if brc is not None else BleakClient,
-            const.PAIR_ENABLE_PROP,
-        )
-        if not supported:
-            reason = (
-                "the installed bleak-retry-connector does not accept the "
-                "pair parameter"
-                if brc is not None
-                else "this bleak build exposes neither a pair method nor "
-                "a pair constructor parameter"
-            )
-            # WARNING (contract 012 §2): an unavailable rung is decisive
-            # evidence (research 012 §4 — panel = WARNING+).
-            _LOGGER.warning(
-                "pairing: unavailable: %s (research 011 §10.1)", reason
-            )
-            return "unavailable", ""
-        try:
-            await self.disconnect()
-            t_b = _now()
-            device = await self._resolve_device()
-            t_resolve = _now()
-            if device is None:
-                raise AquaTempDeviceNotFoundError(
-                    f"no Aqua Temp device found for address {self._address}"
-                )
-            client = await self._establish_connection(device, max_attempts=2, pair=True)
-            t_connect = _now()
-            await self._post_connect_setup(
-                client, device, t0=t_b, t_resolve=t_resolve, t_connect=t_connect
-            )
-        except Exception as exc:  # noqa: BLE001 — the chain stays verbatim
-            chain = exc_chain(exc)
-            if _pairing_already_bonded(chain.lower()):
-                # WARNING (contract 012 §2): the X3 no-op proof is evidence
-                # — the panel keeps WARNING+ only (research 012 §4).
-                _LOGGER.warning("pairing: skipped: already bonded")
-                return "skipped", chain
-            # WARNING (contract 012 §2): the failure chain is evidence the
-            # routing decision reads (research 012 §4 — panel = WARNING+).
-            _LOGGER.warning(
-                "pairing: failed: %s%s", chain, _pairing_ble_guidance(chain)
-            )
-            return "failed", chain
-        # WARNING (contract 012 §2): the decisive success line (research
-        # 012 §4 — the panel keeps WARNING+ only).
-        _LOGGER.warning("pairing: succeeded")
-        return "succeeded", ""
-
-    async def _rung_c_retry(
-        self, pair_method: Any, *, bleak_version: str, brc_version: str | None
-    ) -> tuple[str, str]:
-        """Rung C: register the minimal BlueZ agent, retry the taken rung
-        exactly once, always release the agent in the finally (contract
-        011 §3/§7). Import and registration are guarded — an ImportError
-        or a failed registration is 'unavailable', never an exception
-        (AC-8; research 011 §10.2).
-        """
-        # WARNING (contract 012 §2): the rung line is evidence the routing
-        # decision reads (research 012 §4 — panel = WARNING+).
-        _LOGGER.warning(
-            "pairing: attempting via rung C (minimal BlueZ agent, "
-            "NoInputNoOutput, then one rung retry) (bleak=%s, brc=%s)",
-            bleak_version,
-            brc_version or "absent",
-        )
-        bluez_agent = None
-        try:
-            try:
-                from . import agent as bluez_agent  # package (Home Assistant)
-            except ImportError:
-                import agent as bluez_agent  # standalone (tools/tests)
-        except ImportError:  # pragma: no cover — agent.py is stdlib-only
-            bluez_agent = None
-        if bluez_agent is None or not getattr(
-            bluez_agent, "DBUS_FAST_AVAILABLE", False
-        ):
-            _LOGGER.debug(
-                "rung C unavailable: the agent module/dbus_fast import "
-                "failed (spec 011 FR-3)"
-            )
-            # WARNING (contract 012 §2): the unavailable verdict is decisive
-            # evidence (research 012 §4 — panel = WARNING+).
-            _LOGGER.warning(
-                "pairing: unavailable: no pairing agent could be "
-                "registered (dbus_fast not available)"
-            )
-            return "unavailable", ""
-        bus = await bluez_agent.register_agent()
-        if bus is None:
-            # WARNING (contract 012 §2): the unavailable verdict is decisive
-            # evidence (research 012 §4 — panel = WARNING+).
-            _LOGGER.warning(
-                "pairing: unavailable: agent registration failed on this "
-                "bluetoothd"
-            )
-            return "unavailable", ""
-        try:
-            if pair_method is not None:
-                return await self._call_pair_method_once(pair_method)
-            return await self._pair_via_reconnect()
-        finally:
-            await bluez_agent.unregister_agent(bus)
-
-    async def _read_bond_state(self) -> str:
-        """Best-effort BlueZ Paired property read (contract 011 §3.6,
-        research 011 §10.1): 'paired', 'not paired', or 'unknown'.
-
-        Reaches through the bleak backend's device path and D-Bus bus
-        (both introspected, never assumed); any failure — no backend,
-        no path, no bus, dbus_fast absent, a D-Bus error — degrades to
-        'unknown' with a DEBUG line: the bond check is diagnostics,
-        never a gate (contract 011 §7)."""
-        client = self._client
-        if client is None:
-            return "unknown"
-        try:
-            backend = getattr(client, "_backend", None) or client
-            path = getattr(backend, "_device_path", None)
-            bus = getattr(backend, "_bus", None)
-            if not path or bus is None:
-                return "unknown"
-            message_cls = _dbus_fast_message()
-            if message_cls is None:
-                return "unknown"
-            reply = await bus.call(
-                message_cls(
-                    destination="org.bluez",
-                    path=path,
-                    interface="org.freedesktop.DBus.Properties",
-                    member="Get",
-                    signature="ss",
-                    body=["org.bluez.Device1", "Paired"],
-                )
-            )
-            value = (
-                reply.body[0]
-                if reply and getattr(reply, "body", None)
-                else None
-            )
-            if hasattr(value, "value"):  # dbus-fast Variant shape
-                value = value.value
-            return "paired" if value else "not paired"
-        except Exception as exc:  # noqa: BLE001 — diagnostics only
-            _LOGGER.debug(
-                "bond state read failed: %s: %s", type(exc).__name__, exc
-            )
-            return "unknown"
+    # --------------------------------------------- spec 021 prune
+    # The pairing ladder (pair(), _call_pair_method_once,
+    # _pair_via_reconnect, _rung_c_retry, _read_bond_state) was removed
+    # here: dormant evidence tooling whose verdict never came — the
+    # production run proved `att-accepted-silent` (law L5, spec 020),
+    # i.e. the write pipe opens at the ATT layer with NO bond. The
+    # security probe (run_security_probe, below) survives as the
+    # evidence instrument; a security-class verdict now just routes.
 
     # --------------------------------------------- adaptive GATT discovery
     @staticmethod
@@ -1229,7 +843,10 @@ class AquaTempBleClient:
         """Walk the device's services and log the full GATT table.
 
         ONE connect must be enough to see the REAL layout — service and
-        characteristic UUIDs, handles, properties — at INFO:
+        characteristic UUIDs, handles, properties. The one-line summary
+        logs at INFO (spec 021, tasks.md C3); the per-service and
+        per-characteristic lines log at DEBUG (they fire on EVERY
+        connect and were chatty at INFO):
 
             GATT enumeration <addr>: 2 service(s), 4 characteristic(s)
             GATT enumeration <addr>: service <uuid> (handle <h>): 3 char(s)
@@ -1281,7 +898,7 @@ class AquaTempBleClient:
             len(chars),
         )
         for svc_uuid, svc_handle, svc_chars in collected:
-            _LOGGER.info(
+            _LOGGER.debug(
                 "GATT enumeration %s: service %s (handle %s): %d char(s)",
                 self._address,
                 svc_uuid,
@@ -1289,7 +906,7 @@ class AquaTempBleClient:
                 len(svc_chars),
             )
             for char in svc_chars:
-                _LOGGER.info(
+                _LOGGER.debug(
                     "GATT enumeration %s:   char %s (handle %s) properties %s",
                     self._address,
                     str(getattr(char, "uuid", "") or "").lower(),
@@ -1773,7 +1390,6 @@ class AquaTempBleClient:
         self._req_rx_bytes = 0
         self._req_frame_count = 0
         self._req_block_starts = []
-        self._req_writes = 0  # spec 011 FR-4: the request's write counter
         # Spec 009 FR-1 (plan 009 §2.2): stamp the request start and
         # reset the per-request census timing — _census_frame renders
         # its t+ offsets relative to _req_t0 and updates
@@ -1795,7 +1411,6 @@ class AquaTempBleClient:
         try:
             try:
                 await self._write_frame(frame, force_response=force_response)
-                self._req_writes = 1
             except AquaTempError:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -1898,9 +1513,7 @@ class AquaTempBleClient:
         charge (plan 009 §3.2).
 
         Spec 011 FR-1: force_response threads through so a re-sent
-        request keeps ONE ATT write type; each successful re-send
-        bumps _req_writes (the `answered after pairing (<n> attempt of
-        the window)` line reads it, contract 011 §3.4).
+        request keeps ONE ATT write type.
         """
         for n in range(1, max_sends + 1):
             try:
@@ -1925,7 +1538,6 @@ class AquaTempBleClient:
                     exc,
                 )
                 return
-            self._req_writes += 1
 
     def _log_idle_summary_once(self) -> None:
         """Emit the idle-window summary at the FIRST request of a
@@ -2106,11 +1718,18 @@ class AquaTempBleClient:
             # WARNING (contract 013 §2.1): the operator's HA log panel
             # stores WARNING+ only (contract 012 §2) — this line IS the
             # never-decoded block 2001-2045 capture (research 013 §2.3).
+            # Spec 021 (tasks.md C2): the full 99-byte hex payload moved
+            # to DEBUG — the one-line capture stays the WARNING evidence
+            # (the hex firehose was chatty on flaky links).
             _LOGGER.warning(
-                "block push captured: start=%d qty=%d len=%d crc=OK hex=%s",
+                "block push captured: start=%d qty=%d len=%d crc=OK",
                 start,
                 qty,
                 len(frame),
+            )
+            _LOGGER.debug(
+                "block push captured: start=%d hex=%s",
+                start,
                 frame.hex(),
             )
         else:
@@ -2639,8 +2258,12 @@ class AquaTempBleClient:
         timeout: float | None = None,
     ) -> dict[int, PushCapture]:
         """Listen-only harvest (spec 013 FR-2, contract 013 §1): await
-        the unit's spontaneous block pushes on the ALREADY-SUBSCRIBED
-        notify characteristic and send ZERO frames.
+        the unit's answer blocks on the ALREADY-SUBSCRIBED notify
+        characteristic and send ZERO frames. The unit never pushes
+        spontaneously (law L2, spec 020) — it ANSWERS every request
+        with its four-block burst, so the harvest only makes sense
+        after the caller's own reads (the flow's first read, the
+        trigger) already woke the unit.
 
         The zero-TX invariant (contract 013 §1.1): no FC03 read, no
         query, no write, no ATT operation beyond the CCCD subscription
@@ -2685,22 +2308,24 @@ class AquaTempBleClient:
 
 
 # --------------------------------------------------------------------------
-# Spec 011 — the probe/pair/retry sequence (contract 011 §2). ONE
+# Spec 011 — the security-probe sequence (contract 011 §2). ONE
 # implementation, two consumers: the config-flow connection test
 # (config_flow._async_test) and the developer tool's --phase security
 # (tools/session_probe.py, FR-9 — import the client, never copy it).
+# Spec 021: the pair / first-read-retry stages were pruned with the
+# pairing ladder — the production verdict `att-accepted-silent` proved
+# the unit's write pipe opens with NO bond (law L5, spec 020).
 # --------------------------------------------------------------------------
 
 
 async def run_security_probe(
     client: "AquaTempBleClient",
     *,
-    retry_resend_every: float | None = None,
-    retry_resend_max: int = 0,
     on_stage: Any = None,
 ) -> dict[int, int] | None:
-    """Run the security-probe / pair / first-read-retry stages on a
-    CONNECTED client (spec 011 FR-2/FR-4, contract 011 §2).
+    """Run the security-probe stage on a CONNECTED client (spec 011
+    FR-2, contract 011 §2; spec 021: the pair / first-read-retry stages
+    were pruned with the pairing ladder).
 
     Called strictly AFTER the caller's first read timed out, on the
     SAME live session (contract 011 §3 — the session order is
@@ -2708,22 +2333,21 @@ async def run_security_probe(
 
       security-probe   ONE acknowledged base read — the SAME vendor
                        frame with response=True (the X1 experiment:
-                       research 011 §2.1/§12); no re-send on the probe;
-      [pair]           the pairing ladder, ONLY on an att-error-security
-                       verdict (contract 011 §2) — bounded by its own
-                       PAIR_TIMEOUT (contract 011 §4) so a wedged D-Bus
-                       Pair cannot eat the remaining budget;
-      first-read-retry ONE plain base read, ONLY after a pair attempt
-                       that returned succeeded/skipped-already-bonded
-                       (FR-4), with the caller's re-send bounds.
+                       research 011 §2.1/§12); no re-send on the probe.
+
+    The verdict classification is unchanged (contract 011 §5.1). A
+    security-class verdict no longer triggers a pairing ladder — the
+    production verdict `att-accepted-silent` (law L5, spec 020) proved
+    the unit's write pipe opens with no bond, so the ladder never
+    earned its evidence and was removed (spec 021). The verdict line is
+    the evidence; the caller routes exactly as before.
 
     Returns the answered register dict, or None when no answer arrived
     — the caller then re-raises its ORIGINAL first-read timeout so the
     UI keys stay unchanged (FR-2.5: no_response keeps its meaning and
-    advice). Never raises AquaTempTimeoutError; propagates the retry
-    read's other AquaTempErrors for the caller's existing routing
-    (contract 011 §2). A pairing failure is logged, never raised
-    (contract 011 §7: the test must stay runnable).
+    advice). Never raises AquaTempTimeoutError; propagates the
+    acknowledged read's other AquaTempErrors for the caller's existing
+    routing (contract 011 §2).
 
     Stage labels are reported through on_stage BEFORE each stage runs
     (contract 011 §2: failure lines report the running stage, never a
@@ -2802,60 +2426,10 @@ async def run_security_probe(
             "011 §2.2)"
         )
         return regs
-    if verdict != "att-error-security":
-        # Contract 011 §2: the ladder runs ONLY after a security-class
-        # verdict; other verdicts log and route — never pair.
-        return None
-
-    # Stage pair (contract 011 §3.3): bounded by PAIR_TIMEOUT with
-    # asyncio.wait_for on purpose — an OUTER budget cancellation
-    # (the flow's TEST_TIMEOUT) surfaces as CancelledError and passes
-    # through untouched, while OUR expiry becomes this TimeoutError
-    # (contract 011 §4's inner bound without asyncio.timeout's nested
-    # ambiguity).
-    stage("pair")
-    pair_result = "failed"
-    try:
-        pair_result = await asyncio.wait_for(client.pair(), const.PAIR_TIMEOUT)
-    except TimeoutError:
-        _LOGGER.warning(
-            "security probe: pair stage exceeded the %.0f s pairing "
-            "budget (contract 011 §4)",
-            const.PAIR_TIMEOUT,
-        )
-    except Exception as exc:  # noqa: BLE001 — a pairing failure never breaks the test
-        # WARNING (contract 012 §2): the failure chain is decisive-once
-        # evidence — the system_log panel stores WARNING+ only (research
-        # 012 §4).
-        _LOGGER.warning("pairing: failed: %s", exc_chain(exc))
-        pair_result = "failed"
-    if pair_result not in ("succeeded", "skipped"):
-        # FR-4: the retry follows a successful/skipped pair only — a
-        # failed, wedged or unavailable pairing never burns the
-        # remaining budget on another read.
-        return None
-
-    # Stage first-read-retry (FR-4): exactly ONE more base read with
-    # the caller's re-send bounds (contract 011 §2).
-    stage("first-read-retry")
-    try:
-        regs = await client.read_registers(
-            registers.BASE_BLOCK_START,
-            registers.BASE_BLOCK_COUNT,
-            resend_every=retry_resend_every,
-            resend_max=retry_resend_max,
-        )
-    except AquaTempTimeoutError as exc:
-        # WARNING (contract 012 §2): decisive evidence — the operator's
-        # system_log panel stores WARNING+ only (research 012 §4).
-        _LOGGER.warning(
-            "security probe: still silent after pairing (census: %s)", exc
-        )
-        return None
-    # WARNING (contract 012 §2): the case-closed evidence line — the
-    # operator's system_log panel stores WARNING+ only (research 012 §4).
-    _LOGGER.warning(
-        "security probe: answered after pairing (%d attempt of the window)",
-        getattr(client, "last_request_write_count", 1),
-    )
-    return regs
+    # Spec 021: the pairing ladder and its first-read-retry are gone —
+    # pruned with the pair_on_connect lever after the production
+    # verdict `att-accepted-silent` (law L5, spec 020) proved the unit
+    # needs no bond. The classified verdict line above is the evidence;
+    # every verdict routes to None and the caller re-raises its
+    # original timeout (the UI keys stay unchanged, contract 011 §2).
+    return None
