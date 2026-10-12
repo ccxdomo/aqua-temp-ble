@@ -1203,7 +1203,12 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
                     self.push_temp_confirmed,
                     self.push_control_confirmed,
                 )
-                await self.async_set_updated_data(data)
+                # async_set_updated_data is a PLAIN (sync) DataUpdateCoordinator
+                # method — awaiting it raised "'NoneType' object can't be
+                # awaited" after every control write (the frame had already
+                # been sent, so the unit switched but the service call
+                # reported a failure). Never await this one.
+                self.async_set_updated_data(data)
         # FR-3 step 9: the stage dict — the tests' oracle + the
         # climate's diagnostics attribute (FR-5). The displayed state
         # itself never reads it (never optimistic, FR-6).

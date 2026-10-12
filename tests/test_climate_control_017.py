@@ -293,7 +293,11 @@ class DataUpdateCoordinator:
     def async_request_refresh(self):
         return asyncio.sleep(0)  # an awaitable no-op (the debounced read)
 
-    async def async_set_updated_data(self, data):
+    def async_set_updated_data(self, data):
+        # The real DataUpdateCoordinator method is SYNCHRONOUS. This stub
+        # used to be `async`, which made the integration look correct while
+        # it awaited the method — and that await was the production
+        # TypeError. Keeping the stub honest is what pins the fix.
         self.data = data
         self.pushed_snapshots.append(data)
 
