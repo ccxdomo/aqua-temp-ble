@@ -42,6 +42,7 @@ from .const import (
     DEFAULT_POLL_INTERVAL,
     DEFAULT_TEMPERATURE_UNIT,
     DEFAULT_WRITE_CONTROL,
+    DEFAULT_WRITE_SETPOINT,
     DOMAIN,
     MAX_OTHER_DEVICES,
     NAME_PREFIXES,
@@ -894,6 +895,24 @@ class AquaTempOptionsFlowHandler(OptionsFlow):
                 vol.Required(
                     "write_control",
                     default=current.get("write_control", DEFAULT_WRITE_CONTROL),
+                )
+            ] = bool
+            # Spec 019 FR-9 (contract 019 §4): the setpoint ACTIVATION —
+            # the THIRD gate, SEPARATE from write_control (the owner
+            # may activate either without the other; the gates
+            # compose). The checkbox ships False (the setpoint write
+            # surface stays absent — the read display appears behind
+            # the existing control gate); its description names the
+            # required probe verdict (the `setpoint write probe:
+            # EXECUTED + REVERSIBLE` line, contract 019 §4's discipline
+            # surfaced to the UI). Checking it opens the climate's
+            # TARGET_TEMPERATURE surface (FR-11): the entity reads the
+            # coordinator's gate live, so saving re-renders it — no
+            # restart (the write_control precedent).
+            schema[
+                vol.Required(
+                    "write_setpoint",
+                    default=current.get("write_setpoint", DEFAULT_WRITE_SETPOINT),
                 )
             ] = bool
         return self.async_show_form(step_id="init", data_schema=vol.Schema(schema))

@@ -158,9 +158,11 @@ def test_pushed_control_constants_transcribed() -> None:
     assert registers.PUSH_CONTROL_BLOCK_START == 2001
     assert registers.PUSH_CONTROL_CONFIRMED is False  # the shipped default (the gate)
     assert registers.PUSHED_CONTROL == {
-        "power": 2011,    # [P owner diff-revert 2026-10-12]
-        "mode": 2019,     # [P owner diff-revert 2026-10-12]
-        "setpoint": None, # no setpoint home identified (spec 015 §2)
+        "power": 2011,     # [P owner diff-revert 2026-10-12]
+        "mode": 2019,      # [P owner diff-revert 2026-10-12]
+        # Spec 019 T1 (research 019 §1, [P owner diff 2026-10-12]): the
+        # setpoint home is pinned — the panel's +1.0 °C moved it 290→300.
+        "setpoint": 1046,
     }
     # the pushed mode VALUE mapping — [A] on this heat-only unit (D-3);
     # the observed enum: 0 (off-state) / 4 (on-state).
@@ -816,7 +818,11 @@ def test_climate_push_gate_open_read_only_surface() -> None:
     assert entity.hvac_mode == HVACMode.HEAT
     assert entity.hvac_action is None
     assert entity.target_temperature is None
-    assert entity.min_temp == 5.0
+    # Spec 019 FR-8 (the 015 suite's scripted-store review, T11): the
+    # push-mode bounds now read the setpoint guard's own constants
+    # (10.0/40.0 — one source of truth with ALLOWED_WRITE_SETPOINT);
+    # the gate semantics are unchanged (read-only, no write feature).
+    assert entity.min_temp == 10.0
     assert entity.max_temp == 40.0
 
 

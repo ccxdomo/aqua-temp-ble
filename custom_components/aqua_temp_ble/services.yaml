@@ -58,3 +58,28 @@ power_write_probe:
       selector:
         device:
           integration: aqua_temp_ble
+setpoint_write_probe:
+  name: Setpoint write probe
+  description: >-
+    Run the two-phase setpoint proof probe (spec 019). Phase A writes the
+    register's OWN current value back (a true no-op: the register receives
+    exactly what it already holds, nothing can change) and verifies no
+    other register of the block moved. Phase B dips the heat setpoint by
+    0.5 °C, verifies the pushed mirror register 1046 follows, then reverts
+    it and verifies again. The physical effect: the pool's heat target dips
+    half a degree for about 2 minutes, then returns. The unit can be ON or
+    OFF, and the vendor app must be closed (the unit accepts a single
+    Bluetooth connection). One WARNING verdict line is logged with the
+    outcome; an EXECUTED + REVERSIBLE verdict is the evidence required to
+    enable the setpoint control option. Diagnostic measurement, not a
+    control surface: a failed revert is never silent — the verdict line
+    tells you the new setpoint and how to restore it from the panel.
+  fields:
+    device_id:
+      name: Device
+      description: >-
+        Device to probe. Leave empty to probe every configured Aqua Temp unit.
+      required: false
+      selector:
+        device:
+          integration: aqua_temp_ble

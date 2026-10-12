@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -279,42 +280,58 @@ class AquaTempData:
         mode_value: int | None = None
         hvac_mode: HVACMode | None = None
         target_temp: float | None = None
-        c_cap = captures.get(registers.PUSH_CONTROL_BLOCK_START)
-        if c_cap is not None and control_confirmed:
-            cregs = c_cap.registers
-            p_addr = registers.PUSHED_CONTROL.get("power")
-            raw = cregs.get(p_addr) if p_addr is not None else None
-            power = registers.decode_flag(raw, active_when_nonzero=True)
-            m_addr = registers.PUSHED_CONTROL.get("mode")
-            mode_value = cregs.get(m_addr) if m_addr is not None else None
-            if power is False:
-                hvac_mode = HVACMode.OFF
-            elif power is True:
-                # Spec 018 (contract 018-A §2): the display follows
-                # POWER on this heat-only unit (H06 [P panel]) — a
-                # mode-gated display renders the machine's real
-                # running state `unknown`, because our proven power
-                # write (1011) updates the power mirror 2011 and
-                # never the mode mirror 2019 (research 018 §3, M-1).
-                hvac_mode = HVACMode.HEAT
-                if (
-                    mode_value is not None
-                    and mode_value != 0
-                    and mode_value not in registers.PUSHED_MODE_VALUE_TO_NAME
-                    and mode_value not in _logged_unmapped_push_modes
-                ):
-                    _logged_unmapped_push_modes.add(mode_value)
-                    _LOGGER.info(
-                        "pushed mode value %r (reg %s) unmapped — display "
-                        "follows power (heat-only, spec 018); update "
-                        "registers.PUSHED_MODE_VALUE_TO_NAME for the "
-                        "research map (quickstart 018 §2)",
-                        mode_value,
-                        m_addr,
-                    )
+        if control_confirmed:
+            c_cap = captures.get(registers.PUSH_CONTROL_BLOCK_START)
+            if c_cap is not None:
+                cregs = c_cap.registers
+                p_addr = registers.PUSHED_CONTROL.get("power")
+                raw = cregs.get(p_addr) if p_addr is not None else None
+                power = registers.decode_flag(raw, active_when_nonzero=True)
+                m_addr = registers.PUSHED_CONTROL.get("mode")
+                mode_value = cregs.get(m_addr) if m_addr is not None else None
+                if power is False:
+                    hvac_mode = HVACMode.OFF
+                elif power is True:
+                    # Spec 018 (contract 018-A §2): the display follows
+                    # POWER on this heat-only unit (H06 [P panel]) — a
+                    # mode-gated display renders the machine's real
+                    # running state `unknown`, because our proven power
+                    # write (1011) updates the power mirror 2011 and
+                    # never the mode mirror 2019 (research 018 §3, M-1).
+                    hvac_mode = HVACMode.HEAT
+                    if (
+                        mode_value is not None
+                        and mode_value != 0
+                        and mode_value not in registers.PUSHED_MODE_VALUE_TO_NAME
+                        and mode_value not in _logged_unmapped_push_modes
+                    ):
+                        _logged_unmapped_push_modes.add(mode_value)
+                        _LOGGER.info(
+                            "pushed mode value %r (reg %s) unmapped — display "
+                            "follows power (heat-only, spec 018); update "
+                            "registers.PUSHED_MODE_VALUE_TO_NAME for the "
+                            "research map (quickstart 018 §2)",
+                            mode_value,
+                            m_addr,
+                        )
+            # Spec 019 FR-1 (AC-4): the setpoint decodes from the capture
+            # of the block that CONTAINS the home — pushed_block_start
+            # (the 1046-block), NOT the 2001 window (research 019 §1:
+            # the home lives in the 1046 ladder; the 015 code read every
+            # control key from the 2001 capture, which never carries it).
+            # The gate semantics are UNCHANGED: the home rides the
+            # EXISTING push_control_confirmed gate (the mapping is
+            # confirmed); a store with only the 2001 block decodes NO
+            # target (the block-source fix — the honesty rule, not a
+            # new gate).
             s_addr = registers.PUSHED_CONTROL.get("setpoint")
             if s_addr is not None:
-                target_temp = decode_temp_logged(s_addr, cregs.get(s_addr))
+                s_block = registers.pushed_block_start(s_addr)
+                s_cap = captures.get(s_block) if s_block is not None else None
+                target_temp = decode_temp_logged(
+                    s_addr,
+                    s_cap.registers.get(s_addr) if s_cap is not None else None,
+                )
         return cls(
             registers=regs,
             power=power,
@@ -401,6 +418,11 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
         # extra_state_attributes; never an entity state — the tile's
         # truth stays the pushed mirror alone).
         self._last_control_write: dict[str, Any] | None = None
+        # Spec 019 FR-10 step 6: the last setpoint write's stage dict —
+        # the climate's diagnostics attribute beside last_power_write
+        # (never an entity state — the tile's truth stays the pushed
+        # mirror alone, contract 019 §5.2).
+        self._last_setpoint_write: dict[str, Any] | None = None
         super().__init__(
             hass,
             _LOGGER,
@@ -518,6 +540,35 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
         climate's diagnostics attribute (FR-5); the entity state itself
         never reads it (never optimistic, FR-6)."""
         return self._last_control_write
+
+    @property
+    def write_setpoint_allowed(self) -> bool:
+        """The setpoint-write ACTIVATION gate (spec 019 FR-9, contract
+        019 §4): the THIRD gate, SEPARATE from write_control_allowed
+        (the power proof authorizes 1011 only — the non-transference
+        rule, contracts 016 §4/019 §4.3). The global registers switch
+        (WRITE_SETPOINT_PROVEN — the calibration-switch precedent;
+        restart) OR the per-entry `write_setpoint` option (the
+        write_control pattern — no restart; the climate reads this
+        property live, so saving the option re-renders the entity).
+        Never set by any code path: the owner's act alone opens it,
+        ONLY after the setpoint write probe's EXECUTED + REVERSIBLE
+        verdict (quickstart 019 §1→§3); the shipped default is False
+        on both surfaces — the setpoint WRITE surface stays absent
+        (the read display still appears behind the existing control
+        gate — the home is [P owner], FR-8)."""
+        return bool(
+            registers.WRITE_SETPOINT_PROVEN
+            or self.config_entry.options.get("write_setpoint", False)
+        )
+
+    @property
+    def last_setpoint_write(self) -> dict[str, Any] | None:
+        """Spec 019 FR-10 step 6: the last setpoint write's stage dict
+        (value_raw, verdict, mirror raw + age relative to the write) —
+        the climate's diagnostics attribute (FR-11); the entity state
+        itself never reads it (never optimistic, contract 019 §5.2)."""
+        return self._last_setpoint_write
 
     def now(self) -> float:
         """The coordinator's monotonic clock (the _now seam, contract 007
@@ -1054,7 +1105,9 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
         stays empty ONE base-read trigger goes out (the write itself
         may not have woken the report — research 016 §4 Q4) and one
         more wait follows."""
-        cap = await self._wait_fresh_control(before)
+        cap = await self._wait_fresh_block(
+            registers.PUSH_CONTROL_BLOCK_START, before
+        )
         if cap is None and allow_retry:
             _LOGGER.warning(
                 "power write probe [%s]: no fresh block after the write "
@@ -1062,17 +1115,28 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
                 self.config_entry.data["address"],
             )
             await self._trigger_report("power write probe")
-            cap = await self._wait_fresh_control(before)
+            cap = await self._wait_fresh_block(
+                registers.PUSH_CONTROL_BLOCK_START, before
+            )
         return cap
 
-    async def _wait_fresh_control(self, before: float) -> Any:
-        """Poll the pushed-block store for a 2001 capture fresher than
-        `before` (monotonic ts), bounded by const.PROBE_MIRROR_TIMEOUT.
-        Returns the capture, or None when the window stayed empty."""
+    async def _wait_fresh_block(self, start: int, before: float) -> Any:
+        """Poll the pushed-block store for a capture of the block
+        `start` fresher than `before` (monotonic ts), bounded by
+        const.PROBE_MIRROR_TIMEOUT. Returns the capture, or None when
+        the window stayed empty.
+
+        Spec 019 FR-12 (T5): the 016/017 `_wait_fresh_control`
+        generalized to any pushed block — a PURE parameterization; the
+        power paths pass PUSH_CONTROL_BLOCK_START, the setpoint paths
+        pass the 1046 block (the write target and the mirror COINCIDE
+        — contract 019 §1: the fresh block IS the oracle). The 016/017
+        suites' log lines are unchanged (the refactor touches no
+        strings)."""
         timeout = const.PROBE_MIRROR_TIMEOUT
         deadline = _now() + timeout
         while True:
-            cap = self.client.pushed_blocks.get(registers.PUSH_CONTROL_BLOCK_START)
+            cap = self.client.pushed_blocks.get(start)
             if cap is not None and cap.last_seen > before:
                 return cap
             if _now() >= deadline:
@@ -1154,7 +1218,9 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
             #     UNCHANGED: a 2001 capture with last_seen > t_write,
             #     bounded by PROBE_MIRROR_TIMEOUT — the oracle must
             #     postdate the write it verifies).
-            cap = await self._wait_fresh_control(t_write)
+            cap = await self._wait_fresh_block(
+                registers.PUSH_CONTROL_BLOCK_START, t_write
+            )
             # 5. The cross-check verdicts (FR-4's exact strings).
             mirror_raw = (
                 cap.registers.get(mirror_addr) if cap is not None else None
@@ -1258,3 +1324,474 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
         except ImportError:  # pragma: no cover — ships with Home Assistant
             return
         persistent_notification.async_dismiss(self.hass, notification_id)
+
+    # -------------------------------------- spec 019 setpoint write probe
+    async def async_setpoint_write_probe(self) -> dict[str, Any]:
+        """The setpoint write probe — spec 019 FR-5's TWO-PHASE proof
+        instrument (contract 019 §3): baseline (trigger + fresh
+        1046-block + the four sanity gates) -> phase A (the NO-OP:
+        write the register's OWN current value — harmless by
+        construction — then verify the WHOLE 45-register block is
+        unchanged: the neighbor alarm catches a mis-aimed write
+        before anything real is attempted) -> phase B (the execution
+        diff-revert: a -0.5 °C dip toward the range interior, verify
+        the mirror follows, revert, verify again) -> ONE verdict line
+        at WARNING.
+
+        A MEASUREMENT INSTRUMENT, not a control surface (the 016
+        precedent): it writes ONLY build_write_control(1046, ·)
+        frames, ONLY values it read from that same register first
+        ({S, T}), only after the baseline gates (a sentinel / absent /
+        out-of-range / off-step S aborts with refused-baseline and
+        ZERO writes), and its frames go through the client's own
+        validated seam (write_setpoint_probe_frame — FR-6), NEVER
+        through the funnel (contract 019 §3: the probe is the ONLY
+        code that may write 1046 before the proof; the funnel stays
+        closed). Phase B never runs unless phase A held (the neighbor
+        alarm is the hard stop). A failed revert is never silent: the
+        not-reversible line states the CURRENT setpoint and the
+        remediation. Epistemics: phase A proves HARMLESSNESS, not
+        execution (a dropped write looks identical — quickstart 019
+        §2 says so); phase B proves execution. The physical effect of
+        the whole probe: the pool's heat target dips 0.5 °C for ~2
+        minutes, then returns (quickstart 019 §0).
+
+        Single-flight (the _io_lock); disconnects on completion or
+        failure (the probe convention). Runs with BOTH setpoint gate
+        surfaces closed — it is the gate's CAUSE, never its consumer
+        (contract 019 §4.1).
+
+        Returns the stage dict (the mirror observations with raws +
+        times, the frames sent, the verdict, the resolved write UUID).
+        """
+        address = self.config_entry.data["address"]
+        write_uuid = getattr(self.client, "write_uuid", None) or const.UUID_WRITE
+        mirror_addr = registers.READ_MIRROR_SETPOINT
+        block_start = registers.pushed_block_start(mirror_addr) or mirror_addr
+        result: dict[str, Any] = {
+            "verdict": "no-report",
+            "stage": "baseline",
+            "write_uuid": write_uuid,
+            "mirror_addr": mirror_addr,
+            "block": block_start,
+            "baseline_raw": None,
+            "test_raw": None,
+            "frames_sent": [],
+            "mirror": {},
+        }
+        t_probe = _now()
+
+        def _rel(ts: float) -> float:
+            return round(ts - t_probe, 1)
+
+        def _finish(verdict: str, detail: str) -> dict[str, Any]:
+            """FR-5 step 4: set the verdict, log ONE line at WARNING —
+            the resolved write UUID rides in it (the 016 convention) —
+            and return the stage dict."""
+            result["verdict"] = verdict
+            line = f"setpoint write probe: {detail} — write char {write_uuid}"
+            result["verdict_line"] = line
+            _LOGGER.warning("%s", line)
+            return result
+
+        async def _send(value_raw: int, label: str) -> str | None:
+            """Write one probe value through the client's seam, record
+            the frame, return its hex (None on an ATT failure — the
+            chain is logged by the caller's _finish)."""
+            frame_hex = modbus.build_write_control(mirror_addr, value_raw).hex()
+            _LOGGER.warning(
+                "setpoint write probe [%s]: sending %s frame %s on %s",
+                address,
+                label,
+                frame_hex,
+                write_uuid,
+            )
+            try:
+                await self.client.write_setpoint_probe_frame(value_raw)
+            except Exception as exc:  # noqa: BLE001 — the chain IS the datum
+                _LOGGER.debug("setpoint probe write failed", exc_info=True)
+                result["att_error"] = exc_chain(exc)
+                return None
+            result["frames_sent"].append(frame_hex)
+            return frame_hex
+
+        async def _fresh_block(before: float) -> Any:
+            """Trigger + wait for a fresh 1046-block (the probe's per-write
+            cadence: each write is followed by exactly ONE trigger — C-3's
+            rule, the write does not wake the report)."""
+            await self._trigger_report("setpoint write probe")
+            return await self._wait_fresh_block(block_start, before)
+
+        async with self._io_lock:
+            try:
+                if not self.client.is_connected:
+                    await self.client.connect(
+                        pair=self.config_entry.options.get(
+                            "pair_on_connect", const.DEFAULT_PAIR_ON_CONNECT
+                        )
+                    )
+                # -- step 1: the baseline — trigger + fresh 1046-block --
+                t_mark = _now()
+                cap = await _fresh_block(t_mark)
+                if cap is None:
+                    return _finish(
+                        "no-report",
+                        "no-report (no fresh 1046 block) — check the "
+                        "panel; the report never came back this window "
+                        "(radio); nothing was written — just try again",
+                    )
+                s_raw = cap.registers.get(mirror_addr)
+                # -- the four baseline gates (FR-5 step 1): absent,
+                #    sentinel, out-of-range, off-step -> refused-baseline
+                #    (the probe refuses to compute a safe test value from
+                #    a weird register); ZERO writes.
+                if (
+                    s_raw is None
+                    or registers.is_sentinel(s_raw)
+                    or not (
+                        registers.SETPOINT_MIN_RAW
+                        <= s_raw
+                        <= registers.SETPOINT_MAX_RAW
+                    )
+                    or s_raw % registers.SETPOINT_STEP_RAW != 0
+                ):
+                    return _finish(
+                        "refused-baseline",
+                        f"refused-baseline (mirror {mirror_addr} = {s_raw!r} "
+                        "is not a sane setpoint: absent / sentinel / "
+                        "outside 100..400 / off the 0.5 step) — check the "
+                        "panel's setpoint display; nothing was written",
+                    )
+                baseline_regs = dict(cap.registers)
+                result["baseline_raw"] = s_raw
+                result["mirror"]["baseline"] = {
+                    "raw": s_raw,
+                    "t": _rel(cap.last_seen),
+                }
+                _LOGGER.warning(
+                    "setpoint write probe [%s]: baseline: mirror %d = %d (t+%.1fs)",
+                    address,
+                    mirror_addr,
+                    s_raw,
+                    result["mirror"]["baseline"]["t"],
+                )
+                # -- step 2: phase A — the no-op (the register's OWN value) --
+                result["stage"] = "no-op-write"
+                t_noop = _now()
+                if await _send(s_raw, "no-op") is None:
+                    return _finish(
+                        "att-error", f"att-error: {result.get('att_error')}"
+                    )
+                result["stage"] = "no-op-harvest"
+                cap = await _fresh_block(t_noop)
+                if cap is None:
+                    return _finish(
+                        "no-report",
+                        "no-report (no fresh 1046 block after the no-op) — "
+                        "check the panel; nothing could change (the no-op "
+                        "wrote the register's own value); just try again",
+                    )
+                result["mirror"]["after_no_op"] = {
+                    "raw": cap.registers.get(mirror_addr),
+                    "t": _rel(cap.last_seen),
+                }
+                changed = [
+                    f"{addr} {baseline_regs.get(addr)}->{cap.registers.get(addr)}"
+                    for addr in sorted(set(baseline_regs) | set(cap.registers))
+                    if baseline_regs.get(addr) != cap.registers.get(addr)
+                ]
+                if changed:
+                    # AC-6: the neighbor alarm — a mis-aimed write (or an
+                    # unexpected panel change) is caught HERE, before any
+                    # real value is attempted; phase B never runs.
+                    return _finish(
+                        "no-op-neighbor-changed",
+                        f"no-op-neighbor-changed (register(s) moved during "
+                        f"the no-op: {'; '.join(changed)}) — the probe "
+                        "ABORTED before any real change; check the panel's "
+                        "setpoint is unchanged and report the line "
+                        "(quickstart 019 §2)",
+                    )
+                _LOGGER.warning(
+                    "setpoint write probe [%s]: after no-op: mirror %d = %d "
+                    "(t+%.1fs) — block unchanged",
+                    address,
+                    mirror_addr,
+                    result["mirror"]["after_no_op"]["raw"],
+                    result["mirror"]["after_no_op"]["t"],
+                )
+                # -- step 3: phase B — the execution diff-revert. T dips
+                #    toward the RANGE INTERIOR (S - 5, or S + 5 when S
+                #    sits at the min) — the smallest step that is provably
+                #    visible on the wire (plan 019 §2).
+                t_raw = s_raw - registers.SETPOINT_STEP_RAW
+                if t_raw < registers.SETPOINT_MIN_RAW:
+                    t_raw = s_raw + registers.SETPOINT_STEP_RAW
+                result["test_raw"] = t_raw
+                result["stage"] = "test-write"
+                t_test = _now()
+                if await _send(t_raw, "test") is None:
+                    return _finish(
+                        "att-error", f"att-error: {result.get('att_error')}"
+                    )
+                result["stage"] = "test-harvest"
+                cap = await _fresh_block(t_test)
+                if cap is None:
+                    return _finish(
+                        "no-report",
+                        "no-report (no fresh 1046 block after the test "
+                        "write) — the setpoint's state is UNKNOWN: check "
+                        "the panel; if it changed unexpectedly, restore "
+                        "it from the panel or the vendor app",
+                    )
+                b_raw = cap.registers.get(mirror_addr)
+                result["mirror"]["after_test"] = {
+                    "raw": b_raw,
+                    "t": _rel(cap.last_seen),
+                }
+                _LOGGER.warning(
+                    "setpoint write probe [%s]: after test: mirror %d = %d (t+%.1fs)",
+                    address,
+                    mirror_addr,
+                    b_raw,
+                    result["mirror"]["after_test"]["t"],
+                )
+                if b_raw != t_raw:
+                    return _finish(
+                        "not-executed",
+                        f"not-executed (mirror {mirror_addr} stayed {b_raw} "
+                        f"after the test write, expected {t_raw}) — the "
+                        "unit did not act on our frame; if the panel's "
+                        "setpoint changed unexpectedly, restore it from "
+                        "the panel or the vendor app; try once more "
+                        "(radio), then report the line",
+                    )
+                # -- the revert: write S back, verify ---------------------
+                result["stage"] = "revert-write"
+                t_revert = _now()
+                if await _send(s_raw, "revert") is None:
+                    return _finish(
+                        "att-error",
+                        f"att-error: {result.get('att_error')} — the "
+                        f"setpoint is now {t_raw / registers.TEMP_SCALE:.1f} "
+                        "°C: restore it from the panel or the vendor app",
+                    )
+                result["stage"] = "revert-harvest"
+                cap = await _fresh_block(t_revert)
+                if cap is None:
+                    return _finish(
+                        "no-report",
+                        "no-report (no fresh 1046 block after the revert) "
+                        "— the setpoint's state is UNCONFIRMED: it may sit "
+                        "at the test value; check the panel and restore the "
+                        "setpoint from the panel or the vendor app if "
+                        "needed",
+                    )
+                c_raw = cap.registers.get(mirror_addr)
+                result["mirror"]["after_revert"] = {
+                    "raw": c_raw,
+                    "t": _rel(cap.last_seen),
+                }
+                _LOGGER.warning(
+                    "setpoint write probe [%s]: after revert: mirror %d = %d (t+%.1fs)",
+                    address,
+                    mirror_addr,
+                    c_raw,
+                    result["mirror"]["after_revert"]["t"],
+                )
+                if c_raw != s_raw:
+                    return _finish(
+                        "not-reversible",
+                        f"not-reversible (mirror {mirror_addr} stayed "
+                        f"{c_raw} after the revert, expected {s_raw}) — the "
+                        f"setpoint is now {c_raw / registers.TEMP_SCALE:.1f} "
+                        "°C — restore it from the panel or the vendor app",
+                    )
+                # -- step 4: the verdict ---------------------------------
+                result["stage"] = "done"
+                return _finish(
+                    "executed+reversible",
+                    f"EXECUTED + REVERSIBLE (mirror {mirror_addr} followed "
+                    f"{s_raw}→{t_raw}→{s_raw}) — evidence for "
+                    "WRITE_SETPOINT_PROVEN",
+                )
+            finally:
+                # Disconnect on completion or failure (the probe
+                # convention) — even when an AquaTempError propagates
+                # to the caller.
+                try:
+                    await self.client.disconnect()
+                except Exception:  # noqa: BLE001
+                    _LOGGER.debug("probe disconnect failed", exc_info=True)
+
+    # -------------------------------- spec 019 setpoint control write
+    async def async_control_write_setpoint(self, celsius: float) -> dict[str, Any]:
+        """The guarded setpoint write path (spec 019 FR-10, contract
+        019 §2/§5): validate -> the funnel -> connect -> audit -> under
+        the I/O lock: the fire-and-forget write -> ONE trigger -> the
+        fresh 1046-block wait -> the three cross-check verdicts -> the
+        mirror snapshot push.
+
+        Validation is FIRST and LOUD (contract 019 §2.1: never write a
+        setpoint value that was not explicitly requested — no
+        clamping, no rounding): a non-finite value, a non-0.5 multiple
+        and an out-of-range value all raise ValueError BEFORE any byte
+        moves. The funnel (ensure_writable with the setpoint_allowed
+        thread — FR-9's live OR-property, the 017 pattern) is the
+        second gate, still BEFORE any connect, lock or I/O. The write
+        goes through the client's write_setpoint rail (FR-6's control
+        successor — the same value discipline), NEVER through the
+        classic funnel and NEVER write_registers (the echo trap,
+        contract 017 §4/019 §2.4).
+
+        Never optimistic (contract 019 §5.2): the only state mutation
+        is the snapshot push, built by the SAME from_pushes the poll
+        cycle uses — the tile reflects the MIRROR, never the request.
+        The unconfirmed path pushes NO snapshot and raises NO
+        persistent notification (contract 019 §5.3 — the deliberate
+        divergence from the power cycle: a failed setpoint write
+        leaves the machine at its old target, no hazard; the WARNING +
+        the tile's mirror-truth suffice). Does NOT disconnect on
+        completion (the confirmation lives in the steady-state poll
+        world).
+
+        The write is allowed REGARDLESS of power state (contract 019
+        §5.4): the register is the machine's stored parameter — the
+        panel changed the setpoint with the unit off [P owner].
+
+        Returns the stage dict (FR-10 step 6): value_raw, verdict
+        ("confirmed" | "not-confirmed" | "unconfirmed"), the fresh
+        mirror's raw and its age relative to the write — the tests'
+        oracle and the climate's diagnostics attribute
+        (last_setpoint_write, FR-11).
+        """
+        # 1. Validation — never silently clamp a REGULATION value
+        #    (contract 019 §2.2); the errors are loud and named.
+        if not isinstance(celsius, (int, float)) or isinstance(celsius, bool):
+            raise ValueError(
+                f"setpoint {celsius!r} is not a number (contract 019 §2)"
+            )
+        if not math.isfinite(celsius):
+            raise ValueError(
+                f"setpoint {celsius!r} is not a finite value (contract 019 §2)"
+            )
+        raw = int(round(celsius * registers.TEMP_SCALE))
+        if raw % registers.SETPOINT_STEP_RAW != 0:
+            raise ValueError(
+                f"setpoint {celsius} °C is not a multiple of the 0.5 °C "
+                f"step (raw {raw}, step {registers.SETPOINT_STEP_RAW}) — "
+                "a regulation value is never rounded (contract 019 §2.2)"
+            )
+        if not (
+            registers.SETPOINT_MIN_RAW <= raw <= registers.SETPOINT_MAX_RAW
+        ):
+            raise ValueError(
+                f"setpoint {celsius} °C is outside the guarded range "
+                "10.0-40.0 °C (raw "
+                f"{registers.SETPOINT_MIN_RAW}..{registers.SETPOINT_MAX_RAW}) "
+                "— a regulation value is never clamped (contract 019 §2.2)"
+            )
+        # 2. The funnel guard, FIRST — before any connect, lock or I/O
+        #    (the funnel rule). The setpoint gate rides the
+        #    setpoint_allowed thread (either owner surface — FR-9); the
+        #    address AND value allowlists stay permanent. While the gate
+        #    is closed this fails loudly with the 019 message and ZERO
+        #    bytes move (AC-2).
+        registers.ensure_writable(
+            registers.WRITE_REG_SETPOINT,
+            raw,
+            setpoint_allowed=self.write_setpoint_allowed,
+        )
+        # 3. Connect if needed (the cycle's connect pattern, the pair
+        #    option respected); transport failures propagate to the
+        #    caller (the entity surfaces the error).
+        if not self.client.is_connected:
+            await self.client.connect(
+                pair=self.config_entry.options.get(
+                    "pair_on_connect", const.DEFAULT_PAIR_ON_CONNECT
+                )
+            )
+        # 4. The audit line (contract 019 §8's audit obligation — the
+        #    017 pattern, setpoint-flavored): one line per write,
+        #    attributable in the owner's log page.
+        _LOGGER.info(
+            "setpoint write via %d = %d — mirror should follow in the next report",
+            registers.WRITE_REG_SETPOINT,
+            raw,
+        )
+        mirror_addr = registers.READ_MIRROR_SETPOINT
+        block_start = registers.pushed_block_start(mirror_addr) or mirror_addr
+        result: dict[str, Any] = {
+            "value_raw": raw,
+            "verdict": "unconfirmed",
+            "mirror_raw": None,
+            "mirror_age_s": None,
+        }
+        async with self._io_lock:
+            # 5a. The fire-and-forget write — the client's own rail
+            #     (address, range, step), on the _write_frame seam.
+            #     A write error propagates: no trigger, no cross-check,
+            #     no snapshot push, no notification.
+            await self.client.write_setpoint(raw)
+            t_write = _now()
+            # 5b. ONE trigger (C-3: the write does not wake the report;
+            #     the trigger does — research 017 §2, unchanged).
+            await self._trigger_report("setpoint write confirm")
+            # 5c. The fresh-block wait — a 1046 capture with last_seen >
+            #     t_write (the oracle must postdate the write it
+            #     verifies; contract 019 §1).
+            cap = await self._wait_fresh_block(block_start, t_write)
+            mirror_raw = cap.registers.get(mirror_addr) if cap is not None else None
+            if cap is not None:
+                result["mirror_raw"] = mirror_raw
+                result["mirror_age_s"] = round(cap.last_seen - t_write, 1)
+            # 6. The three verdicts (017 FR-4's semantics,
+            #    setpoint-flavored; NO persistent notification —
+            #    contract 019 §5.3).
+            if cap is None or mirror_raw is None:
+                # No fresh report (or a capture whose mirror raw is
+                # absent — the same honest verdict): the state is
+                # UNKNOWN, never guessed; the machine keeps its old
+                # target — no hazard (the WARNING + the tile's
+                # mirror-truth suffice).
+                result["verdict"] = "unconfirmed"
+                _LOGGER.warning(
+                    "setpoint write unconfirmed (no fresh report within "
+                    "%.0f s) — the setpoint's state is UNKNOWN: check the "
+                    "panel",
+                    const.PROBE_MIRROR_TIMEOUT,
+                )
+            elif mirror_raw == raw:
+                result["verdict"] = "confirmed"
+                _LOGGER.info(
+                    "setpoint write confirmed by mirror (%d = %d)",
+                    mirror_addr,
+                    mirror_raw,
+                )
+            else:
+                result["verdict"] = "not-confirmed"
+                _LOGGER.warning(
+                    "setpoint write not confirmed by mirror (mirror %d = "
+                    "%d, requested %d)",
+                    mirror_addr,
+                    mirror_raw,
+                    raw,
+                )
+            # 7. The snapshot push (confirmed / not-confirmed ONLY —
+            #    the MIRROR's truth, never the request; NO push on the
+            #    unconfirmed path).
+            if result["verdict"] in ("confirmed", "not-confirmed"):
+                data = AquaTempData.from_pushes(
+                    dict(self.client.pushed_blocks),
+                    self.push_temp_confirmed,
+                    self.push_control_confirmed,
+                )
+                # async_set_updated_data is a PLAIN (sync)
+                # DataUpdateCoordinator method — never await it (the
+                # 017 production lesson).
+                self.async_set_updated_data(data)
+        # FR-10 step 6: the stage dict — the tests' oracle + the
+        # climate's diagnostics attribute (FR-11). The displayed state
+        # itself never reads it (never optimistic).
+        self._last_setpoint_write = result
+        return result

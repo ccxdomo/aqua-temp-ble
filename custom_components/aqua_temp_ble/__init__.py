@@ -46,6 +46,15 @@ POWER_PROBE_SCHEMA = vol.Schema(
     }
 )
 
+# Spec 019 FR-7: the setpoint write probe service's schema — the
+# power_write_probe service's schema twin (the probe reads one fixed
+# register set: the 1046-block mirror 1046).
+SETPOINT_PROBE_SCHEMA = vol.Schema(
+    {
+        vol.Optional("device_id"): vol.Any(str, [str]),
+    }
+)
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up one Aqua Temp heat pump from a config entry."""
@@ -78,11 +87,15 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         except Exception:  # noqa: BLE001
             _LOGGER.debug("disconnect during unload failed", exc_info=True)
         if not hass.data[DOMAIN]:
-            # Spec 016 FR-5: both domain services go with the last entry
-            # (the guarded loop keeps the probe_registers removal
-            # behavior-identical — the service is always registered
-            # when an entry exists).
-            for service in ("probe_registers", "power_write_probe"):
+            # Spec 016 FR-5 / Spec 019 FR-7: all three domain services go
+            # with the last entry (the guarded loop keeps the
+            # probe_registers removal behavior-identical — the services
+            # are always registered when an entry exists).
+            for service in (
+                "probe_registers",
+                "power_write_probe",
+                "setpoint_write_probe",
+            ):
                 if hass.services.has_service(DOMAIN, service):
                     hass.services.async_remove(DOMAIN, service)
     return unload_ok
@@ -233,3 +246,41 @@ def _async_register_services(hass: HomeAssistant) -> None:
             supports_response=SupportsResponse.OPTIONAL,
         )
         _LOGGER.debug("service %s.power_write_probe registered", DOMAIN)
+
+    # Spec 019 FR-7: the setpoint write probe service — the owner-triggered
+    # two-phase proof (quickstart 019 §1's Developer-Tools path; the
+    # diagnostic button is the other surface). Registered independently
+    # so a reload that already carries the sibling services still gains
+    # the new one (the power_write_probe precedent).
+    if not hass.services.has_service(DOMAIN, "setpoint_write_probe"):
+
+        async def _async_setpoint_write_probe(call: ServiceCall) -> dict[str, Any]:
+            """Run the two-phase setpoint proof probe on the target device(s)."""
+            device_ids = call.data.get("device_id")
+            if isinstance(device_ids, str):
+                device_ids = [device_ids]
+            coordinators = _resolve_probe_coordinators(hass, device_ids)
+
+            result: dict[str, Any] = {}
+            for coordinator in coordinators.values():
+                address = coordinator.config_entry.data["address"]
+                try:
+                    result[address] = await coordinator.async_setpoint_write_probe()
+                except AquaTempError as err:
+                    # A connect/trigger transport failure — the probe logs
+                    # its stage WARNING line itself; this is the service
+                    # report (the power_write_probe precedent).
+                    _LOGGER.error(
+                        "setpoint write probe of %s failed: %s", address, err
+                    )
+                    result[address] = {"error": str(err)}
+            return result
+
+        hass.services.async_register(
+            DOMAIN,
+            "setpoint_write_probe",
+            _async_setpoint_write_probe,
+            schema=SETPOINT_PROBE_SCHEMA,
+            supports_response=SupportsResponse.OPTIONAL,
+        )
+        _LOGGER.debug("service %s.setpoint_write_probe registered", DOMAIN)

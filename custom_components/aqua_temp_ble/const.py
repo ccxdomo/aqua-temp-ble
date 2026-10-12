@@ -116,6 +116,20 @@ PROBE_MIRROR_TIMEOUT = 20.0
 # the alternative (the calibration-switch precedent; restart).
 DEFAULT_WRITE_CONTROL = False
 
+# Spec 019 (the setpoint control — phase 2, FR-9): the setpoint-write
+# ACTIVATION's shipped default. The THIRD gate, SEPARATE from
+# DEFAULT_WRITE_CONTROL by design (contract 019 §4's non-transference:
+# the power proof authorizes 1011 with {0,1} and NOTHING here — a
+# regulation VALUE is a different risk class from a boolean; the
+# owner may activate either without the other; the gates compose).
+# The owner's act alone opens it — ONLY after the setpoint write
+# probe's `EXECUTED + REVERSIBLE` verdict (quickstart 019 §1→§3);
+# False keeps the setpoint WRITE surface absent while the READ
+# display still appears behind the existing control gate (the home
+# is [P owner]). No code path, update or default may ever SET it
+# (contract 019 §4.1).
+DEFAULT_WRITE_SETPOINT = False
+
 # Config flow (spec 002) — scanning UX tuning (tasks.md block 1).
 # Flow-facing constants live here, next to the other integration-wide
 # knobs; everything above stays protocol-only.

@@ -68,7 +68,12 @@ class AquaTempClimateEntity(ClimateEntity, AquaTempEntity):
 
     _attr_hvac_modes = [HVACMode.OFF, HVACMode.HEAT, HVACMode.COOL, HVACMode.AUTO]
     _attr_supported_features = ClimateEntityFeature.TARGET_TEMPERATURE
-    _attr_target_temperature_step = 0.5
+    # Spec 019 FR-8: the step reads the guard's own constant (one source
+    # of truth with ALLOWED_WRITE_SETPOINT — 5 raw / x10 = the 0.5 °C
+    # granularity).
+    _attr_target_temperature_step = (
+        registers.SETPOINT_STEP_RAW / registers.TEMP_SCALE
+    )
 
     def __init__(
         self, coordinator: AquaTempCoordinator, entry: ConfigEntry, read_only: bool = False
@@ -109,33 +114,55 @@ class AquaTempClimateEntity(ClimateEntity, AquaTempEntity):
     @property
     def supported_features(self) -> ClimateEntityFeature:
         if self._read_only:
+            # Spec 019 FR-8/FR-9: the gates COMPOSE — TURN_ON/TURN_OFF
+            # behind write_control_allowed (017), TARGET_TEMPERATURE
+            # behind write_setpoint_allowed (the THIRD gate, separate
+            # by design: the owner may activate either without the
+            # other; the power proof authorizes NOTHING setpoint —
+            # non-transference, contract 019 §4.3). With both closed:
+            # the exact 015-era surface (byte-identical, AC-2).
+            features = ClimateEntityFeature(0)
             if self.coordinator.write_control_allowed:
                 # The shipped HA climate API's turn-on/turn-off
-                # features where the installed HA defines them;
-                # TARGET_TEMPERATURE is NEVER advertised (no setpoint
-                # surface — FR-8).
-                features = ClimateEntityFeature(0)
+                # features where the installed HA defines them.
                 if getattr(ClimateEntityFeature, "TURN_ON", None) is not None:
                     features |= ClimateEntityFeature.TURN_ON
                 if getattr(ClimateEntityFeature, "TURN_OFF", None) is not None:
                     features |= ClimateEntityFeature.TURN_OFF
-                return features
-            return ClimateEntityFeature(0)
+            if self.coordinator.write_setpoint_allowed:
+                # The setpoint write affordance — ONLY behind the
+                # setpoint gate (the read display needs no gate: the
+                # home is [P owner]).
+                features |= ClimateEntityFeature.TARGET_TEMPERATURE
+            return features
         return self._attr_supported_features
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
-        """Spec 017 FR-5 diagnostics: the write-control gate + the
-        last power-write verdict — the cheap support surface. The
-        locked surface and the classic entity keep their exact prior
-        surface (byte-identical, AC-3/US-6)."""
-        if not self._read_only or not self.coordinator.write_control_allowed:
+        """Spec 017 FR-5 diagnostics + the spec 019 twin: each open
+        gate's marker and its last-write stage dict. The locked surface
+        (both write gates closed) keeps its exact prior surface (None,
+        byte-identical, AC-2/US-6); the classic entity never enters the
+        branches."""
+        if not self._read_only:
             return None
-        attrs: dict[str, Any] = {"write_control": "allowed"}
-        last = self.coordinator.last_control_write
-        if last is not None:
-            attrs["last_power_write"] = dict(last)
-        return attrs
+        attrs: dict[str, Any] = {}
+        if self.coordinator.write_control_allowed:
+            attrs["write_control"] = "allowed"
+            last = self.coordinator.last_control_write
+            if last is not None:
+                attrs["last_power_write"] = dict(last)
+        # Spec 019 FR-11: the setpoint gate's marker + stage dict — the
+        # gates compose, so the setpoint diagnostics appear with EITHER
+        # gate open (the read display needs no gate at all — the home
+        # is [P owner]; the tile's truth stays the pushed mirror
+        # alone, contract 019 §5.2).
+        if self.coordinator.write_setpoint_allowed:
+            attrs["write_setpoint"] = "allowed"
+            last_sp = self.coordinator.last_setpoint_write
+            if last_sp is not None:
+                attrs["last_setpoint_write"] = dict(last_sp)
+        return attrs or None
 
     # ------------------------------------------------------------- unit conv
     @property
@@ -205,6 +232,15 @@ class AquaTempClimateEntity(ClimateEntity, AquaTempEntity):
 
     @property
     def min_temp(self) -> float:
+        if self._read_only:
+            # Spec 019 FR-8: the push-mode bounds are the guard's own
+            # range — one source of truth with ALLOWED_WRITE_SETPOINT
+            # (the static [D] bounds 10.0/40.0; the [A-weak] ladder
+            # bound candidates are NOT displayed until a future spec
+            # pins them, research 019 §10 U-5).
+            celsius = registers.SETPOINT_MIN_RAW / registers.TEMP_SCALE
+            value = self._to_display_unit(celsius)
+            return value if value is not None else celsius
         data = self.coordinator.data
         value = self._to_display_unit(data.min_target) if data else None
         if value is not None:
@@ -214,6 +250,12 @@ class AquaTempClimateEntity(ClimateEntity, AquaTempEntity):
 
     @property
     def max_temp(self) -> float:
+        if self._read_only:
+            # Spec 019 FR-8: the push-mode upper bound — the guard's own
+            # constant (40.0 °C), the same number the funnel enforces.
+            celsius = registers.SETPOINT_MAX_RAW / registers.TEMP_SCALE
+            value = self._to_display_unit(celsius)
+            return value if value is not None else celsius
         data = self.coordinator.data
         value = self._to_display_unit(data.max_target) if data else None
         if value is not None:
@@ -297,6 +339,23 @@ class AquaTempClimateEntity(ClimateEntity, AquaTempEntity):
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
         if self._read_only:
+            # Spec 019 FR-11: with the setpoint gate open, the push-mode
+            # climate writes the target through the confirmation cycle
+            # (validate -> funnel -> write -> trigger -> the MIRROR
+            # decides — contract 019 §5). With the gate closed, the
+            # exact 015 refusal (byte-identical, AC-2). The write is
+            # allowed regardless of power state (contract 019 §5.4 —
+            # the register is the machine's stored parameter) and is
+            # NEVER clamped: a value off the 0.5 step or outside
+            # 10.0-40.0 °C raises loudly through the cycle
+            # (contract 019 §2.2).
+            if self.coordinator.write_setpoint_allowed:
+                temp = kwargs.get(ATTR_TEMPERATURE)
+                if temp is None:
+                    return
+                celsius = self._from_display_unit(temp)
+                await self.coordinator.async_control_write_setpoint(celsius)
+                return
             self._refuse_write()
         temp = kwargs.get(ATTR_TEMPERATURE)
         if temp is None:

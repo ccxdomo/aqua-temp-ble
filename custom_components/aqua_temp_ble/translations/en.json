@@ -79,10 +79,12 @@
           "pair_on_connect": "Pair on connect (evidence-gated)",
           "push_temp_confirmed": "The captured temperatures match the app's parameter view (calibration verified)",
           "push_control_confirmed": "The captured power/mode registers match the app's display (diff-toggle calibration verified)",
-          "write_control": "Allow power control (write)"
+          "write_control": "Allow power control (write)",
+          "write_setpoint": "Allow setpoint control (write)"
         },
         "data_description": {
-          "write_control": "Requires your own probe verdict: power write probe: EXECUTED + REVERSIBLE (mirror 2011 followed 0→1→0). While enabled, the climate's Heat/Off buttons really start and stop the pump — the same register write the vendor app's power slide sends."
+          "write_control": "Requires your own probe verdict: power write probe: EXECUTED + REVERSIBLE (mirror 2011 followed 0→1→0). While enabled, the climate's Heat/Off buttons really start and stop the pump — the same register write the vendor app's power slide sends.",
+          "write_setpoint": "Requires your own probe verdict: setpoint write probe: EXECUTED + REVERSIBLE (mirror 1046 followed <S>→<T>→<S>). While enabled, the climate's target slider really sets the heat setpoint (register 1046, 10.0-40.0 °C in 0.5 steps) — the same register write the vendor app's setpoint control sends. Writes outside 10.0-40.0 °C or off the 0.5 step are refused, never silently rounded."
         }
       }
     }
@@ -105,6 +107,16 @@
     "power_write_probe": {
       "name": "Power write probe",
       "description": "Runs the power-write proof probe: sends the vendor's own power-ON frame, verifies the pushed mirror register 2011 follows it, then sends the power-OFF frame and verifies the revert. One WARNING verdict line is logged with the outcome. The unit must be OFF and the vendor app must be closed. Diagnostic measurement, not a control surface.",
+      "fields": {
+        "device_id": {
+          "name": "Device",
+          "description": "Device to probe. Leave empty to probe every configured Aqua Temp unit."
+        }
+      }
+    },
+    "setpoint_write_probe": {
+      "name": "Setpoint write probe",
+      "description": "Runs the two-phase setpoint proof probe: phase A writes the register's own current value back (a true no-op — nothing can change) and verifies no neighbor register moved; phase B dips the heat setpoint by 0.5 °C, verifies the pushed mirror register 1046 follows, then reverts it and verifies again. The physical effect: the pool's heat target dips half a degree for about 2 minutes, then returns. One WARNING verdict line is logged with the outcome. Close the vendor app first. Diagnostic measurement, not a control surface.",
       "fields": {
         "device_id": {
           "name": "Device",

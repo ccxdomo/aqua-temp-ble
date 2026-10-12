@@ -519,6 +519,67 @@ if __name__ == "__main__":
         failures,
     )
 
+    # 13c. Spec 019 AC-1/T4 — the SETPOINT parity vectors (research
+    #     019 §6, CRC-computed through the app's own builder pipeline
+    #     and re-verified independently in the repo): 30.0 °C = 300 and
+    #     29.5 °C = 295 to register 1046 (the family-2 heat slot,
+    #     [A-strong — research 019 §5]). The build_write_registers
+    #     cross-check keeps one source of truth (the 017 AC-1
+    #     precedent). NOTE on the 31.0 °C row: research 019 §6 prints
+    #     the body ...0132 (= 306 = 30.6 °C) — an internal arithmetic
+    #     slip (306 is off the vendor's own 0.5-grained value space);
+    #     the PROVEN formula (value = temp × 10, research 019 §2 [P])
+    #     gives 310 = 0x0136, pinned here from the verified pipeline.
+    SETPOINT_VECTORS = [
+        ("setpoint 30.0 °C", 300, "63100416000102012c5049"),
+        ("setpoint 29.5 °C", 295, "631004160001020127118e"),
+        ("setpoint 31.0 °C (pipeline-derived)", 310, "631004160001020136d182"),
+    ]
+    for name, val, hexstr in SETPOINT_VECTORS:
+        frame = bytes.fromhex(hexstr)
+        ok = (
+            len(frame) == 11
+            and validate_crc(frame)
+            and build_write_control(1046, val) == frame
+            and frame[4:6] == b"\x00\x01"
+            and frame[6] == 0x02
+        )
+        _check(f"setpoint frame {name}: {hexstr}", ok, failures)
+    # the FR-3 cross-check: the generic funnel and the control builder
+    # agree at the setpoint address — one source of truth (AC-1).
+    _check(
+        "setpoint funnel parity AC-1: build_write_registers(1046,[300]) == "
+        "build_write_control(1046,300)",
+        build_write_registers(1046, [300]) == build_write_control(1046, 300),
+        failures,
+    )
+    # the registers cross-source: the write constants cohere with the
+    # pinned read home (NFR-3's evidence discipline, at self-test time).
+    try:
+        import registers as _registers_019
+
+        ok = (
+            _registers_019.WRITE_REG_SETPOINT == 1046
+            and _registers_019.READ_MIRROR_SETPOINT
+            == _registers_019.PUSHED_CONTROL["setpoint"]
+            == 1046
+            and build_write_control(
+                _registers_019.WRITE_REG_SETPOINT, 300
+            )
+            == bytes.fromhex("63100416000102012c5049")
+            and _registers_019.WRITE_SETPOINT_FAMILY_MAP[2][1] == 1046
+            and 300 in _registers_019.ALLOWED_WRITE_SETPOINT[1046]
+            and 297 not in _registers_019.ALLOWED_WRITE_SETPOINT[1046]
+            and _registers_019.WRITE_SETPOINT_PROVEN is False
+        )
+    except ImportError:  # pragma: no cover — registers.py sits beside modbus.py
+        ok = False
+    _check(
+        "setpoint constants cohere with registers (spec 019 NFR-3)",
+        ok,
+        failures,
+    )
+
     # 12. parse_block_response error paths (plan 008 §1.1 validation order)
     corrupt_block = bytearray(frame1001)
     corrupt_block[10] ^= 0xFF

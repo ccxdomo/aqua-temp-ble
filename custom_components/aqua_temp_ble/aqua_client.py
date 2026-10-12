@@ -2523,6 +2523,115 @@ class AquaTempBleClient:
         except Exception as exc:  # noqa: BLE001
             raise AquaTempConnectionError(f"GATT write failed: {exc}") from exc
 
+    # ---------------------------------------- spec 019 setpoint seams
+    def _setpoint_write_frame(self, value_raw: int) -> bytes:
+        """The setpoint rail + frame (spec 019 FR-6/FR-10): shared by
+        the probe seam and the control write.
+
+        Rail (defense in depth under the funnel guard, the
+        write_probe_frame/write_control precedent): the value must be
+        an int inside [SETPOINT_MIN_RAW, SETPOINT_MAX_RAW] AND a
+        multiple of SETPOINT_STEP_RAW, else ValueError BEFORE any byte
+        goes out — the frame is BUILT (never string-pinned: the probe's
+        values are dynamic), the builder is the parity builder
+        (modbus.build_write_control — one source of truth, asserted
+        byte-equal to research 019 §6's vectors by the self-test), and
+        the frame's address field is asserted == WRITE_REG_SETPOINT
+        (the shape rail: only 1046 may ever be aimed at). A regulation
+        value is never rounded, never clamped (contract 019 §2.2)."""
+        if not isinstance(value_raw, int) or isinstance(value_raw, bool):
+            raise ValueError(
+                f"setpoint raw {value_raw!r} is not an int (contract 019 §2)"
+            )
+        if not (
+            registers.SETPOINT_MIN_RAW <= value_raw <= registers.SETPOINT_MAX_RAW
+        ):
+            raise ValueError(
+                f"setpoint raw {value_raw} is outside "
+                f"{registers.SETPOINT_MIN_RAW}..{registers.SETPOINT_MAX_RAW} "
+                "(10.0-40.0 °C) — the value allowlist is part of the guard "
+                "(contract 019 §2.2)"
+            )
+        if value_raw % registers.SETPOINT_STEP_RAW != 0:
+            raise ValueError(
+                f"setpoint raw {value_raw} is not a multiple of "
+                f"{registers.SETPOINT_STEP_RAW} (the 0.5 °C step) — a "
+                "regulation value is never rounded (contract 019 §2.2)"
+            )
+        frame = modbus.build_write_control(
+            registers.WRITE_REG_SETPOINT, value_raw
+        )
+        if int.from_bytes(frame[2:4], "big") != registers.WRITE_REG_SETPOINT:
+            # The shape rail: the builder is deterministic, so this can
+            # never fire — but a future builder change must fail HERE,
+            # before the frame reaches the wire.
+            raise ValueError(  # pragma: no cover — the rail's own net
+                "setpoint frame address "
+                f"{int.from_bytes(frame[2:4], 'big')} is not "
+                f"{registers.WRITE_REG_SETPOINT} (the shape rail)"
+            )
+        return frame
+
+    async def write_setpoint_probe_frame(self, value_raw: int) -> None:
+        """The setpoint write probe's ONLY send path (spec 019 FR-6,
+        the write_probe_frame precedent): the SAME `_write_frame` seam
+        as every other write (the 011-suite override point), the
+        session's resolved write mode — without-response app parity on
+        the production ff03 bucket (spec 010 §2.3; contract 019 §2.4).
+        NEVER `write_registers` (the echo trap — contract 017 §4).
+
+        Safety rail: only an in-range, on-step value for register 1046
+        may ever pass (the shared `_setpoint_write_frame` rail);
+        anything else raises ValueError BEFORE a byte goes out. The
+        only caller is the probe (coordinator.async_setpoint_write_probe
+        — spec 019 FR-5/FR-7); the probe's own frames bypass the
+        funnel by design (contract 019 §3 — this seam IS the probe's
+        guard).
+        """
+        frame = self._setpoint_write_frame(value_raw)
+        if not self.is_connected:
+            raise AquaTempConnectionError("not connected")
+        _LOGGER.debug(
+            "TX setpoint probe fire-and-forget (%d bytes): %s",
+            len(frame),
+            frame.hex(),
+        )
+        try:
+            await self._write_frame(frame)
+        except AquaTempError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise AquaTempConnectionError(f"GATT write failed: {exc}") from exc
+
+    async def write_setpoint(self, value_raw: int) -> None:
+        """The setpoint control write (spec 019 FR-10, T9): the control
+        twin of the probe seam — the SAME value rail (address 1046,
+        range, step), the SAME fire-and-forget `_write_frame` send
+        with the session's resolved write mode (without-response app
+        parity, contract 016 §5's table). NEVER `write_registers`
+        (the echo trap — contract 017 §4): the MIRROR (the fresh
+        pushed 1046-block) is the confirmation, never an echo.
+
+        Only reachable behind the funnel (ensure_writable with the
+        setpoint_allowed thread — the coordinator's confirmation
+        cycle); this client-side rail is the defense in depth under
+        it (both layers enforce the same permanent value allowlist,
+        contract 019 §2.2)."""
+        frame = self._setpoint_write_frame(value_raw)
+        if not self.is_connected:
+            raise AquaTempConnectionError("not connected")
+        _LOGGER.debug(
+            "TX setpoint control fire-and-forget (%d bytes): %s",
+            len(frame),
+            frame.hex(),
+        )
+        try:
+            await self._write_frame(frame)
+        except AquaTempError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise AquaTempConnectionError(f"GATT write failed: {exc}") from exc
+
     # ------------------------------------------------- spec 013 harvest
     async def harvest_pushes(
         self,

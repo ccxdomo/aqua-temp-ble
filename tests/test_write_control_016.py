@@ -157,8 +157,12 @@ def test_write_plane_constants_transcribed() -> None:
 
 def test_read_map_untouched() -> None:
     """FR-1/NFR-3: the READ plane is untouched — PUSHED_CONTROL keeps
-    the spec-015 pinning and the base allowlist keeps spec 003 §6."""
-    assert registers.PUSHED_CONTROL == {"power": 2011, "mode": 2019, "setpoint": None}
+    the 015 pinning for power/mode (spec 019 T1 later pinned the
+    setpoint home to 1046 — the owner's panel diff, research 019 §1)
+    and the base allowlist keeps spec 003 §6."""
+    assert registers.PUSHED_CONTROL == {
+        "power": 2011, "mode": 2019, "setpoint": 1046,
+    }
     assert registers.ALLOWED_WRITE_BASE == frozenset({8, 13, 14})
     assert registers.PUSH_TEMP_CONFIRMED is False
     assert registers.PUSH_CONTROL_CONFIRMED is False
@@ -990,13 +994,16 @@ def test_button_platform_adds_power_write_probe() -> None:
         added.extend(entities)
 
     asyncio.run(button_mod.async_setup_entry(hass, entry, _collect))
-    assert len(added) == 2, [type(e).__name__ for e in added]
-    probe_btn = added[-1]
-    assert probe_btn._attr_name == "Power write probe"
+    # Spec 019 T7 added a THIRD button (the setpoint probe); the 016
+    # power probe keeps its exact assertions — selected BY NAME now.
+    assert len(added) == 3, [type(e).__name__ for e in added]
+    probe_btn = next(e for e in added if e._attr_name == "Power write probe")
     assert probe_btn._attr_entity_category == EntityCategory.DIAGNOSTIC
     assert "power_write_probe" in probe_btn._attr_unique_id
     # the probe-registers button is unchanged (non-regression)
     assert added[0]._attr_name == "Probe registers"
+    # the spec-019 sibling routes to the setpoint probe (its own suite)
+    assert added[2]._attr_name == "Setpoint write probe"
     # pressing runs the probe end-to-end on the scripted client
     with _probe_logs():
         asyncio.run(probe_btn.async_press())

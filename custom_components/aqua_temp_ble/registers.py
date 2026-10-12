@@ -175,10 +175,14 @@ PUSHED_CONTROL: dict[str, int | None] = {
     # [P owner diff-revert 2026-10-12]: 0 -> 4 -> 0 across the same
     # toggle (quickstart 015 §1); the enum's other members are unknown.
     "mode": 2019,
-    # No setpoint home identified [P scan — research 015 §2.3]: no
-    # setpoint-shaped value in any pushed block; the 1046-ladder
-    # candidates stay unconfirmed — the climate displays NO target.
-    "setpoint": None,
+    # Spec 019 [P owner diff 2026-10-12 — research 019 §1]: register
+    # 1046 IS the heat setpoint — the owner's panel change (+1.0 °C)
+    # moved the first register of the pushed 1046-block 290 -> 300
+    # (29.0 -> 30.0 °C, x10 scaled). The home rides the EXISTING
+    # push_control_confirmed gate (the mapping is confirmed); the
+    # decode reads the capture of the block that CONTAINS the home
+    # (coordinator.from_pushes, FR-1) — NOT the 2001 window.
+    "setpoint": 1046,
 }
 
 # Spec 018 (contract 018-A §3): the OBSERVED-VALUES registry for the
@@ -207,7 +211,9 @@ PUSH_CONTROL_CANDIDATES: dict[int, str] = {
     2011: "power home [P owner diff-revert 2026-10-12]",
     2019: "mode home [P owner diff-revert 2026-10-12]",
     2012: "flag candidate [V] — static 1 across the 2026-10-12 diff",
-    1046: "setpoint candidate [A-weak] — Cooling set?",
+    # Spec 019 T1: the tag updated to the proven wording — 1046 is no
+    # longer a candidate (the panel diff proved it, research 019 §1).
+    1046: "setpoint home (heat) [P owner diff 2026-10-12]",
     1049: "setpoint candidate [A-weak] — Heating set?",
     1051: "setpoint candidate [A-weak] — Heating set / Auto. Set?",
     1055: "setpoint candidate [A-weak] — Max. cool?",
@@ -302,6 +308,56 @@ WRITE_FRAME_POWER_OFF = "631003f3000102000030f1"
 # CONTROLS (contract 016 §2); the probe only READS it.
 READ_MIRROR_POWER = PUSHED_CONTROL["power"]  # = 2011 [P]
 
+# --- setpoint write plane (spec 019, research 019 §2/§4/§5/§7) ----------
+# The vendor app's setpoint write: ONE register (qty 1, bytecount "02",
+# value = temp × 10 [P — research 019 §2's disassembly of the
+# home-screen setpoint handler 0x6a1f54/0x6a1fe8]) to an address
+# resolved at RUNTIME from a per-family, per-mode map recovered from
+# the disassembly [P — research 019 §4.1, the binder 0x5dc3c4]:
+#   CS.field_0x11b = Map{1: [1135,1136,1137], 2: [1051,1046,1068],
+#                        3: [1073,1074,1075]}[family][mode]
+# (mode 0/1/2 = cool/heat/auto [A — the mode handler's field order]).
+# The owner's unit adjudicates to family 2's heat slot = 1046
+# [A-strong — research 019 §5] — the SAME register the panel diff
+# proved is the live setpoint [P owner — research 019 §1]: the write
+# target and the read home COINCIDE (a PARAMETER register — the "66"
+# page's plane, read AND written by the vendor's own app; research
+# 019 §4.2/§5). The alternative 1013 hypothesis is disproven by the
+# exhaustive immediate scan (zero movz #1013 in the binary —
+# research 019 §3).
+WRITE_REG_SETPOINT = 1046  # [A-strong — research 019 §5; the map is data too]
+
+# The proof oracle: the pushed read home (1046). The write target and
+# the mirror are the SAME register — the fresh 1046-block capture is
+# the write's confirmation, NATIVELY (contract 019 §1: the mirror must
+# postdate the write it verifies).
+READ_MIRROR_SETPOINT = PUSHED_CONTROL["setpoint"]  # = 1046 [P owner]
+
+# The value discipline [D — research 019 §7]: the setpoint is a
+# REGULATION value — only raw 100..400 (10.0-40.0 °C) in steps of 5
+# (the 0.5 °C granularity; every observed raw is a multiple of 5
+# [P decode]) may EVER be written. PERMANENT: extending the range or
+# changing the step needs a new contract (contract 019 §2.2).
+SETPOINT_MIN_RAW = 100   # 10.0 °C
+SETPOINT_MAX_RAW = 400   # 40.0 °C
+SETPOINT_STEP_RAW = 5    # 0.5 °C
+
+# The vendor's per-family, per-mode write-address map — DATA ONLY
+# [P — research 019 §4.1], documented for the record. The family key's
+# exact semantics is [V] (research 019 §10 U-4 — the logcat oracle or a
+# targeted disassembly pass; NOT a control blocker). NO consumer may
+# ever read this map for a write target (contract 019 §7.1: no
+# mode-aware addressing at runtime — 1046 is pinned for this heat-only
+# unit; a multi-mode or other-family unit needs its own spec, its own
+# proof and its own contract; the unproven slots (1135-1137, 1051,
+# 1068, 1073-1075) are NEVER writable — installer thresholds,
+# contract 019 §7.2).
+WRITE_SETPOINT_FAMILY_MAP: dict[int, tuple[int, int, int]] = {
+    1: (1135, 1136, 1137),  # cool / heat / auto [P — the map's list order]
+    2: (1051, 1046, 1068),
+    3: (1073, 1074, 1075),
+}
+
 # --- write security (spec 003 §6 / FR-9) ---
 # The ONLY registers the integration may ever write: power, mode and the
 # current setpoint — all proven user-operational writes inside the base
@@ -326,6 +382,21 @@ ALLOWED_WRITE_CONTROL: dict[int, frozenset[int]] = {
     WRITE_REG_POWER: frozenset({0, 1}),
 }
 
+# --- write security, setpoint plane (spec 019 FR-4, contract 019 §4) ---
+# The THIRD gate's value discipline: the address AND the value
+# allowlist — 1046 accepts ONLY raw 100..400 in steps of 5 (10.0-40.0
+# °C, the 0.5 °C granularity), FOREVER, even when proven (contract 019
+# §2.2: a bounded RANGE instead of the power plane's {0, 1} — a
+# regulation value needs it; a 30.3 °C request is REFUSED, never
+# rounded; a 41.0 °C request is REFUSED, never clamped). The ladder's
+# other members (1049/1050/1051/1054/1055/1068…) are NEVER writable
+# here — installer thresholds (contract 019 §7.2).
+ALLOWED_WRITE_SETPOINT: dict[int, frozenset[int]] = {
+    WRITE_REG_SETPOINT: frozenset(
+        range(SETPOINT_MIN_RAW, SETPOINT_MAX_RAW + 1, SETPOINT_STEP_RAW)
+    ),
+}
+
 # The evidence gate (the WRITE_ECHO_EXPECTED / PUSH_TEMP_CONFIRMED
 # calibration-switch precedent): False is the SHIPPED default — with
 # it, ensure_writable refuses 1011 exactly as 0.11.0 refused it
@@ -338,9 +409,33 @@ ALLOWED_WRITE_CONTROL: dict[int, frozenset[int]] = {
 # wiring (spec 016 tasks.md T7/AC-11) stays parked until then.
 WRITE_CONTROL_PROVEN = False
 
+# The THIRD gate (spec 019 FR-9, contract 019 §4): SEPARATE from
+# WRITE_CONTROL_PROVEN by design — (a) contract 016 §4's
+# non-transference, restated: every register needs its own proof (the
+# power proof authorizes 1011 with {0, 1} and NOTHING here); (b) a
+# different risk class: a regulation VALUE whose misuse changes the
+# machine's thermal behavior, vs a reversible boolean; (c) independent
+# activation: the owner may want power control but not setpoint
+# control (the gates compose); (d) a different value discipline: a
+# bounded range with a granularity rule, not {0, 1}. False is the
+# SHIPPED default — with it, ensure_writable refuses 1046 exactly as
+# 0.13.2 refused it (AC-2: byte-identical). Flip to True ONLY after
+# the setpoint write probe's live verdict line
+#   setpoint write probe: EXECUTED + REVERSIBLE (mirror 1046 followed <S>→<T>→<S>)
+# is recorded (contract 019 §4 — the owner quotes it in the spec's
+# decision log / PR), then restart Home Assistant; the per-entry
+# `write_setpoint` option (const.DEFAULT_WRITE_SETPOINT) is the
+# no-restart twin (the write_control precedent). No code path, update
+# or default may ever SET either surface (contract 019 §4.1).
+WRITE_SETPOINT_PROVEN = False
+
 
 def ensure_writable(
-    address: int, value: int | None = None, *, control_allowed: bool | None = None
+    address: int,
+    value: int | None = None,
+    *,
+    control_allowed: bool | None = None,
+    setpoint_allowed: bool | None = None,
 ) -> None:
     """Guard the single write funnel: raise ValueError unless allowed.
 
@@ -371,6 +466,23 @@ def ensure_writable(
     reads the caller's own activation state per call. The base-block
     rules ignore the thread entirely; the address AND value allowlists
     stay permanent (contract 016 §4's value discipline).
+
+    Spec 019 FR-4 adds the SETPOINT plane — the THIRD gate, separate
+    by design (contract 019 §4): a register in ALLOWED_WRITE_SETPOINT
+    (today: 1046) is writable ONLY when the setpoint gate is open
+    (WRITE_SETPOINT_PROVEN, or the caller's own activation state via
+    the `setpoint_allowed` thread — the 017 pattern, read per call;
+    None keeps the module switch) AND the value is in the entry's
+    allowlist (100..400 in steps of 5 — a REGULATION value is never
+    rounded or clamped, contract 019 §2.2). With the gate False
+    (shipped), 1046 is refused exactly as 0.13.2 refused it (AC-2:
+    byte-identical) — the ONLY pre-proof write path is the
+    owner-triggered setpoint write probe (coordinator.
+    async_setpoint_write_probe, whose frames go through the client's
+    own validated seam, NOT through this funnel — contract 019 §3).
+    The base and power rules are untouched by the new thread; the
+    non-transference rule stands (contract 016 §4/019 §4.3): the power
+    proof authorizes NOTHING here.
     """
     allowed = ALLOWED_WRITE_BASE
     if WRITE_MODE_SETPOINT_TOO:
@@ -397,6 +509,30 @@ def ensure_writable(
             raise ValueError(
                 f"register {address} accepts only values {sorted(values)} "
                 "(contract 016 §4 — the value allowlist is part of the guard)"
+            )
+        return
+    if address in ALLOWED_WRITE_SETPOINT:
+        # Spec 019 FR-4: the setpoint branch — gate closed → the locked
+        # message naming the probe verdict + WRITE_SETPOINT_PROVEN;
+        # gate open + a value outside the allowlist → the
+        # value-discipline message (the range and the step in the text).
+        gate = (
+            WRITE_SETPOINT_PROVEN if setpoint_allowed is None else bool(setpoint_allowed)
+        )
+        if not gate:
+            raise ValueError(
+                f"register {address} is not writable (spec 003 §6; the "
+                "setpoint plane stays locked until the setpoint write "
+                "probe's EXECUTED + REVERSIBLE verdict flips "
+                "WRITE_SETPOINT_PROVEN — contract 019 §4)"
+            )
+        values = ALLOWED_WRITE_SETPOINT[address]
+        if value is None or value not in values:
+            raise ValueError(
+                f"register {address} accepts only values "
+                f"{SETPOINT_MIN_RAW}..{SETPOINT_MAX_RAW} in steps of "
+                f"{SETPOINT_STEP_RAW} (10.0-40.0 °C in 0.5 steps) — the "
+                "setpoint value allowlist is permanent (contract 019 §2.2)"
             )
         return
     raise ValueError(f"register {address} is not writable (spec 003 §6)")
@@ -562,11 +698,20 @@ KNOWN_LABELS.update({
     2018: "unknown (168) [V]",
     2011: "Power (pushed control) [P owner diff 2026-10-12]",
     2019: "Mode (pushed control) [P owner diff 2026-10-12]",
-    1046: "setpoint candidate [A-weak] — Cooling set?",
-    1049: "setpoint candidate [A-weak] — Heating set?",
-    1051: "setpoint candidate [A-weak] — Heating set / Auto. Set?",
+    # Spec 019 (research 019 §1.1 — the corrected ladder labels): the
+    # panel's page order is NOT the register order. 1046 is the PROVEN
+    # heat home; 1051/1068 are the per-mode candidates adjudicated from
+    # the family map [A-strong]; 1049 is a ladder member (min-bound or
+    # diff family, [V]); 1050/1054 are the max/min BOUND candidates,
+    # kept [A-weak] — never promoted until a bounds-diff at the panel
+    # pins them (research 019 §10 U-5).
+    1046: "setpoint home (heat) [P owner diff 2026-10-12]",
+    1049: "setpoint-block ladder member (min-bound/diff family) [V 019]",
+    1050: "max-bound candidate (40.0) [A-weak 019]",
+    1051: "cool setpoint candidate [A-strong 019]",
+    1054: "min-bound candidate (10.0) [A-weak 019]",
     1055: "setpoint candidate [A-weak] — Max. cool?",
-    1068: "setpoint candidate [A-weak] — Auto. set?",
+    1068: "auto setpoint candidate [A-strong 019]",
 })
 
 # Spec 016 (FR-1): the WRITE-plane tags — the probe-log annotation
