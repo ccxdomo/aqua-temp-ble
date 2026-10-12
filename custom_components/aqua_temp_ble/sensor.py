@@ -7,13 +7,12 @@ under a label. A pinned address must also lie inside the polled base block
 high-block polling is a future phase).
 
 Spec 013 (FR-5/FR-6) adds the pushed-plane surface: entries with
-mode == "push" get the mirrored base keys (inlet/outlet/ambient —
-values from the pushed registers only once the calibration gate is
-open, `unknown` until then) plus the push-only T-family keys behind
-the same gate, plus the push_stream diagnostic. fault_code, firmware
-and the climate entity are NOT created in push mode — their data has
-no identified pushed home [P/V] (contract 013 §4.4). Classic entries
-keep today's exact creation rules (US-6).
+mode == "push" get ALL six T-family sensors (values from the pushed
+registers — spec 022: active by default, the calibration gate is
+gone) plus the push_stream diagnostic. fault_code and firmware are
+NOT created in push mode — their data has no identified pushed home
+[P/V] (contract 013 §4.4). Classic entries keep today's exact
+creation rules (US-6).
 """
 
 from __future__ import annotations
@@ -59,27 +58,19 @@ async def async_setup_entry(
 ) -> None:
     coordinator: AquaTempCoordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
     if str(entry.data.get("mode", "classic")) == "push":
-        # Spec 013 FR-5/FR-6 (contract 013 §4): the pushed-plane entity
-        # surface — monitoring only. The mirrored base keys are created
-        # (decoding `unknown` until the calibration gate opens, contract
-        # 013 §4.3); the push-only T-family keys are created only when
-        # the gate is open; fault_code/firmware have no pushed home [P]
-        # and are NOT created (§4.4); the push_stream diagnostic always
-        # rides along (FR-6).
-        confirmed = coordinator.push_temp_confirmed
+        # Spec 013 FR-5/FR-6 + spec 022 FR-1/FR-3: the pushed-plane
+        # entity surface — ACTIVE BY DEFAULT. ALL six T-family sensors
+        # are created unconditionally (values from the pushed registers,
+        # sentinel/plausibility-guarded by the shared helper);
+        # fault_code/firmware have no pushed home [P] and are NOT
+        # created (§4.4); the push_stream diagnostic always rides
+        # along (FR-6).
         entities: list[AquaTempSensorEntity | AquaTempPushStreamEntity] = []
         for regdef in registers.SENSORS:
             if regdef.key not in registers.PUSHED_TEMPS:
                 _LOGGER.debug(
                     "sensor %s skipped in push mode: no pushed register "
                     "(spec 013 FR-5)",
-                    regdef.key,
-                )
-                continue
-            if regdef.key not in registers.PUSHED_MIRRORS and not confirmed:
-                _LOGGER.debug(
-                    "sensor %s skipped: push temperatures not confirmed "
-                    "yet (quickstart 013 §2)",
                     regdef.key,
                 )
                 continue
@@ -137,11 +128,10 @@ class AquaTempSensorEntity(AquaTempEntity, SensorEntity):
             # Spec 013 FR-5 (contract 013 §4.3): the pushed-plane read.
             # The key's register comes from registers.PUSHED_TEMPS at
             # render time — the single source of truth (a permuted
-            # calibration outcome is a one-line edit there). Unconfirmed
-            # raws never reached the entity plane (from_pushes withheld
-            # them) -> `unknown`; the shared decode helper handles the
-            # sentinels + plausibility on this plane identically (no
-            # second decoder, contract 013 §7.2).
+            # calibration outcome is a one-line edit there). The
+            # capture's raws ride data.registers; the shared decode
+            # helper handles the sentinels + plausibility on this
+            # plane identically (no second decoder, contract 013 §7.2).
             address = registers.PUSHED_TEMPS.get(self._regdef.key)
             if address is None:
                 return None

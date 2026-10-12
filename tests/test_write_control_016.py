@@ -10,9 +10,9 @@ modbus.build_write_control builder reproducing the four pinned vectors
 of research 016 §2.1 byte-exact (AC-1, NFR-2's two-sources cross-check
 against registers.WRITE_FRAME_*), the probe-log annotations
 (KNOWN_LABELS), the untouched read map (PUSHED_CONTROL/ALLOWED_WRITE_
-BASE) and the guard matrix: AC-2 (1011 refused while WRITE_CONTROL_
-PROVEN is False — the shipped default), AC-3 (proven=True opens 1011
-with the {0,1} value allowlist; 1012/1076/None-value refused), AC-4
+BASE) and the guard matrix (spec 022: the PROVEN switch is gone —
+1011 is writable BY DEFAULT within the {0,1} value allowlist;
+1012/1076/None-value refused), AC-4
 (the base-block rules byte-identical: one-arg calls still work, 15/
 1004/2001/2090 still raise — a read home is never writable, contract
 016 §2 — and 19-21 stay behind WRITE_MODE_SETPOINT_TOO).
@@ -32,14 +32,17 @@ FR-4 step-4 robust order (ONE retry trigger after a silent write
 window), the disconnect-on-completion and the T3 funnel (async_write_
 register threads the value through the guard).
 
-Part D (the surfaces, AC-9/AC-10): the diagnostic "Power write probe"
-button routes to the probe; the push-mode climate is STILL read-only
-while WRITE_CONTROL_PROVEN is False (the 015 surface unchanged); the
-service is declared in services.yaml/strings.json/translations.
+Part D (the surfaces, spec 022): the diagnostic "Power write probe"
+button routes to the probe; the push-mode climate is created with the
+FULL surface (active by default — the read-only world is dead with
+the gates); the service is declared in
+services.yaml/strings.json/translations.
 
-Phase 2 (T7/AC-11) is BLOCKED on the owner's live verdict (contract
-016 §4) and deliberately NOT tested here — with the shipped switch
-False the funnel refuses 1011, which Part A pins.
+Spec 022 note: the 016 gate surfaces (the PROVEN switch, the
+gate-closed refusals, the read-only climate) are INVERTED — the gates
+are gone; the living behaviours (the pinned frames, the builder
+parity, the probe's verdict paths, the button, the service) keep
+their assertions.
 
 Red-first on d8f6385 (0.11.0): none of the write-plane constants, the
 builder, the guard extension, the probe seam or the probe itself
@@ -146,10 +149,9 @@ def test_write_plane_constants_transcribed() -> None:
     # the pinned frames, byte-for-byte research 016 §2.1
     assert registers.WRITE_FRAME_POWER_ON == POWER_ON_HEX
     assert registers.WRITE_FRAME_POWER_OFF == POWER_OFF_HEX
-    # the shipped evidence gate is OFF (contract 016 §4 — the proof
-    # gate; flipping without the live verdict is a contract violation)
-    assert registers.WRITE_CONTROL_PROVEN is False
     # the control allowlist: the address AND the value allowlist only
+    # (spec 022: the value rail is the PERMANENT protection — the
+    # human gate is gone)
     assert registers.ALLOWED_WRITE_CONTROL == {
         registers.WRITE_REG_POWER: frozenset({0, 1}),
     }
@@ -164,8 +166,6 @@ def test_read_map_untouched() -> None:
         "power": 2011, "mode": 2019, "setpoint": 1046,
     }
     assert registers.ALLOWED_WRITE_BASE == frozenset({8, 13, 14})
-    assert registers.PUSH_TEMP_CONFIRMED is False
-    assert registers.PUSH_CONTROL_CONFIRMED is False
 
 
 def test_pinned_control_frame_vectors() -> None:
@@ -213,41 +213,38 @@ def test_write_plane_labels_annotated() -> None:
     assert registers.KNOWN_LABELS[8] == "Power [P]"
 
 
-def test_guard_shipped_default_refuses_control_plane() -> None:
-    """AC-2: with WRITE_CONTROL_PROVEN False (shipped), ensure_writable
-    refuses 1011 for every value — the write plane stays locked exactly
-    as 0.11.0 refused it, and the error names the evidence gate."""
-    assert registers.WRITE_CONTROL_PROVEN is False
-    for value in (0, 1, 2):
-        with expect_raises(ValueError, "not writable", "WRITE_CONTROL_PROVEN"):
-            registers.ensure_writable(registers.WRITE_REG_POWER, value)
-    # the one-argument form (the historic callers' signature) also refuses
-    with expect_raises(ValueError, "not writable"):
+def test_guard_control_value_rail_by_default() -> None:
+    """AC-4 (spec 022, the inversion of the shipped-locked world):
+    ensure_writable admits 1011 BY DEFAULT within its PERMANENT value
+    rail — 0/1 pass; any other value (and the valueless form) is
+    refused with the value-discipline message, ZERO bytes moving."""
+    for good in (0, 1):
+        registers.ensure_writable(registers.WRITE_REG_POWER, good)  # must not raise
+    for bad in (2, None):
+        with expect_raises(ValueError, "accepts only values"):
+            registers.ensure_writable(registers.WRITE_REG_POWER, bad)
+    # the one-argument form (the historic callers' signature) refuses
+    with expect_raises(ValueError, "accepts only values"):
         registers.ensure_writable(registers.WRITE_REG_POWER)
 
 
-def test_guard_proven_opens_power_value_allowlist() -> None:
-    """AC-3: with the gate open (the owner's post-verdict flip),
-    1011 accepts ONLY 0/1; any other value, any other control register
-    (mode 1012/1013, mute 1076) and a valueless control write all raise.
-    The base allowlist never leaks into the control plane."""
-    with _patch_attr(registers, "WRITE_CONTROL_PROVEN", True):
-        registers.ensure_writable(registers.WRITE_REG_POWER, 0)  # must not raise
-        registers.ensure_writable(registers.WRITE_REG_POWER, 1)  # must not raise
-        with expect_raises(ValueError, "accepts only values"):
-            registers.ensure_writable(registers.WRITE_REG_POWER, 2)
-        with expect_raises(ValueError, "accepts only values"):
-            registers.ensure_writable(registers.WRITE_REG_POWER, None)
-        with expect_raises(ValueError, "not writable"):
-            registers.ensure_writable(registers.WRITE_REG_MODE, 1)
-        with expect_raises(ValueError, "not writable"):
-            registers.ensure_writable(registers.WRITE_REG_MODE_PAIR, 0)
-        with expect_raises(ValueError, "not writable"):
-            registers.ensure_writable(registers.WRITE_REG_MUTE, 1)
-    # restored: the gate is closed again
-    assert registers.WRITE_CONTROL_PROVEN is False
-    with expect_raises(ValueError):
-        registers.ensure_writable(registers.WRITE_REG_POWER, 1)
+def test_guard_power_value_allowlist_permanent() -> None:
+    """AC-3/AC-4 (spec 022): 1011 accepts ONLY 0/1 — the value rail is
+    PERMANENT (no gate to open); any other value, any other control
+    register (mode 1012/1013, mute 1076) and a valueless control write
+    all raise. The base allowlist never leaks into the control plane."""
+    registers.ensure_writable(registers.WRITE_REG_POWER, 0)  # must not raise
+    registers.ensure_writable(registers.WRITE_REG_POWER, 1)  # must not raise
+    with expect_raises(ValueError, "accepts only values"):
+        registers.ensure_writable(registers.WRITE_REG_POWER, 2)
+    with expect_raises(ValueError, "accepts only values"):
+        registers.ensure_writable(registers.WRITE_REG_POWER, None)
+    with expect_raises(ValueError, "not writable"):
+        registers.ensure_writable(registers.WRITE_REG_MODE, 1)
+    with expect_raises(ValueError, "not writable"):
+        registers.ensure_writable(registers.WRITE_REG_MODE_PAIR, 0)
+    with expect_raises(ValueError, "not writable"):
+        registers.ensure_writable(registers.WRITE_REG_MUTE, 1)
 
 
 def test_guard_base_block_rules_unchanged() -> None:
@@ -255,18 +252,17 @@ def test_guard_base_block_rules_unchanged() -> None:
     {8,13,14} pass with AND without a value (the backward-compatible
     signature), 19-21 stay behind WRITE_MODE_SETPOINT_TOO, and the
     never-writable set still raises: the installer families, the high
-    blocks and the READ home 2011 (never written even when proven —
-    contract 016 §2)."""
+    blocks and the READ home 2011 (never written — contract 016 §2)."""
     for address in (registers.REG_POWER, registers.REG_MODE, registers.REG_SET_CURRENT_TEMP):
         registers.ensure_writable(address)  # one-arg form: unchanged
         registers.ensure_writable(address, 0)  # value threads through: unchanged
     for address in (15, 1004, 2001, 2090):
         with expect_raises(ValueError, "not writable", "spec 003"):
             registers.ensure_writable(address)
-    # a read home is never writable — even with the gate open
-    with _patch_attr(registers, "WRITE_CONTROL_PROVEN", True):
-        with expect_raises(ValueError, "not writable"):
-            registers.ensure_writable(registers.READ_MIRROR_POWER, 0)
+    # a read home is never writable — permanently (spec 022: the value
+    # rails are the only guards left, and 2011 is in none of them)
+    with expect_raises(ValueError, "not writable"):
+        registers.ensure_writable(registers.READ_MIRROR_POWER, 0)
     # 19-21 behind the default-off mirror switch (spec 003 §6 verbatim)
     for address in (19, 20, 21):
         with expect_raises(ValueError):
@@ -274,9 +270,11 @@ def test_guard_base_block_rules_unchanged() -> None:
     with _patch_attr(registers, "WRITE_MODE_SETPOINT_TOO", True):
         for address in (19, 20, 21):
             registers.ensure_writable(address)  # must not raise
-        # the mirror switch never opens the control plane
-        with expect_raises(ValueError):
-            registers.ensure_writable(registers.WRITE_REG_POWER, 1)
+        # the mirror switch never touches the control plane's value
+        # rail: 1011 accepts 1 (the default world) and still refuses 2
+        registers.ensure_writable(registers.WRITE_REG_POWER, 1)  # {0, 1}
+        with expect_raises(ValueError, "accepts only values"):
+            registers.ensure_writable(registers.WRITE_REG_POWER, 2)
 
 
 # ===========================================================================
@@ -640,6 +638,8 @@ class ScriptedProbeClient:
         self.read_calls = 0
         self.probe_writes: list[bytes] = []
         self.funnel_writes: list[tuple[int, list[int]]] = []
+        self.control_writes: list[tuple[int, int]] = []
+        self.setpoint_writes: list[int] = []
         self._store: dict[int, SimpleNamespace] = {}
 
     def _deliver(self) -> None:
@@ -664,6 +664,12 @@ class ScriptedProbeClient:
             if error is not None:
                 raise error  # a refused write never delivers a burst
         self._deliver()
+
+    async def write_control(self, address, value):
+        self.control_writes.append((address, value))
+
+    async def write_setpoint(self, value_raw: int) -> None:
+        self.setpoint_writes.append(value_raw)
 
     async def write_registers(self, address, values):
         self.funnel_writes.append((address, list(values)))
@@ -767,7 +773,7 @@ def test_probe_executed_reversible() -> None:
     assert len(lines) == 1, lines
     assert lines[0].startswith(
         "power write probe: EXECUTED + REVERSIBLE (mirror 2011 followed 0→1→0)"
-        " — evidence for phase 2 (WRITE_CONTROL_PROVEN)"
+        " — the write is proven (spec 022: the control is active by default)"
     ), lines[0]
     assert UUID_WRITE in lines[0], lines[0]
     # every stage observation + the verdict log at WARNING (the
@@ -937,30 +943,23 @@ def test_probe_uses_pinned_frames_only() -> None:
         )
 
 
-def test_write_funnel_threads_value_through_guard() -> None:
-    """T3: async_write_register passes the value to the guard — with the
-    shipped gate closed a 1011 funnel write raises before ANY client
-    I/O; with the gate open (the owner's post-verdict flip) the funnel
-    delivers (1011, [1]) to the client. The base-block path is
-    unchanged."""
+def test_write_funnel_delivers_control_by_default() -> None:
+    """T3 (spec 022, the inversion of the gate-threaded funnel):
+    async_write_register passes the value to the guard — the funnel
+    delivers (1011, [1]) to the client BY DEFAULT (the PERMANENT value
+    rail is the only guard); an off-rail value raises before ANY
+    client I/O; the base-block path is unchanged."""
     client = ScriptedProbeClient()
     coordinator = _make_probe_coordinator(client)
-    with expect_raises(ValueError, "WRITE_CONTROL_PROVEN"):
-        asyncio.run(coordinator.async_write_register(1011, 1))
-    assert client.funnel_writes == [], "a refused funnel write must not reach the client"
+    asyncio.run(coordinator.async_write_register(1011, 1))
+    assert client.funnel_writes == [(1011, [1])], client.funnel_writes
     # the base path is unchanged (the value threads through harmlessly)
     asyncio.run(coordinator.async_write_register(8, 1))
-    assert client.funnel_writes == [(8, [1])], client.funnel_writes
-    # with the gate open the funnel delivers the control write
-    with _patch_attr(coordinator_mod.registers, "WRITE_CONTROL_PROVEN", True):
-        asyncio.run(coordinator.async_write_register(1011, 1))
-    assert client.funnel_writes[-1] == (1011, [1]), client.funnel_writes
-    # value discipline through the funnel, gate open
-    with _patch_attr(coordinator_mod.registers, "WRITE_CONTROL_PROVEN", True):
-        with expect_raises(ValueError, "accepts only values"):
-            asyncio.run(coordinator.async_write_register(1011, 2))
-    assert coordinator_mod.registers is not registers  # separate instances
-    assert registers.WRITE_CONTROL_PROVEN is False  # the standalone module untouched
+    assert client.funnel_writes == [(1011, [1]), (8, [1])], client.funnel_writes
+    # value discipline through the funnel — the PERMANENT rail, no gate
+    with expect_raises(ValueError, "accepts only values"):
+        asyncio.run(coordinator.async_write_register(1011, 2))
+    assert client.funnel_writes == [(1011, [1]), (8, [1])], client.funnel_writes
 
 
 # ===========================================================================
@@ -1014,18 +1013,18 @@ def test_button_platform_adds_power_write_probe() -> None:
     assert client.disconnected
 
 
-def test_climate_still_read_only_while_unproven() -> None:
-    """AC-10: with the shipped WRITE_CONTROL_PROVEN=False the push-mode
-    climate STILL refuses every write (the spec-015 surface unchanged —
-    no write capability is advertised before the live proof)."""
+def test_climate_full_surface_while_active() -> None:
+    """Spec 022 (the inversion of the AC-10 read-only world): the
+    push-mode climate is created with NO options and its commands
+    WRITE — turn_on reaches the client's control rail; the heat-only
+    rule (COOL refused) stands; the probe seam stays untouched (the
+    climate uses the confirmation cycle, never the probe frames)."""
     caps = {
         2001: _capture({2010: 2001, 2011: 1, 2012: 1, 2017: 13, 2018: 168, 2019: 4}),
     }
-    snapshot = coordinator_mod.AquaTempData.from_pushes(caps, True, True)
+    snapshot = coordinator_mod.AquaTempData.from_pushes(caps)
     client = ScriptedProbeClient()
-    hass, entry, _coordinator = _make_surface_coordinator(
-        client, snapshot, options={"push_control_confirmed": True}
-    )
+    hass, entry, _coordinator = _make_surface_coordinator(client, snapshot)
     added: list = []
 
     def _collect(entities) -> None:
@@ -1034,17 +1033,14 @@ def test_climate_still_read_only_while_unproven() -> None:
     asyncio.run(climate_mod.async_setup_entry(hass, entry, _collect))
     assert len(added) == 1, [type(e).__name__ for e in added]
     entity = added[0]
-    assert entity._attr_hvac_modes == []  # read-only: no mode buttons
-    assert coordinator_mod.registers.WRITE_CONTROL_PROVEN is False
-    for call in (
-        lambda: entity.async_set_hvac_mode(HVACMode.HEAT),
-        lambda: entity.async_turn_on(),
-        lambda: entity.async_turn_off(),
-    ):
-        with expect_raises(HomeAssistantError, "read-only"):
-            asyncio.run(call())
-    # NOTHING reached the client — neither the funnel nor the probe seam
-    assert client.funnel_writes == []
+    assert entity.hvac_modes == [HVACMode.OFF, HVACMode.HEAT]
+    with _patch_attr(coordinator_mod.const, "PROBE_MIRROR_TIMEOUT", 0.05):
+        asyncio.run(entity.async_turn_on())
+    assert client.control_writes == [(1011, 1)], client.control_writes
+    # the heat-only rule stands (the mode write is refused — spec 018)
+    with expect_raises(HomeAssistantError, "heat-only"):
+        asyncio.run(entity.async_set_hvac_mode(HVACMode.COOL))
+    # the probe seam is never touched by the climate (the cycle's rail)
     assert client.probe_writes == []
 
 
@@ -1077,8 +1073,8 @@ def main() -> int:
         test_pinned_control_frame_vectors,
         test_builder_cross_checks_registers_pinned_strings,
         test_write_plane_labels_annotated,
-        test_guard_shipped_default_refuses_control_plane,
-        test_guard_proven_opens_power_value_allowlist,
+        test_guard_control_value_rail_by_default,
+        test_guard_power_value_allowlist_permanent,
         test_guard_base_block_rules_unchanged,
         # Part B — the seam
         test_probe_seam_wire_parity,
@@ -1095,10 +1091,10 @@ def main() -> int:
         test_probe_no_report_after_off_names_remediation,
         test_probe_att_error_on_off_names_remediation,
         test_probe_uses_pinned_frames_only,
-        test_write_funnel_threads_value_through_guard,
+        test_write_funnel_delivers_control_by_default,
         # Part D — the surfaces
         test_button_platform_adds_power_write_probe,
-        test_climate_still_read_only_while_unproven,
+        test_climate_full_surface_while_active,
         test_service_surfaces_declared,
     ]
     failures = 0

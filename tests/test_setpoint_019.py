@@ -6,12 +6,12 @@ data, the guard, the two-phase probe and the gated climate surface
 Part A (standalone modules — the test_registers pattern): the read home
 (PUSHED_CONTROL["setpoint"] = 1046 — [P owner diff 2026-10-12]), the
 write-plane constants (WRITE_REG_SETPOINT, the family map, the range/step
-raws, ALLOWED_WRITE_SETPOINT, WRITE_SETPOINT_PROVEN=False), the parity
+raws, ALLOWED_WRITE_SETPOINT), the parity
 vectors (build_write_control(1046, 300/295/310) == research 019 §6's
 pinned frames — CRC re-verified independently in this repo — plus the
-build_write_registers cross-check, AC-1), the guard matrix (AC-2: both
-setpoint gate surfaces False → 1046 refused exactly as 0.13.2 refused
-it; AC-3: the value discipline 100..400 step 5, the address allowlist,
+build_write_registers cross-check, AC-1), the guard matrix (spec 022:
+the gate is gone — 1046 is writable BY DEFAULT within the PERMANENT
+value discipline 100..400 step 5; the address allowlist,
 the power/base rules byte-identical), the integrity check (1046
 in-window, collision-free) and the corrected ladder labels.
 
@@ -23,8 +23,8 @@ not connected raises AquaTempConnectionError.
 
 Part C (coordinator, synthetic-package import — the 015/016 pattern):
 the FR-1 block-source decode (a store with ONLY a fresh 1046 block →
-the target decodes; the 2001 block only → target None — AC-4; the gate
-closed → None), then the two-phase probe over the scripted client:
+the target decodes; the 2001 block only → target None — AC-4;
+spec 022: the decode is unconditional), then the two-phase probe over the scripted client:
 AC-5 (S → no-op → S → T → revert → S → executed+reversible + ONE
 WARNING verdict line with the <S>→<T>→<S> raws), AC-6 (a scripted
 NEIGHBOR change during the no-op → no-op-neighbor-changed naming the
@@ -33,11 +33,11 @@ moved register(s), exactly ONE write, NO phase-B frame), AC-7
 value / refused-baseline sentinel + out-of-range + off-step + absent
 with ZERO writes / no-report at every stage / att-error with the chain
 verbatim), AC-8 (only values from {S, T} reach the seam; the classic
-funnel is never called; the probe runs with BOTH gate surfaces closed
-— it is the proof instrument, not a control surface).
+funnel is never called; the probe uses its own validated seam, never
+the funnel — a measurement instrument, not a control surface).
 
-Part D (the confirmation cycle, AC-9): the gate closed → the guard's
-locked message with ZERO client I/O; the validation errors (30.3 → the
+Part D (the confirmation cycle, AC-9): the cycle runs with NO options
+(spec 022: the closed-gate refusal world is inverted); the validation errors (30.3 → the
 step, 41.0/45.0/9.5 → the range — NEVER clamped, contract 019 §2);
 confirmed (the audit INFO + the verdict INFO lines EXACT, the snapshot
 pushed reflects the MIRROR, ONE trigger, NO disconnect); not-confirmed
@@ -48,23 +48,20 @@ write error propagates with zero post-write reads; the write is allowed
 with the power OFF in the snapshot [P owner]; the END-TO-END frame over
 the real client is byte-equal to the pinned vector.
 
-Part E (the surfaces, AC-2/AC-10): the climate gate matrix (setpoint
-gate closed: NO TARGET_TEMPERATURE feature, the 015 refusal
-byte-identical, ZERO I/O; gate open: TARGET_TEMPERATURE + the write
-path; the gates COMPOSE — setpoint open with power closed advertises
-the target alone; the read display is independent of the write gate),
-the bounds from the guard's own constants (10.0/40.0/0.5), the
-last_setpoint_write diagnostics attribute, the activation property's
-OR matrix + the no-setter source scan, the diagnostic "Setpoint write
-probe" button (routes to the probe), the options-flow checkbox (default
-False) and the strings/translations declaring the service + the option
-with the required verdict line.
+Part E (the surfaces, spec 022): the climate surface is UNCONDITIONAL
+(TARGET_TEMPERATURE + TURN_ON/TURN_OFF + the write paths — the gates
+are gone), the bounds from the guard's own constants (10.0/40.0/0.5),
+the last_setpoint_write diagnostics attribute (no gate markers), the
+diagnostic "Setpoint write probe" button (routes to the probe), the
+options flow (no gate keys) and the strings/translations declaring
+the service (the option labels are gone).
 
-Red-first on a7305ba (0.13.2): none of the setpoint surfaces exist —
-the read home is None (no target displayed), the write constants, the
-guard branch, the seams, the probe, the activation property, the
-climate write surface, the button and the option are all absent — so
-every test below fails until the implementation lands.
+Spec 022 note: the 019 gate surfaces (the PROVEN switch, the locked
+guard, the activation property, the options checkbox, the gate-closed
+climate refusals) are INVERTED or removed — the gates are gone; the
+living behaviours (the read home, the parity vectors, the value
+rail, the two-phase probe, the confirmation cycle, the button, the
+service) keep their assertions.
 
 Run standalone:
 
@@ -245,90 +242,66 @@ def test_allowed_write_setpoint_data() -> None:
     assert 297 not in allowed and 292 not in allowed  # off the 0.5 step
 
 
-def test_guard_shipped_default_locked() -> None:
-    """AC-2: with both setpoint gate surfaces False (the shipped default),
-    ensure_writable refuses 1046 for every value — the setpoint plane
-    stays locked exactly as 0.13.2 refused it, and the error names the
-    evidence gate."""
-    assert registers.WRITE_SETPOINT_PROVEN is False
-    for value in (100, 300, 400):
-        with expect_raises(ValueError, "not writable", "WRITE_SETPOINT_PROVEN"):
-            registers.ensure_writable(1046, value)
-    with expect_raises(ValueError, "not writable"):
-        registers.ensure_writable(1046)  # the valueless form refuses too
-    # the message names the required probe verdict (the gate's cause)
-    try:
-        registers.ensure_writable(1046, 300)
-    except ValueError as err:
-        assert "EXECUTED + REVERSIBLE" in str(err), str(err)
-    else:
-        raise AssertionError("the locked message did not raise")
-
-
-def test_guard_value_discipline_when_open() -> None:
-    """AC-3: with the gate open (the owner's post-verdict flip), 1046
-    accepts ONLY the allowlist — the range AND the step are enforced,
-    and the value-discipline message names both."""
-    with _patch_attr(registers, "WRITE_SETPOINT_PROVEN", True):
-        for good in (100, 105, 295, 300, 400):
-            registers.ensure_writable(1046, good)  # must not raise
-        for bad in (99, 401, 297, 292, 1000, -5):
-            with expect_raises(ValueError, "accepts only values"):
-                registers.ensure_writable(1046, bad)
+def test_guard_setpoint_value_rail_permanent() -> None:
+    """AC-2/AC-3 (spec 022, the inversion of the shipped-locked world):
+    1046 is writable BY DEFAULT within its PERMANENT value rail — the
+    on-step in-range values pass; off-step and out-of-range values
+    (and the valueless form) are refused with the value-discipline
+    message, which names the range and the step."""
+    for good in (100, 105, 295, 300, 400):
+        registers.ensure_writable(1046, good)  # must not raise
+    for bad in (99, 401, 297, 292, 1000, -5, None):
         with expect_raises(ValueError, "accepts only values"):
-            registers.ensure_writable(1046, None)
-        try:
-            registers.ensure_writable(1046, 297)
-        except ValueError as err:
-            # the range and the step ride in the text (T3)
-            assert "100" in str(err) and "400" in str(err), str(err)
-            assert "5" in str(err), str(err)  # the step
-        else:
-            raise AssertionError("the value-discipline message did not raise")
-    # restored: the gate is closed again
-    assert registers.WRITE_SETPOINT_PROVEN is False
-    with expect_raises(ValueError):
-        registers.ensure_writable(1046, 300)
-
-
-def test_guard_setpoint_allowed_thread() -> None:
-    """FR-4/AC-3: the `setpoint_allowed` thread — the OPTION surface
-    honors the write while the module switch stays the shipped gate for
-    every other caller; the base scope ignores the thread entirely."""
-    registers.ensure_writable(1046, 300, setpoint_allowed=True)  # must not raise
-    with expect_raises(ValueError, "WRITE_SETPOINT_PROVEN"):
-        registers.ensure_writable(1046, 300, setpoint_allowed=False)
+            registers.ensure_writable(1046, bad)
     with expect_raises(ValueError, "accepts only values"):
-        registers.ensure_writable(1046, 297, setpoint_allowed=True)
-    # the address allowlist: the ladder neighbours are NEVER writable —
-    # even with the gate open (contract 019 §7.2)
+        registers.ensure_writable(1046)  # the valueless form refuses too
+    try:
+        registers.ensure_writable(1046, 297)
+    except ValueError as err:
+        # the range and the step ride in the text (T3)
+        assert "100" in str(err) and "400" in str(err), str(err)
+        assert "5" in str(err), str(err)  # the step
+    else:
+        raise AssertionError("the value-discipline message did not raise")
+
+
+def test_guard_setpoint_neighbours_never_writable() -> None:
+    """FR-4/AC-3 (spec 022, the inversion of the allowed-thread test):
+    the `setpoint_allowed` thread is GONE with the gate; the address
+    allowlist stands — the ladder neighbours are NEVER writable
+    (installer thresholds, contract 019 §7.2)."""
+    registers.ensure_writable(1046, 300)  # must not raise (the value rail)
+    with expect_raises(ValueError, "accepts only values"):
+        registers.ensure_writable(1046, 297)
     for addr in (1045, 1047, 1049, 1051, 1068):
         with expect_raises(ValueError, "not writable"):
-            registers.ensure_writable(addr, 300, setpoint_allowed=True)
+            registers.ensure_writable(addr, 300)
 
 
 def test_guard_power_and_base_rules_unchanged() -> None:
     """AC-3: the power rules and the base rules are byte-identical —
-    1011 stays behind WRITE_CONTROL_PROVEN/{0,1}, the base allowlist
+    1011 accepts ONLY {0,1} (the permanent rail — spec 022: writable
+    by default), the base allowlist
     {8, 13, 14} passes with and without a value, the read homes stay
-    unwritable, and the setpoint thread never leaks into them."""
-    with expect_raises(ValueError, "WRITE_CONTROL_PROVEN"):
-        registers.ensure_writable(1011, 1)
-    registers.ensure_writable(1011, 1, control_allowed=True)  # must not raise
+    unwritable, and the setpoint rail never leaks into them."""
+    registers.ensure_writable(1011, 1)  # must not raise (the value rail)
+    registers.ensure_writable(1011, 0)  # must not raise
     with expect_raises(ValueError, "accepts only values"):
-        registers.ensure_writable(1011, 2, control_allowed=True)
+        registers.ensure_writable(1011, 2)
+    with expect_raises(ValueError, "accepts only values"):
+        registers.ensure_writable(1011, None)
     for address in (8, 13, 14):
         registers.ensure_writable(address)  # the one-arg form: unchanged
         registers.ensure_writable(address, 0)  # the value threads harmlessly
     for address in (15, 2001, 2090):
         with expect_raises(ValueError, "spec 003"):
             registers.ensure_writable(address)
-    # a read home is never writable — even with the setpoint gate open
+    # a read home is never writable — permanently
     with expect_raises(ValueError, "not writable"):
-        registers.ensure_writable(2011, 0, setpoint_allowed=True)
+        registers.ensure_writable(2011, 0)
     # 19-21 stay behind WRITE_MODE_SETPOINT_TOO (spec 003 §6 verbatim)
     with expect_raises(ValueError):
-        registers.ensure_writable(20, 300, setpoint_allowed=True)
+        registers.ensure_writable(20, 300)
 
 
 def test_integrity_passes_with_setpoint_home() -> None:
@@ -357,25 +330,28 @@ def test_labels_corrected() -> None:
         assert "setpoint" in registers.KNOWN_LABELS[reg].lower(), reg
     # the FR-10 candidate tag updated to the proven wording
     assert "[P owner" in registers.PUSH_CONTROL_CANDIDATES[1046]
-    # the candidate key set is unchanged (gains nothing new)
+    # spec 022 FR-8: the 2017/2018 fault-hunt wildcards join the set
+    assert "spec 022 fault hunt" in registers.PUSH_CONTROL_CANDIDATES[2017]
+    assert "spec 022 fault hunt" in registers.PUSH_CONTROL_CANDIDATES[2018]
+    # the candidate key set (spec 022: + the 2017/2018 wildcards)
     assert set(registers.PUSH_CONTROL_CANDIDATES) == {
-        2011, 2019, 2012, 1046, 1049, 1051, 1055, 1068,
+        2011, 2019, 2012, 2017, 2018, 1046, 1049, 1051, 1055, 1068,
     }
 
 
-def test_no_code_path_sets_the_setpoint_gate() -> None:
-    """AC-10 (contract 019 §4): no code path, update, or default may
-    ever SET either activation surface — a source scan: the only
-    assignment to WRITE_SETPOINT_PROVEN is the False definition, and
-    no component file ever writes the write_setpoint option key."""
+def test_removed_gate_symbols_absent() -> None:
+    """AC-5 (spec 022, the inversion of the 019 no-setter scan): the
+    activation surfaces are GONE ENTIRELY — no component file even
+    names them (a source scan), and the registers module exposes no
+    such attribute."""
     for py in sorted(COMPONENT_DIR.glob("*.py")):
         text = py.read_text()
-        for match in re.finditer(r"WRITE_SETPOINT_PROVEN\s*=", text):
-            assigned = text[match.start():match.start() + 60]
-            assert "= False" in assigned, (py.name, assigned)
+        assert "WRITE_SETPOINT_PROVEN" not in text, py.name
+        assert "WRITE_CONTROL_PROVEN" not in text, py.name
         assert not re.search(r"options\[[\"']write_setpoint[\"']\]\s*=", text), py.name
         assert '"write_setpoint": True' not in text, py.name
-    assert registers.WRITE_SETPOINT_PROVEN is False  # the shipped default
+    assert not hasattr(registers, "WRITE_SETPOINT_PROVEN")
+    assert not hasattr(registers, "WRITE_CONTROL_PROVEN")
 
 
 # ===========================================================================
@@ -777,16 +753,6 @@ def _make_coordinator(client=None, options=None):
     )
 
 
-def _open_options() -> dict:
-    """The open-gate option set: the 015 control-confirmation gate +
-    the 019 setpoint activation (the THIRD gate — separate by design)."""
-    return {
-        "push_control_confirmed": True,
-        "push_temp_confirmed": True,
-        "write_setpoint": True,
-    }
-
-
 class _LogCap(logging.Handler):
     def __init__(self) -> None:
         super().__init__(level=logging.DEBUG)
@@ -974,10 +940,8 @@ def test_control_seam_wire_parity_and_rail() -> None:
 # ===========================================================================
 
 
-def _push_snapshot(caps=None, confirmed=True, control_confirmed=False):
-    return coordinator_mod.AquaTempData.from_pushes(
-        caps or {}, confirmed, control_confirmed
-    )
+def _push_snapshot(caps=None):
+    return coordinator_mod.AquaTempData.from_pushes(caps or {})
 
 
 def test_decode_target_from_own_block() -> None:
@@ -986,33 +950,30 @@ def test_decode_target_from_own_block() -> None:
     block fresh decodes the target; the 2001 block alone decodes
     NOTHING (the block-source fix)."""
     caps = {1046: _ns_capture(1046, LADDER_RAWS)}
-    data = _push_snapshot(caps, True, True)
+    data = _push_snapshot(caps)
     assert data.target_temp == 29.0  # 290 / 10
     # the 2001 block only: the target stays None
     caps = {2001: _ns_capture(2001, CONTROL_BLOCK_ON)}
-    data = _push_snapshot(caps, True, True)
+    data = _push_snapshot(caps)
     assert data.target_temp is None
     # both blocks: the target comes from the 1046 window
     caps = {
         1046: _ns_capture(1046, LADDER_RAWS),
         2001: _ns_capture(2001, CONTROL_BLOCK_ON),
     }
-    data = _push_snapshot(caps, True, True)
+    data = _push_snapshot(caps)
     assert data.target_temp == 29.0
     # the power/mode decode still needs the 2001 capture (unchanged)
     assert data.power is True and data.hvac_mode == HVACMode.HEAT
 
 
-def test_decode_target_gate_closed_none() -> None:
-    """FR-1: the decode rides the EXISTING push_control_confirmed gate —
-    unconfirmed, the target stays None exactly as today (no
-    unconfirmed register under a certain name)."""
+def test_decode_target_unconditional() -> None:
+    """FR-1 (spec 022, the inversion of the gate-closed withholding):
+    the target decodes with NO options — the capture alone decides
+    (active by default; the two-argument call form no longer exists)."""
     caps = {1046: _ns_capture(1046, LADDER_RAWS)}
-    data = _push_snapshot(caps, True, False)
-    assert data.target_temp is None
-    # the two-argument call sites keep the 0.10.0 behaviour
-    data = coordinator_mod.AquaTempData.from_pushes(caps, True)
-    assert data.target_temp is None
+    data = _push_snapshot(caps)
+    assert data.target_temp == 29.0
 
 
 def test_decode_target_sentinel_and_implausible() -> None:
@@ -1021,11 +982,11 @@ def test_decode_target_sentinel_and_implausible() -> None:
     coordinator_mod._logged_implausible.clear()
     sent = dict(LADDER_RAWS)
     sent[1046] = 32765  # the 0x7FFD sentinel
-    data = _push_snapshot({1046: _ns_capture(1046, sent)}, True, True)
+    data = _push_snapshot({1046: _ns_capture(1046, sent)})
     assert data.target_temp is None
     impl = dict(LADDER_RAWS)
     impl[1046] = 5000  # outside the plausibility window
-    data = _push_snapshot({1046: _ns_capture(1046, impl)}, True, True)
+    data = _push_snapshot({1046: _ns_capture(1046, impl)})
     assert data.target_temp is None
 
 
@@ -1034,8 +995,8 @@ def test_probe_executed_reversible() -> None:
     executed+reversible; exactly THREE writes go out — S, T, S — and
     the ONE verdict line (WARNING) carries the <S>→<T>→<S> raws; the
     probe disconnects on completion; the classic funnel is never
-    called; the probe runs with BOTH gate surfaces closed (it is the
-    proof instrument — the gate's cause, not its consumer)."""
+    called; the probe uses its own validated seam, never the classic
+    funnel (a measurement instrument, not a control surface)."""
     ladder = dict(LADDER_RAWS)
     blocks = [ladder, dict(ladder), {**ladder, 1046: T_RAW}, dict(ladder)]
     client, result, cap = _run_probe(blocks)
@@ -1061,7 +1022,7 @@ def test_probe_executed_reversible() -> None:
     assert lines[0].startswith(
         "setpoint write probe: EXECUTED + REVERSIBLE "
         f"(mirror 1046 followed {S_RAW}→{T_RAW}→{S_RAW})"
-        " — evidence for WRITE_SETPOINT_PROVEN"
+        " — the write is proven (spec 022: the control is active by default)"
     ), lines[0]
     assert UUID_WRITE in lines[0], lines[0]
     # every stage observation logs at WARNING (the operator's panel
@@ -1287,17 +1248,22 @@ def _run_cycle(blocks, *, celsius, options=None, is_connected=True,
     return client, coordinator, cap, result
 
 
-def test_cycle_gate_closed_zero_io() -> None:
-    """AC-9: with both activation surfaces off the cycle refuses with
-    the guard's locked message BEFORE any connect, lock or I/O."""
-    client = ScriptedSetpointClient()
+def test_cycle_runs_without_options() -> None:
+    """Spec 022 (the inversion of the closed-gate refusal): the cycle
+    proceeds with NO options — validation passes, the write goes out,
+    ONE trigger fires, the MIRROR decides (the pre-I/O refusal world
+    is dead with the gate)."""
+    ladder = dict(LADDER_RAWS)
+    client = ScriptedSetpointClient([{**ladder, 1046: 300}])
     coordinator = _make_coordinator(client, options={})
-    with expect_raises(ValueError, "WRITE_SETPOINT_PROVEN"):
-        asyncio.run(coordinator.async_control_write_setpoint(30.0))
-    assert client.read_calls == 0
-    assert client.control_writes == []
-    assert client.probe_writes == []
-    assert client.connect_kwargs is None, "the guard fires BEFORE the connect"
+    with _patch_attr(coordinator_mod.const, "PROBE_MIRROR_TIMEOUT", 0.15):
+        with _probe_logs() as cap:
+            result = asyncio.run(coordinator.async_control_write_setpoint(30.0))
+    assert result["verdict"] == "confirmed", result
+    assert result["value_raw"] == 300
+    assert client.control_writes == [300], client.control_writes
+    assert client.read_calls == 1, "exactly ONE trigger after the write"
+    assert client.connect_kwargs is None, "already connected: no connect call"
 
 
 def test_cycle_validation_never_clamps() -> None:
@@ -1314,7 +1280,7 @@ def test_cycle_validation_never_clamps() -> None:
         (float("inf"), "finite"),
     ):
         client = ScriptedSetpointClient()
-        coordinator = _make_coordinator(client, options=_open_options())
+        coordinator = _make_coordinator(client, options={})
         with expect_raises(ValueError, needle):
             asyncio.run(coordinator.async_control_write_setpoint(celsius))
         assert client.read_calls == 0, celsius
@@ -1328,7 +1294,7 @@ def test_cycle_confirmed() -> None:
     disconnect (the steady-state poll world)."""
     ladder = dict(LADDER_RAWS)
     client, coordinator, cap, result = _run_cycle(
-        [{**ladder, 1046: 300}], celsius=30.0, options=_open_options()
+        [{**ladder, 1046: 300}], celsius=30.0, options={}
     )
     assert result["verdict"] == "confirmed", result
     assert result["value_raw"] == 300
@@ -1355,7 +1321,7 @@ def test_cycle_connects_when_disconnected() -> None:
     — spec 021: no pair kwarg anymore)."""
     ladder = dict(LADDER_RAWS)
     client, _coord, _cap, result = _run_cycle(
-        [{**ladder, 1046: 300}], celsius=30.0, options=_open_options(),
+        [{**ladder, 1046: 300}], celsius=30.0, options={},
         is_connected=False,
     )
     assert result["verdict"] == "confirmed", result
@@ -1367,7 +1333,7 @@ def test_cycle_not_confirmed_shows_mirror() -> None:
     the tile shows the MIRROR's truth, never the request."""
     ladder = dict(LADDER_RAWS)
     client, coordinator, cap, result = _run_cycle(
-        [dict(ladder)], celsius=30.0, options=_open_options()
+        [dict(ladder)], celsius=30.0, options={}
     )
     assert result["verdict"] == "not-confirmed", result
     assert result["mirror_raw"] == 290 and result["value_raw"] == 300
@@ -1390,7 +1356,7 @@ def test_cycle_unconfirmed_no_snapshot_no_notification() -> None:
     leaves the machine at its old target — no hazard)."""
     pn = _attach_pn()
     client, coordinator, cap, result = _run_cycle(
-        [None], celsius=30.0, options=_open_options()
+        [None], celsius=30.0, options={}
     )
     assert result["verdict"] == "unconfirmed", result
     assert result["mirror_raw"] is None
@@ -1411,7 +1377,7 @@ def test_cycle_stale_capture_never_confirms() -> None:
     """AC-9's freshness gate: a capture with last_seen <= t_write NEVER
     satisfies the wait — a stale mirror cannot confirm a write."""
     client, coordinator, _cap, result = _run_cycle(
-        [], celsius=30.0, options=_open_options(), pre_stale=True
+        [], celsius=30.0, options={}, pre_stale=True
     )
     assert result["verdict"] == "unconfirmed", result
     assert result["mirror_raw"] is None  # the stale capture was refused
@@ -1423,7 +1389,7 @@ def test_cycle_write_error_propagates() -> None:
     cross-check, NO snapshot push, NO notification."""
     pn = _attach_pn()
     client = ScriptedSetpointClient([], write_errors=[RuntimeError("link down")])
-    coordinator = _make_coordinator(client, options=_open_options())
+    coordinator = _make_coordinator(client, options={})
     coordinator.data = None
     with _patch_attr(coordinator_mod.const, "PROBE_MIRROR_TIMEOUT", 0.15):
         with _probe_logs():
@@ -1442,7 +1408,7 @@ def test_cycle_works_with_power_off() -> None:
     changed the setpoint with the unit off]."""
     ladder = dict(LADDER_RAWS)
     client, coordinator, _cap, result = _run_cycle(
-        [{**ladder, 1046: 300}], celsius=30.0, options=_open_options(),
+        [{**ladder, 1046: 300}], celsius=30.0, options={},
         seed={2001: CONTROL_BLOCK_OFF},
     )
     assert result["verdict"] == "confirmed", result
@@ -1464,7 +1430,7 @@ def test_cycle_end_to_end_real_client_frame() -> None:
         entry_id="e2e019",
         title="Aqua Temp test",
         data={"address": ADDRESS, "mode": "push"},
-        options=dict(_open_options()),
+        options={},
     )
     coordinator = coordinator_mod.AquaTempCoordinator(hass=None, entry=entry, client=client)
     coordinator.data = None
@@ -1526,51 +1492,44 @@ def _target_snapshot(target=29.0):
         2001: _ns_capture(2001, CONTROL_BLOCK_ON),
         2046: _ns_capture(2046, T_WINDOW_RAWS),
     }
-    return coordinator_mod.AquaTempData.from_pushes(caps, True, True)
+    return coordinator_mod.AquaTempData.from_pushes(caps)
 
 
-def test_climate_setpoint_gate_closed_no_target_feature() -> None:
-    """AC-2: with both setpoint gate surfaces closed the push climate
-    advertises NO TARGET_TEMPERATURE — even with the POWER gate open
-    (the 017 surface stands unchanged) — and set_temperature refuses
-    with the 015 message, byte-identical, with ZERO client I/O."""
+def test_climate_full_surface_unconditional() -> None:
+    """Spec 022 (the inversion of the gate-closed no-target world):
+    the push climate advertises the FULL surface with NO options —
+    TURN_ON/TURN_OFF + TARGET_TEMPERATURE, [OFF, HEAT] modes, the
+    bounds from the guard's own constants, the live read display;
+    NOTHING moves until a write is requested."""
     snapshot = _target_snapshot()
     client = ScriptedSetpointClient()
-    hass, entry, _coord = _make_platform(
-        {"push_control_confirmed": True, "write_control": True}, snapshot, client
-    )
+    hass, entry, _coord = _make_platform({}, snapshot, client)
     entity = _added_entity(hass, entry)
     assert entity.supported_features == (
-        ClimateEntityFeature.TURN_ON | ClimateEntityFeature.TURN_OFF
+        ClimateEntityFeature.TURN_ON
+        | ClimateEntityFeature.TURN_OFF
+        | ClimateEntityFeature.TARGET_TEMPERATURE
     )
-    assert not (entity.supported_features & ClimateEntityFeature.TARGET_TEMPERATURE)
-    with expect_raises(HomeAssistantError, "read-only"):
-        asyncio.run(entity.async_set_temperature(temperature=30.0))
-    assert client.control_writes == []
-    assert client.probe_writes == []
-    assert client.read_calls == 0
-    # the read display is live (the home is [P owner] — no write needed)
-    assert entity.target_temperature == 29.0
-
-
-def test_climate_setpoint_gate_open_composes() -> None:
-    """AC-9/FR-9: the gates COMPOSE — with the setpoint gate open and
-    the POWER gate closed the climate advertises TARGET_TEMPERATURE
-    alone (no mode buttons), the bounds come from the guard's own
-    constants, and the write path runs the confirmation cycle."""
-    snapshot = _target_snapshot()
-    ladder = dict(LADDER_RAWS)
-    client = ScriptedSetpointClient([{**ladder, 1046: 300}])
-    hass, entry, coordinator = _make_platform(
-        {"push_control_confirmed": True, "write_setpoint": True}, snapshot, client
-    )
-    entity = _added_entity(hass, entry)
-    assert entity.supported_features == ClimateEntityFeature.TARGET_TEMPERATURE
-    assert entity.hvac_modes == []  # the power gate is still closed
+    assert entity.hvac_modes == [HVACMode.OFF, HVACMode.HEAT]
     assert entity.min_temp == 10.0
     assert entity.max_temp == 40.0
     assert entity._attr_target_temperature_step == 0.5
     assert entity.target_temperature == 29.0  # the read display
+    assert client.control_writes == []
+    assert client.probe_writes == []
+    assert client.read_calls == 0
+
+
+def test_climate_setpoint_write_confirms_via_mirror() -> None:
+    """Spec 022: set_temperature routes to the confirmation cycle with
+    NO options — the write reaches the rail, the MIRROR decides the
+    tile (30.0 came from the pushed block), the diagnostics carry the
+    stage dict (no gate markers)."""
+    snapshot = _target_snapshot()
+    ladder = dict(LADDER_RAWS)
+    client = ScriptedSetpointClient([{**ladder, 1046: 300}])
+    hass, entry, coordinator = _make_platform({}, snapshot, client)
+    entity = _added_entity(hass, entry)
     with _patch_attr(coordinator_mod.const, "PROBE_MIRROR_TIMEOUT", 0.15):
         asyncio.run(entity.async_set_temperature(temperature=30.0))
     assert client.control_writes == [300], client.control_writes
@@ -1580,20 +1539,20 @@ def test_climate_setpoint_gate_open_composes() -> None:
     # the diagnostics attribute carries the stage dict
     attrs = entity.extra_state_attributes
     assert attrs is not None
-    assert attrs["write_setpoint"] == "allowed"
     assert attrs["last_setpoint_write"]["verdict"] == "confirmed", attrs
+    assert "write_setpoint" not in attrs
+    assert "write_control" not in attrs
 
 
-def test_climate_step_range_and_gate_refusals() -> None:
-    """AC-2/AC-9 (the mission's mandatory cases): gate open — 30.3 °C
-    (not a 0.5 multiple) raises; 45.0 °C (out of range) raises; gate
-    closed — set_temperature refuses with the 015 message."""
+def test_climate_step_range_validation() -> None:
+    """AC-9 (the mission's mandatory cases): the validation errors
+    surface through the entity — 30.3 °C (not a 0.5 multiple) raises;
+    45.0/41.0 °C (above) and 9.5 °C (below) raise; NOTHING reaches the
+    wire (spec 022: the gate-closed refusal variant is dead with the
+    gate — the value rail is the only refusal)."""
     snapshot = _target_snapshot()
-    # gate open: the validation errors surface through the entity
     client = ScriptedSetpointClient()
-    hass, entry, _coord = _make_platform(
-        {"push_control_confirmed": True, "write_setpoint": True}, snapshot, client
-    )
+    hass, entry, _coord = _make_platform({}, snapshot, client)
     entity = _added_entity(hass, entry)
     with expect_raises(ValueError, "0.5"):
         asyncio.run(entity.async_set_temperature(temperature=30.3))
@@ -1604,23 +1563,14 @@ def test_climate_step_range_and_gate_refusals() -> None:
     with expect_raises(ValueError, "10.0-40.0"):
         asyncio.run(entity.async_set_temperature(temperature=9.5))
     assert client.control_writes == []  # nothing reached the wire
-    # gate closed: the 015 refusal, byte-identical
-    hass2, entry2, _coord2 = _make_platform(
-        {"push_control_confirmed": True}, snapshot, ScriptedSetpointClient()
-    )
-    entity2 = _added_entity(hass2, entry2)
-    with expect_raises(HomeAssistantError, "read-only"):
-        asyncio.run(entity2.async_set_temperature(temperature=30.0))
 
 
-def test_climate_read_display_independent_of_write_gate() -> None:
-    """FR-8: target_temperature is displayed behind the EXISTING
-    push_control_confirmed gate, independent of the write gate — the
-    honest display of an owner-proven register (the 015 read-only
-    pattern); unconfirmed decodes None."""
+def test_climate_read_display_live() -> None:
+    """FR-8: target_temperature is displayed unconditionally — the
+    honest display of an owner-proven register; a store with NO 1046
+    block decodes None (never guessed)."""
     snapshot = _target_snapshot()
-    hass, entry, _coord = _make_platform({"push_control_confirmed": True},
-                                         snapshot, ScriptedSetpointClient())
+    hass, entry, _coord = _make_platform({}, snapshot, ScriptedSetpointClient())
     entity = _added_entity(hass, entry)
     assert entity.target_temperature == 29.0
     # no 1046 block in the store -> the target is unknown (never guessed)
@@ -1628,21 +1578,18 @@ def test_climate_read_display_independent_of_write_gate() -> None:
         2001: _ns_capture(2001, CONTROL_BLOCK_ON),
         2046: _ns_capture(2046, T_WINDOW_RAWS),
     }
-    empty = coordinator_mod.AquaTempData.from_pushes(caps, True, True)
-    hass2, entry2, _coord2 = _make_platform(
-        {"push_control_confirmed": True}, empty, ScriptedSetpointClient()
-    )
+    empty = coordinator_mod.AquaTempData.from_pushes(caps)
+    hass2, entry2, _coord2 = _make_platform({}, empty, ScriptedSetpointClient())
     entity2 = _added_entity(hass2, entry2)
     assert entity2.target_temperature is None
 
 
-def test_climate_locked_attrs_absent() -> None:
-    """AC-2: with both write gates closed the diagnostics attributes
-    stay absent (the 015/017 locked surface, byte-identical)."""
+def test_climate_attrs_empty_before_any_write() -> None:
+    """AC-2 (spec 022): before any write the diagnostics attributes
+    are None (the stage dicts are the ONLY attributes — the gate
+    markers are gone with the gates)."""
     snapshot = _target_snapshot()
-    hass, entry, _coord = _make_platform(
-        {"push_control_confirmed": True}, snapshot, ScriptedSetpointClient()
-    )
+    hass, entry, _coord = _make_platform({}, snapshot, ScriptedSetpointClient())
     entity = _added_entity(hass, entry)
     assert entity.extra_state_attributes is None
 
@@ -1678,68 +1625,31 @@ def test_button_platform_adds_setpoint_probe() -> None:
     assert client.disconnected
 
 
-def test_write_setpoint_gate_property_paths() -> None:
-    """FR-9/AC-10: the activation property — the per-entry option OR the
-    global registers switch, read LIVE (no restart); both off = locked;
-    the power gate is untouched (the gates are separate)."""
-    pkg_regs = sys.modules[f"{PKG}.registers"]
-    closed = _make_coordinator(options={})
-    option = _make_coordinator(options={"write_setpoint": True})
-    assert closed.write_setpoint_allowed is False
-    assert option.write_setpoint_allowed is True
-    with _patch_attr(pkg_regs, "WRITE_SETPOINT_PROVEN", True):
-        assert closed.write_setpoint_allowed is True  # the switch ORs
-        assert option.write_setpoint_allowed is True  # both on
-    assert pkg_regs.WRITE_SETPOINT_PROVEN is False  # restored
-    assert registers.WRITE_SETPOINT_PROVEN is False  # the standalone module untouched
-    assert coordinator_mod.registers is not registers  # separate instances
-    # the power gate reads its own surfaces only
-    assert closed.write_control_allowed is False
-
-
-def test_options_flow_schema_has_write_setpoint() -> None:
-    """FR-9/T8: the OptionsFlow carries the write_setpoint checkbox —
-    default False (the shipped inert default), push-mode only, its
-    checked value kept as the default, and the save merge carries it."""
+def test_options_flow_schema_has_no_gate_keys() -> None:
+    """Spec 022 (AC-3, inverted): the OptionsFlow carries exactly the
+    poll interval + the display unit — the write_setpoint checkbox is
+    GONE (with all four gate keys); the push and classic entries share
+    the same two-field form."""
     assert config_flow_mod is not None, (
         f"config_flow import failed: {_CONFIG_FLOW_IMPORT_ERROR}"
     )
-    assert config_flow_mod.DEFAULT_WRITE_SETPOINT is False
     flow = config_flow_mod.AquaTempOptionsFlowHandler()
     flow.config_entry = SimpleNamespace(options={}, data={"mode": "push"})
     result = asyncio.run(flow.async_step_init(None))
     assert result["type"] == "form" and result["step_id"] == "init", result
-    marker = next(
-        e for e in result["data_schema"] if getattr(e, "key", None) == "write_setpoint"
-    )
-    assert marker.kwargs.get("default") is False
-    # an already-enabled entry keeps True as the default
-    flow.config_entry = SimpleNamespace(
-        options={"write_setpoint": True}, data={"mode": "push"}
-    )
-    result = asyncio.run(flow.async_step_init(None))
-    marker = next(
-        e for e in result["data_schema"] if getattr(e, "key", None) == "write_setpoint"
-    )
-    assert marker.kwargs.get("default") is True
-    # the save merge carries the option into the entry's options
-    flow.config_entry = SimpleNamespace(options={}, data={"mode": "push"})
-    result = asyncio.run(flow.async_step_init({"write_setpoint": True}))
-    assert result["type"] == "create_entry", result
-    assert result["data"]["write_setpoint"] is True
-    # classic entries do not get the checkbox (the push-only precedent)
+    keys = {getattr(e, "key", None) for e in result["data_schema"]}
+    assert keys == {"poll_interval", "temperature_unit"}, keys
     flow.config_entry = SimpleNamespace(options={}, data={})
     result = asyncio.run(flow.async_step_init(None))
-    assert not any(
-        getattr(e, "key", None) == "write_setpoint" for e in result["data_schema"]
-    )
+    keys = {getattr(e, "key", None) for e in result["data_schema"]}
+    assert keys == {"poll_interval", "temperature_unit"}, keys
 
 
-def test_service_and_option_declared_in_strings() -> None:
-    """FR-7/FR-9: the setpoint_write_probe service is declared in
-    services.yaml, strings.json and BOTH translations; the write_setpoint
-    option is labeled + described with the required probe verdict (the
-    UI carries contract 019 §4's discipline)."""
+def test_service_declared_option_gone() -> None:
+    """FR-7 (living) + spec 022 (AC-8, inverted): the setpoint_write_probe
+    service is declared in services.yaml, strings.json and BOTH
+    translations; the write_setpoint OPTION label and description are
+    GONE from the options step (the option is gone with the gate)."""
     services_yaml = (COMPONENT_DIR / "services.yaml").read_text()
     assert "setpoint_write_probe:" in services_yaml, "services.yaml misses the service"
     strings = json.loads((COMPONENT_DIR / "strings.json").read_text())
@@ -1747,11 +1657,10 @@ def test_service_and_option_declared_in_strings() -> None:
     assert "fields" in strings["services"]["setpoint_write_probe"]
     # the service description names the physical effect (FR-7)
     assert "0.5" in strings["services"]["setpoint_write_probe"]["description"]
-    # the option + its description name the required verdict line
+    # spec 022: the option label + description are GONE
     init = strings["options"]["step"]["init"]
-    assert "write_setpoint" in init["data"], init["data"].keys()
-    assert "write_setpoint" in init.get("data_description", {}), init.keys()
-    assert "EXECUTED + REVERSIBLE" in init["data_description"]["write_setpoint"]
+    assert "write_setpoint" not in init["data"], init["data"].keys()
+    assert "write_setpoint" not in init.get("data_description", {}), init.keys()
     for lang in ("en", "fr"):
         translations = json.loads(
             (COMPONENT_DIR / "translations" / f"{lang}.json").read_text()
@@ -1761,14 +1670,11 @@ def test_service_and_option_declared_in_strings() -> None:
             translations.get("services", {}).keys(),
         )
         init_lang = translations["options"]["step"]["init"]
-        assert "write_setpoint" in init_lang["data"], (lang, init_lang["data"].keys())
-        assert "write_setpoint" in init_lang.get("data_description", {}), (
+        assert "write_setpoint" not in init_lang["data"], (lang, init_lang["data"].keys())
+        assert "write_setpoint" not in init_lang.get("data_description", {}), (
             lang,
             init_lang.keys(),
         )
-        assert "EXECUTED + REVERSIBLE" in (
-            init_lang["data_description"]["write_setpoint"]
-        ), lang
 
 
 # ---------------------------------------------------------------------------
@@ -1783,13 +1689,12 @@ def main() -> int:
         test_write_plane_constants_transcribed,
         test_setpoint_parity_vectors,
         test_allowed_write_setpoint_data,
-        test_guard_shipped_default_locked,
-        test_guard_value_discipline_when_open,
-        test_guard_setpoint_allowed_thread,
+        test_guard_setpoint_value_rail_permanent,
+        test_guard_setpoint_neighbours_never_writable,
         test_guard_power_and_base_rules_unchanged,
         test_integrity_passes_with_setpoint_home,
         test_labels_corrected,
-        test_no_code_path_sets_the_setpoint_gate,
+        test_removed_gate_symbols_absent,
         # Part B — the client seams
         test_probe_seam_wire_parity,
         test_probe_seam_rail_refuses_before_any_byte,
@@ -1797,7 +1702,7 @@ def main() -> int:
         test_control_seam_wire_parity_and_rail,
         # Part C — the decode + the probe
         test_decode_target_from_own_block,
-        test_decode_target_gate_closed_none,
+        test_decode_target_unconditional,
         test_decode_target_sentinel_and_implausible,
         test_probe_executed_reversible,
         test_probe_connects_when_disconnected,
@@ -1812,7 +1717,7 @@ def main() -> int:
         test_probe_att_error,
         test_probe_frame_discipline,
         # Part D — the confirmation cycle
-        test_cycle_gate_closed_zero_io,
+        test_cycle_runs_without_options,
         test_cycle_validation_never_clamps,
         test_cycle_confirmed,
         test_cycle_connects_when_disconnected,
@@ -1823,15 +1728,14 @@ def main() -> int:
         test_cycle_works_with_power_off,
         test_cycle_end_to_end_real_client_frame,
         # Part E — the surfaces
-        test_climate_setpoint_gate_closed_no_target_feature,
-        test_climate_setpoint_gate_open_composes,
-        test_climate_step_range_and_gate_refusals,
-        test_climate_read_display_independent_of_write_gate,
-        test_climate_locked_attrs_absent,
+        test_climate_full_surface_unconditional,
+        test_climate_setpoint_write_confirms_via_mirror,
+        test_climate_step_range_validation,
+        test_climate_read_display_live,
+        test_climate_attrs_empty_before_any_write,
         test_button_platform_adds_setpoint_probe,
-        test_write_setpoint_gate_property_paths,
-        test_options_flow_schema_has_write_setpoint,
-        test_service_and_option_declared_in_strings,
+        test_options_flow_schema_has_no_gate_keys,
+        test_service_declared_option_gone,
     ]
     failures = 0
     for test in tests:

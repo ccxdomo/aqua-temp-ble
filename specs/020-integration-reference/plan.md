@@ -1,9 +1,12 @@
 # Spec 020 — Architecture (as shipped)
 
 This file documents the **current** architecture of
-`custom_components/aqua_temp_ble` (manifest 0.14.0) — the structure a
+`custom_components/aqua_temp_ble` (manifest 0.15.0) — the structure a
 maintainer needs before touching anything. Everything described here is
 PROVEN in code; where behaviour was proven on the wire it is tagged [P].
+
+Revised after spec 022: the activation gates were removed; everything
+is active by default. The automatic write protections are unchanged.
 
 ---
 
@@ -13,17 +16,16 @@ PROVEN in code; where behaviour was proven on the wire it is tagged [P].
 custom_components/aqua_temp_ble/
 ├── const.py         # protocol constants, timeouts, option defaults, GATT buckets
 ├── modbus.py        # pure protocol layer: frame build/parse + self-test (no I/O)
-├── registers.py     # THE single source of truth: register map, gates, allowlists
+├── registers.py     # THE single source of truth: register map, allowlists, value rails
 ├── aqua_client.py   # BLE transport: GATT resolution, reassembly, pushed store,
 │                    #   request/response, write seams, harvest, security probe
 ├── coordinator.py   # DataUpdateCoordinator: poll cycle, snapshot decode,
 │                    #   write confirmation cycles, proof probes
-├── climate.py      # the climate entity (read-only ↔ gated control surface)
+├── climate.py      # the climate entity (full surface, active by default)
 ├── sensor.py        # temperature sensors + push_stream diagnostic
-├── binary_sensor.py # [V] registry-driven; zero entities on this unit (see §7)
 ├── button.py        # diagnostic buttons: probe / power probe / setpoint probe
-├── agent.py         # D-Bus pairing agent (dormant tooling, see §9)
 ├── config_flow.py   # discovery menu → device list → live test → confirm
+│                    #   (name only; the screen shows the captured values)
 ├── __init__.py      # setup/unload, options listener, 3 domain services
 └── services.yaml / strings.json / translations/
 ```
@@ -59,10 +61,12 @@ Entry data carries `mode: "push"` (stamped at setup by the config flow;
    `max(2 × poll_interval, 60 s)`. Stale/absent → `UpdateFailed("push
    stream silent after trigger")` + disconnect (entities go unavailable —
    honest, never stale values).
-5. **SNAPSHOT**: `AquaTempData.from_pushes(captures, temp_gate,
-   control_gate)` — the confirmed T-block feeds the temperature registers;
-   the confirmed control block (2001) feeds power/mode; the setpoint decodes
-   from the 1046-block that *contains* its home (the block-source rule).
+5. **SNAPSHOT**: `AquaTempData.from_pushes(captures)` — the T-block
+   feeds the temperature registers; the control block (2001) feeds
+   power/mode; the setpoint decodes from the 1046-block that *contains*
+   its home (the block-source rule). Unconditional decode (active by
+   default, spec 022): an absent block still decodes `None`, sentinels
+   and implausible raws still decode `unknown`.
 
 A trigger that is **answered** (FC03 data — never observed) would log the
 revival WARNING and use base data — the deliberate escape hatch for a
@@ -74,7 +78,9 @@ future firmware world.
 start (`PushCapture`: start, qty, registers, first_seen, last_seen, count).
 Latest-frame-wins per start; every capture is CRC-validated before
 storage; the first capture of each start per connect logs its full hex at
-WARNING (bounded: ≤4 lines/connect). The store is the *only* source the
+WARNING (bounded: ≤4 lines/connect; the hex was demoted to DEBUG by the
+021 cleanup and restored by spec 022 FR-13 — it is the passive capture
+instrument for the fault hunt). The store is the *only* source the
 snapshot decode reads in push mode — the entity plane never touches raw
 notifies.
 
@@ -92,26 +98,30 @@ notifies.
 
 ## 5. The entity surface (push mode)
 
-| Platform | Entities | Gate |
-|---|---|---|
-| sensor | Inlet/Outlet/Coil/Ambient/Exhaust water + Suction temperature (6 keys; T01 shows `unknown` — absent sensor) | `push_temp_confirmed` |
-| sensor | `Push stream` diagnostic (on/off + counts, ages, control-candidate raws) | always (diagnostic) |
-| climate | 1 entity, created **only** when `push_control_confirmed` | `push_control_confirmed` |
-| button | Probe registers / Power write probe / Setpoint write probe (diagnostic) | always (diagnostic) |
-| binary_sensor | none (no pushed homes; base pins never made) | — |
+All push-mode entities are created unconditionally — active by default
+(spec 022); no confirmation step, no option, no switch stands between
+a fresh entry and the full surface.
 
-Climate surface per gate state (read live from entry options — saving the
-options re-renders without reload):
+| Platform | Entities |
+|---|---|
+| sensor | Inlet/Outlet/Coil/Ambient/Exhaust water + Suction temperature (6 keys; T01 shows `unknown` — absent sensor) |
+| sensor | `Push stream` diagnostic (on/off + counts, ages, control-candidate raws: 2012 + the 2017/2018 fault candidates, spec 022) |
+| climate | 1 entity (OFF/HEAT display + setpoint read + both writes) |
+| button | Probe registers / Power write probe / Setpoint write probe (diagnostic) |
+| binary_sensor | none (no pushed homes; the platform was pruned in the 021 cleanup pass) |
 
-- gates closed: no features, no hvac modes, writes refused loudly;
-- `write_control`: `TURN_ON`/`TURN_OFF` (where the HA version defines
-  them), hvac modes `[OFF, HEAT]`;
-- `write_setpoint`: `TARGET_TEMPERATURE`, step 0.5, bounds 10.0–40.0 °C
-  (the guard's own constants), target displayed from mirror 1046.
+Climate surface (unconditional in push mode):
 
-`extra_state_attributes` exposes `write_control`/`write_setpoint` markers
-and the last write's stage dict (value, verdict, mirror raw, age) —
-diagnostics only; the tile's truth is always the mirror.
+- hvac modes `[OFF, HEAT]` (heat-only rule, spec 018 — COOL/AUTO are
+  refused: the vendor app locks the mode and the mode write would
+  clobber an unpinned register pair);
+- `TURN_ON`/`TURN_OFF` (where the HA version defines them) +
+  `TARGET_TEMPERATURE`, step 0.5, bounds 10.0–40.0 °C (the guard's own
+  constants), target displayed from mirror 1046.
+
+`extra_state_attributes` exposes the last power/setpoint write's stage
+dict (value, verdict, mirror raw, age) — diagnostics only; the tile's
+truth is always the mirror.
 
 ## 6. The write paths (the confirmation cycle)
 
@@ -120,7 +130,7 @@ Both control writes follow the same shape
 
 ```
 validate (setpoint: finite, 0.5-multiple, 10.0–40.0 — loud ValueError)
-  → registers.ensure_writable(addr, value, <gate thread>)   # the funnel
+  → registers.ensure_writable(addr, value)   # the funnel: allowlist + rail
   → connect if needed
   → audit INFO line ("power write via 1011 = 1 — mirror should follow…")
   → [io lock] fire-and-forget write on the client rail (no FC10 echo wait)
@@ -146,14 +156,17 @@ surfaces them.
   classic climate write branches, `write_registers` + FC10 echo wait):
   reachable only if a unit ever answers the classic read — kept for
   other-firmware tolerance, unreachable on this machine.
-- **binary_sensor.py + the [V] placeholders in `registers.py`**
-  (compressor/pump/fan/valve/switches, addresses `None`): no base pin,
-  no pushed home → zero entities, by design ("no unconfirmed data under
-  a label").
+- **The binary_sensor plane**: pruned in the 021 cleanup pass — no
+  register was ever pinned (no base pin, no pushed home), so no binary
+  entity could exist without guessing ("no unproven data under a
+  label"). Spec 022 pins the evidence bar for its justified return
+  (a fault entity, behind a recorded fault diff-revert).
 - **`from_merged`** (base answer + pushed overlay): the never-observed
   revival world; one WARNING if it ever fires.
-- **Probe button "base"** — see tasks.md backlog: it targets the block
-  the unit never serves; on this unit use a high block instead.
+- **Probe button "base"** — fixed in the 021 cleanup pass: on a push
+  entry it no longer reads register 7 (never answered) — it triggers
+  the burst and dumps the whole pushed store with labels; the classic
+  direct read survives only on the dormant classic plane.
 
 ## 8. Services
 
@@ -168,15 +181,13 @@ bypass the funnel through their own validated seams (`write_probe_frame`
 pinned-frames-only; `_setpoint_write_frame` value rail), always start from
 a verified baseline, and always aim to leave the unit unchanged.
 
-## 9. Dormant pairing tooling
+## 9. Pairing (pruned)
 
-`agent.py` (D-Bus Just-Works agent) + `client.pair()` + the
-`pair_on_connect` option implement the spec-011 pairing ladder. The
-production verdict was `att-accepted-silent` (writes accepted without
-bonding), so none of this ran in anger; the config-flow test still
-executes the ladder **only** on an ATT security-class error, and
-`pair_on_connect` ships OFF (enabling it without the
-`security probe: answered after pairing` line is a contract violation).
+The spec-011 pairing ladder (`agent.py`, `client.pair()`, the
+`pair_on_connect` option) never earned its evidence: the production
+verdict was `att-accepted-silent` (writes accepted without bonding),
+so none of it ever ran in anger. The 021 cleanup pass pruned the whole
+surface; the verdict and law L5 (research.md) stand as the record.
 
 ## 10. Timing constants (const.py)
 
@@ -193,7 +204,8 @@ executes the ladder **only** on an ATT security-class error, and
 ## 11. Tests
 
 `tests/` carries the per-spec suites (reassembly, census, store/harvest,
-coordinator cycles, probes, climate surfaces, config-flow walkthrough —
-~18k lines). The protocol vectors are also pinned in `modbus.py`'s
-`__main__` self-test (byte-exact frames, CRC checks, builder parity with
-`registers.py` constants). Any protocol change must keep both green.
+coordinator cycles, probes, climate surfaces, config-flow walkthrough,
+active-by-default pins — ~18k lines across ~30 files). The protocol
+vectors are also pinned in `modbus.py`'s `__main__` self-test
+(byte-exact frames, CRC checks, builder parity with `registers.py`
+constants). Any protocol change must keep both green.

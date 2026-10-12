@@ -15,8 +15,8 @@ byte-identical (US-6 — classic units untouched).
 Pinned by this file (the three worlds of AC-3 + the budget):
 - world 1: probe None + harvest sees 2046 => test SUCCEEDS, the entry
   records mode "push", the success WARNING summary lists the T-window
-  raws, the confirm step is the push variant with the calibration
-  checkbox;
+  raws, the confirm step is the push variant (spec 022 FR-2/FR-7: the
+  name-only form + the live captured values);
 - world 2: no pushes at all => the no_response failure,
   byte-identical message + key, stage label unchanged;
 - world 3: the probe ANSWERS => the harvest stage never runs (classic
@@ -501,18 +501,21 @@ async def test_world1_push_harvest_succeeds_with_mode_push() -> None:
     )
     assert summary in cap.messages, cap.messages
     assert cap.levels[cap.messages.index(summary)] == "WARNING"
-    # no unconfirmed data under a certain name: the placeholders are all
-    # "unknown" (no base answer exists in push mode)
+    # spec 022 FR-7: the placeholders decode LIVE from the harvest
+    # captures — the T-block values (inlet/outlet/ambient) and the
+    # per-value fallbacks for the absent blocks (power/setpoint)
     placeholders = result["description_placeholders"]
-    assert placeholders["power"] == "unknown", placeholders
-    assert placeholders["inlet"] == "unknown", placeholders
-    # the checkbox rides the push confirm form (calibration gate, FR-5)
+    assert placeholders["inlet"] == "14.5 °C", placeholders
+    assert placeholders["outlet"] == "14.0 °C", placeholders
+    assert placeholders["ambient"] == "13.5 °C", placeholders
+    assert placeholders["power"] == "unknown", placeholders  # no 2001 capture
+    assert placeholders["setpoint"] == "unknown", placeholders  # no 1046 capture
+    assert "mode" not in placeholders, placeholders  # no mode line (FR-7)
+    # spec 022 FR-2/AC-2: the schema asks for a NAME only — the
+    # confirmation checkboxes are gone
     schema = result["data_schema"]
     schema_items = _schema_keys(schema)
-    assert "push_temp_confirmed" in schema_items, schema_items
-    # Spec 015 FR-6 (additive): the CONTROL gate rides the same form —
-    # unchecked until the power/mode diff matched the app's display.
-    assert "push_control_confirmed" in schema_items, schema_items
+    assert schema_items == {"name"}, schema_items
 
 
 def _schema_keys(schema) -> set[str]:
@@ -524,8 +527,10 @@ def _schema_keys(schema) -> set[str]:
 
 
 async def test_world1_entry_records_push_mode() -> None:
-    """AC-3: submitting the push confirm step creates the entry with
-    mode "push" (data field) + the push_temp_confirmed option."""
+    """AC-3 + spec 022 AC-2: submitting the push confirm step creates
+    the entry with mode "push" (data field) and options that carry
+    ONLY the poll interval + the display unit (the gate keys are
+    gone with the gates)."""
     flow, _client, result, _cap = await _drive_to_confirm(
         script=[
             AquaTempTimeoutOutcome(FIRST_TIMEOUT),
@@ -534,53 +539,19 @@ async def test_world1_entry_records_push_mode() -> None:
         harvest_result={2046: CAPTURE_2046},
     )
     assert result["step_id"] == "confirm_push", result
-    created = await flow.async_step_confirm_push(
-        user_input={"name": "Pool pump", "push_temp_confirmed": True}
-    )
+    created = await flow.async_step_confirm_push(user_input={"name": "Pool pump"})
     assert created["type"] == "create_entry", created
     assert created["data"] == {
         "address": ADDRESS,
         "name": "Pool pump",
         "mode": "push",
     }, created
-    assert created["options"]["push_temp_confirmed"] is True
-    assert created["options"]["poll_interval"] == 30
-    # Spec 015 FR-6 (additive): the control gate defaults to False
-    # (unchecked — the shipped default, contract 015-A §4).
-    assert created["options"]["push_control_confirmed"] is False
-    # unchecked variant: the option defaults to False
-    flow2, _c2, result2, _cap2 = await _drive_to_confirm(
-        script=[AquaTempTimeoutOutcome(FIRST_TIMEOUT), AquaTempTimeoutOutcome(FIRST_TIMEOUT)],
-        harvest_result={2046: CAPTURE_2046},
-    )
-    created2 = await flow2.async_step_confirm_push(user_input={"name": "X"})
-    assert created2["options"]["push_temp_confirmed"] is False
-
-
-async def test_confirm_push_records_control_gate_option() -> None:
-    """Spec 015 FR-6: submitting the control gate checkbox stores it on
-    the entry — the option the coordinator's push_control_confirmed
-    property reads (the push_temp_confirmed pattern); a reload then
-    creates the READ-ONLY climate (spec 015 FR-8)."""
-    flow, _client, result, _cap = await _drive_to_confirm(
-        script=[
-            AquaTempTimeoutOutcome(FIRST_TIMEOUT),
-            AquaTempTimeoutOutcome(FIRST_TIMEOUT),
-        ],
-        harvest_result={2046: CAPTURE_2046},
-    )
-    assert result["step_id"] == "confirm_push", result
-    assert "push_control_confirmed" in _schema_keys(result["data_schema"])
-    created = await flow.async_step_confirm_push(
-        user_input={
-            "name": "Pool pump",
-            "push_temp_confirmed": True,
-            "push_control_confirmed": True,
-        }
-    )
-    assert created["type"] == "create_entry", created
-    assert created["options"]["push_control_confirmed"] is True
-    assert created["options"]["push_temp_confirmed"] is True
+    # Spec 022 AC-2: the options carry ONLY the poll interval + the
+    # display unit — the four gate keys are gone
+    assert created["options"] == {
+        "poll_interval": 30,
+        "temperature_unit": "C",
+    }, created["options"]
 
 
 async def test_world2_no_pushes_routes_no_response_byte_identical() -> None:
@@ -630,7 +601,11 @@ async def test_world3_probe_answered_harvest_never_runs() -> None:
     created = await flow.async_step_confirm(user_input={"name": "Classic"})
     assert created["data"] == {"address": ADDRESS, "name": "Classic"}, created
     assert "mode" not in created["data"], created
-    assert "push_temp_confirmed" not in created["options"], created
+    # the classic options shape is unchanged (and carries no gate keys)
+    assert created["options"] == {
+        "poll_interval": 30,
+        "temperature_unit": "C",
+    }, created["options"]
 
 
 async def test_harvest_budget_arithmetic() -> None:
@@ -670,7 +645,6 @@ def main() -> int:
     tests = [
         test_world1_push_harvest_succeeds_with_mode_push,
         test_world1_entry_records_push_mode,
-        test_confirm_push_records_control_gate_option,
         test_world2_no_pushes_routes_no_response_byte_identical,
         test_world3_probe_answered_harvest_never_runs,
         test_harvest_budget_arithmetic,

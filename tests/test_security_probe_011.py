@@ -1038,7 +1038,9 @@ async def test_flow_budget_expiry_mid_probe_routes_cannot_connect() -> None:
 async def test_options_flow_has_no_pair_toggle() -> None:
     """Spec 021 (tasks.md D3): the evidence-gated pair_on_connect
     toggle is GONE from the options schema (pruned with the pairing
-    ladder); the push-mode gates remain."""
+    ladder). Spec 022 (AC-3, inverted): the four gate keys are GONE
+    too — the push options are exactly the poll interval + the
+    display unit."""
     flow = cf.AquaTempOptionsFlowHandler()
     flow.config_entry = types.SimpleNamespace(options={}, data={"mode": "push"})
     result = await flow.async_step_init(None)
@@ -1051,7 +1053,8 @@ async def test_options_flow_has_no_pair_toggle() -> None:
         "write_control",
         "write_setpoint",
     ):
-        assert key in keys, keys
+        assert key not in keys, (key, keys)
+    assert set(keys) == {"poll_interval", "temperature_unit"}, keys
 
 
 # ---------------------------------------------------------------------------

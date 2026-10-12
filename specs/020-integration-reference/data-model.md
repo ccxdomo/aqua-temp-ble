@@ -2,7 +2,9 @@
 
 The single source of truth in code is `registers.py` (constants) +
 `coordinator.AquaTempData` (decode). This file mirrors that map for
-human readers, current as of manifest 0.14.0. Evidence tags as in
+human readers, current as of manifest 0.15.0. Revised after spec 022:
+the activation gates were removed; everything is active by default.
+The automatic write protections are unchanged. Evidence tags as in
 `research.md` ([P] proven / [A] assumed / [V] open).
 
 ## 1. Read plane — pushed blocks (the live data)
@@ -16,7 +18,7 @@ Four 45-register blocks per burst, latest-frame-wins per start:
 | 2010 | block self-reference (`0x07D1` = 2001) | — | none (byte-order proof) | [P] |
 | **2011** | **Power** (state mirror) | flag: raw ≠ 0 → on | climate `hvac_mode`: 0→OFF, ≠0→HEAT | [P diff-revert] |
 | 2012 | flag (static 1 in the diff) | — | none | [V] |
-| 2017, 2018 | unknown | — | none | [V] |
+| 2017, 2018 | unknown — documented fault candidates (spec 022) | — | none (raws ride the `Push stream` control_candidates) | [V] |
 | **2019** | **Mode** (state mirror) | raw enum; 0 = off-world/after-our-writes, 4 = app-flow heat | diagnostic only (never gates display; unmapped nonzero → 1 INFO/session) | [P diff-revert] |
 
 ### Block 2046 (regs 2046-2090) — live T-family temperatures
@@ -37,7 +39,7 @@ raw −450..1500 → else `unknown` + WARNING once.
 
 | Register | Quantity | Entity | Evidence |
 |---|---|---|---|
-| **1046** | **Heat setpoint** (`raw / 10` °C) | climate `target_temperature` (read); write target (behind `write_setpoint`) | [P panel diff + live write] |
+| **1046** | **Heat setpoint** (`raw / 10` °C) | climate `target_temperature` (read) + the write target | [P panel diff + live write] |
 | 1049 | ladder member (min-bound/diff family) | none | [V] |
 | 1050 | max-bound candidate (40.0) | none (display uses the guard's static 10.0/40.0) | [A-weak] |
 | 1051 | cool setpoint candidate | none | [A-strong] |
@@ -52,10 +54,13 @@ them. [P store]
 
 ## 2. Write plane
 
-| Register | Command | Value discipline | Gate | Status |
+Active by default (spec 022) — what guards these writes is automatic
+and permanent, not a human confirmation:
+
+| Register | Command | Value discipline | Protection | Status |
 |---|---|---|---|---|
-| **1011** | power ON/OFF | {0, 1} only, forever | `write_control` option OR `WRITE_CONTROL_PROVEN` | [P proven live] |
-| **1046** | heat setpoint | raw 100..400, multiples of 5 (10.0-40.0 °C / 0.5 °C step); never rounded/clamped | `write_setpoint` option OR `WRITE_SETPOINT_PROVEN` | [P proven live] |
+| **1011** | power ON/OFF | {0, 1} only, forever | address allowlist + value allowlist (the funnel) | [P proven live] |
+| **1046** | heat setpoint | raw 100..400, multiples of 5 (10.0-40.0 °C / 0.5 °C step); never rounded/clamped | address allowlist + value rail (the funnel) | [P proven live] |
 | 1012+1013 | mode (pair write) | — | **never writable** (1013 unpinned; app locks mode) | [P shape] |
 | 1076 | mute | — | **never writable** | [P frame / V] |
 
@@ -84,12 +89,12 @@ Kept as the APK-proven label map and the dormant classic-mode surface:
 The coordinator's single state object, decoded per cycle:
 
 ```
-registers: dict[int, int]        # confirmed T-block raws (push mode)
-power, mode_value, hvac_mode     # from block 2001 (behind control gate)
-target_temp                      # from block 1046 (behind control gate)
+registers: dict[int, int]        # pushed T-block raws (push mode)
+power, mode_value, hvac_mode     # from block 2001
+target_temp                      # from block 1046
 mode: "classic" | "push"         # entry plane
-push_confirmed, push_counts, push_first_seen, push_last_seen
-push_control_raws                # diagnostic candidates (2011/2012/2019/1046/…)
+push_counts, push_first_seen, push_last_seen
+push_control_raws                # diagnostic candidates (2011/2012/2017/2018/2019/1046/…)
 ```
 
 Classic fields (boost/min_target/max_target/inlet/outlet/ambient/fault/
@@ -97,15 +102,17 @@ firmware/binaries) decode `None` in push mode — never guessed.
 
 ## 5. Entity → source summary (push mode)
 
-| Entity | Source register(s) | Gate |
-|---|---|---|
-| climate `hvac_mode` | 2011 (power) | `push_control_confirmed` |
-| climate `target_temperature` | 1046 | `push_control_confirmed` |
-| climate `current_temperature` | 2047 (inlet) | `push_temp_confirmed` |
-| climate min/max/step | static 10.0/40.0/0.5 (guard constants) | — |
-| 6 temperature sensors | 2046-2051 | `push_temp_confirmed` |
-| `Push stream` diagnostic | store freshness + counts + candidate raws | always |
-| 3 probe buttons | services | always (diagnostic) |
+All entities are created unconditionally (active by default, spec 022):
+
+| Entity | Source register(s) |
+|---|---|
+| climate `hvac_mode` | 2011 (power) |
+| climate `target_temperature` | 1046 |
+| climate `current_temperature` | 2047 (inlet — the regulated quantity; pinned by test, spec 022 FR-12) |
+| climate min/max/step | static 10.0/40.0/0.5 (guard constants) |
+| 6 temperature sensors | 2046-2051 |
+| `Push stream` diagnostic | store freshness + counts + candidate raws |
+| 3 probe buttons | services |
 
 Unique ids: `<ADDRESS>_<key>`; device identifiers `{domain, address}`;
 manufacturer PHNIX. One entity per quantity on the two planes (a mirrored

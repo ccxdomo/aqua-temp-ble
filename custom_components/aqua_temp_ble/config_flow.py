@@ -40,8 +40,6 @@ from .aqua_client import (
 from .const import (
     DEFAULT_POLL_INTERVAL,
     DEFAULT_TEMPERATURE_UNIT,
-    DEFAULT_WRITE_CONTROL,
-    DEFAULT_WRITE_SETPOINT,
     DOMAIN,
     MAX_OTHER_DEVICES,
     NAME_PREFIXES,
@@ -196,6 +194,45 @@ def _probe_placeholders(address: str | None, regs: dict[int, int]) -> dict[str, 
     }
 
 
+def _push_placeholders(address: str | None, caps: dict[int, Any]) -> dict[str, str]:
+    """Values shown on the push confirm step, decoded live from the
+    harvest captures (spec 022 FR-7).
+
+    Only PROVEN decodes are used: the temperatures from the T-block
+    capture (raws 2047/2048/2050), the power state from the control
+    block capture (raw 2011) and the heat target from the 1046-block
+    capture (raw 1046). Per-value fallback: sentinel -> `sensor absent`,
+    absent block/register -> `unknown`. No mode line (heat-only unit;
+    the mode mirror is a diagnostic — spec 018).
+    """
+
+    def raw_at(reg: int) -> int | None:
+        block = registers.pushed_block_start(reg)
+        cap = caps.get(block) if block is not None else None
+        return cap.registers.get(reg) if cap is not None else None
+
+    def temp(reg: int) -> str:
+        raw = raw_at(reg)
+        if raw is None:
+            return "unknown"
+        if registers.is_sentinel(raw):
+            return "sensor absent"
+        return f"{raw / registers.TEMP_SCALE:.1f} °C"
+
+    power_raw = raw_at(registers.PUSHED_CONTROL["power"])
+    setpoint_addr = registers.PUSHED_CONTROL["setpoint"]
+    return {
+        "address": address or "?",
+        "power": (
+            "unknown" if power_raw is None else ("on" if power_raw != 0 else "off")
+        ),
+        "setpoint": temp(setpoint_addr) if setpoint_addr is not None else "unknown",
+        "inlet": temp(registers.PUSHED_TEMPS["inlet_water_temp"]),
+        "outlet": temp(registers.PUSHED_TEMPS["outlet_water_temp"]),
+        "ambient": temp(registers.PUSHED_TEMPS["ambient_temp"]),
+    }
+
+
 class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle the aqua_temp_ble config flow."""
 
@@ -211,6 +248,9 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
         # SUCCEEDED on the unit's pushed blocks (mode "push"); the
         # confirm step and the created entry read it.
         self._push_mode: bool = False
+        # Spec 022 FR-7: the harvest captures stashed on success —
+        # the confirm step's live placeholders decode from them.
+        self._push_caps: dict[int, Any] = {}
         # Spec 011 FR-2 (contract 011 §2): the running test stage —
         # stamped BEFORE each stage runs (the 007 conventions extended
         # to the probe stages); failure lines report the running stage,
@@ -717,6 +757,7 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
             raws.get(2050, 0),
             raws.get(2051, 0),
         )
+        self._push_caps = caps  # spec 022 FR-7: the placeholders' source
         self._push_mode = True
         return True
 
@@ -744,37 +785,24 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_confirm_push(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """The push-mode confirm step (spec 013 FR-3/FR-5).
+        """The push-mode confirm step (spec 013 FR-3; spec 022 FR-2/FR-7).
 
-        Same summary placeholders as the classic confirm step — all
-        "unknown" here (no base answer exists in push mode; no
-        unconfirmed register is ever displayed under a certain name,
-        contract 013 §4.3) — plus the push-mode note (the confirm-step
-        UI string, FR-3/FR-6.1): monitoring entities only; control,
-        the fault code and the firmware version are absent until the
-        request path revives (spec 013 §6 — no promise of control).
-        The `push_temp_confirmed` checkbox is the calibration gate
-        (FR-5, quickstart 013 §2): the owner checks it ONLY after the
-        side-by-side run matched the app's T-family display (contract
-        013 §5); a mismatch is reported and pins nothing.
-        The `push_control_confirmed` checkbox is the CONTROL gate
-        (spec 015 FR-6, contract 015-A §4): the owner checks it ONLY
-        after the power/mode diff-revert (quickstart 015 §1/§5) matched
-        the app's display — it unlocks the READ-ONLY climate (FR-8);
-        a mismatch closes the gate and pins nothing.
+        The step asks for a NAME only (the confirmation checkboxes are
+        gone — spec 022 Option B: the integration is active by
+        default). The description shows what the test captured,
+        decoded live from the harvest captures: the power state, the
+        heat target and the inlet/outlet/ambient temperatures
+        (per-value `unknown` / `sensor absent` fallbacks; no mode
+        line — heat-only unit).
         """
         if user_input is None:
             return self.async_show_form(
                 step_id="confirm_push",
                 data_schema=vol.Schema(
-                    {
-                        vol.Required("name", default=DEFAULT_NAME): str,
-                        vol.Optional("push_temp_confirmed", default=False): bool,
-                        vol.Optional("push_control_confirmed", default=False): bool,
-                    }
+                    {vol.Required("name", default=DEFAULT_NAME): str}
                 ),
-                description_placeholders=_probe_placeholders(
-                    self._address, self._regs or {}
+                description_placeholders=_push_placeholders(
+                    self._address, self._push_caps
                 ),
             )
         return self.async_create_entry(
@@ -791,17 +819,6 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
             options={
                 "poll_interval": DEFAULT_POLL_INTERVAL,
                 "temperature_unit": DEFAULT_TEMPERATURE_UNIT,
-                # Spec 013 FR-5: the calibration gate, stored on the
-                # entry (contract 013 §5.3 — the shipped default False).
-                "push_temp_confirmed": bool(
-                    user_input.get("push_temp_confirmed", False)
-                ),
-                # Spec 015 FR-6: the control confirmation gate — the
-                # shipped default False (contract 015-A §4); checking it
-                # unlocks the READ-ONLY push-mode climate after a reload.
-                "push_control_confirmed": bool(
-                    user_input.get("push_control_confirmed", False)
-                ),
             },
         )
 
@@ -813,8 +830,9 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 class AquaTempOptionsFlowHandler(OptionsFlow):
-    """Options: poll interval (10..600 s), display temperature unit, and
-    (push entries) the calibration + write activation gates.
+    """Options: poll interval (10..600 s) and the display temperature
+    unit — the same two fields for every entry (spec 022: the push
+    entries' gate toggles are gone with the gates).
 
     Changes apply without an entry reload (see __init__ listener); the unit
     is read dynamically by the climate entity.
@@ -841,64 +859,4 @@ class AquaTempOptionsFlowHandler(OptionsFlow):
                 default=current.get("temperature_unit", DEFAULT_TEMPERATURE_UNIT),
             ): vol.In({"C": "Celsius (°C)", "F": "Fahrenheit (°F)"}),
         }
-        if str(self.config_entry.data.get("mode", "classic")) == "push":
-            # Spec 013 FR-5 (contract 013 §5.3): the calibration gate's
-            # post-setup flip — the owner matches the captured T-window
-            # against the app's T-family display (quickstart 013 §2),
-            # then reloads so the temperature entities appear. Classic
-            # entries keep today's exact options form (US-6).
-            schema[
-                vol.Required(
-                    "push_temp_confirmed",
-                    default=current.get("push_temp_confirmed", False),
-                )
-            ] = bool
-            # Spec 015 FR-6 (contract 015-A §4): the CONTROL gate's
-            # post-setup flip — the owner re-verifies the pinned control
-            # homes (power 2011 / mode 2019, quickstart 015 §5) against
-            # the app's display, then reloads so the READ-ONLY climate
-            # appears (spec 015 FR-8).
-            schema[
-                vol.Required(
-                    "push_control_confirmed",
-                    default=current.get("push_control_confirmed", False),
-                )
-            ] = bool
-            # Spec 017 FR-1 (contract 017 §2): the write-control
-            # ACTIVATION — the owner's act alone, never automatic. The
-            # checkbox ships False (the integration stays
-            # byte-identical to 0.12.0); its description names the
-            # required probe verdict (the `power write probe:
-            # EXECUTED + REVERSIBLE` line, contract 016 §4's discipline
-            # surfaced to the UI). Checking it opens the climate's
-            # power-control surface (FR-5): the entities read the
-            # coordinator's gate live, so saving re-renders them — no
-            # Home Assistant restart needed (the push_control_confirmed
-            # precedent for the option's lifetime; the global
-            # registers.WRITE_CONTROL_PROVEN switch stays the
-            # alternative path).
-            schema[
-                vol.Required(
-                    "write_control",
-                    default=current.get("write_control", DEFAULT_WRITE_CONTROL),
-                )
-            ] = bool
-            # Spec 019 FR-9 (contract 019 §4): the setpoint ACTIVATION —
-            # the THIRD gate, SEPARATE from write_control (the owner
-            # may activate either without the other; the gates
-            # compose). The checkbox ships False (the setpoint write
-            # surface stays absent — the read display appears behind
-            # the existing control gate); its description names the
-            # required probe verdict (the `setpoint write probe:
-            # EXECUTED + REVERSIBLE` line, contract 019 §4's discipline
-            # surfaced to the UI). Checking it opens the climate's
-            # TARGET_TEMPERATURE surface (FR-11): the entity reads the
-            # coordinator's gate live, so saving re-renders it — no
-            # restart (the write_control precedent).
-            schema[
-                vol.Required(
-                    "write_setpoint",
-                    default=current.get("write_setpoint", DEFAULT_WRITE_SETPOINT),
-                )
-            ] = bool
         return self.async_show_form(step_id="init", data_schema=vol.Schema(schema))

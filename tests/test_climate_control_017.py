@@ -5,11 +5,10 @@ client rail, the confirmation cycle and the climate surface
 
 Part A (standalone modules): the AC-1 funnel parity (the classic
 funnel, the control builder and registers' pinned strings produce the
-SAME proven bytes — one source of truth), the const default
-(DEFAULT_WRITE_CONTROL is False — the code ships inert), the guard's
-`control_allowed` activation thread (the option surface honored while
-the module switch stays the shipped gate) and the coordinator's
-activation property (both surfaces OR'd, both-off locked).
+SAME proven bytes — one source of truth) and the guard's PERMANENT
+value rail (spec 022: the `control_allowed` thread and the activation
+property are gone with the gates — 1011 is writable by default within
+{0, 1}).
 
 Part B (the client seam — the 016 fake-bleak pattern): client.write_
 control is fire-and-forget on the SAME _write_frame seam (the pinned
@@ -20,8 +19,9 @@ raises AquaTempConnectionError; a GATT failure is wrapped, never
 silent.
 
 Part C (coordinator, synthetic-package import — the 016 scripted-
-client pattern): the confirmation cycle's verdict matrix — gate
-closed (the 016 message, ZERO I/O before the guard), the value
+client pattern): the confirmation cycle's verdict matrix — the cycle
+runs with NO options (spec 022: the closed-gate refusal world is
+inverted), the value
 discipline through the funnel, confirmed (the FR-4 audit + verdict
 INFO lines EXACT; the snapshot pushed reflects the MIRROR; ONE
 trigger; no disconnect), the freshness gate (a STALE capture never
@@ -34,27 +34,28 @@ the trigger failure (propagates, its WARNING names the confirm
 context). The probe's own trigger lines keep their exact 016 strings
 after the _trigger_report refactor.
 
-Part D (the climate surface, AC-3/4/5): locked = the 015 read-only
-surface byte-identical; the option path = [OFF, HEAT], TURN_ON|TURN_
-OFF features (never TARGET_TEMPERATURE), the commands wired to the
-cycle, COOL/AUTO refused (heat-only), set_temperature keeps the 015
-refusal, the diagnostics attributes (write_control + the last
-verdict); the switch path opens the same surface; the END-TO-END
-command over the REAL client records EXACTLY the pinned frames on
+Part D (the climate surface, spec 022): the surface is UNCONDITIONAL
+— [OFF, HEAT], TURN_ON|TURN_OFF|TARGET_TEMPERATURE features, the
+commands wired to the cycle, COOL/AUTO refused (heat-only),
+set_temperature routed to the setpoint cycle (the gate is gone), the
+diagnostics attributes (the last verdicts, no gate markers); the
+END-TO-END command over the REAL client records EXACTLY the pinned
+frames on
 the fake write char, withoutResponse (AC-4's byte-level demand);
 write-path errors propagate (never optimistic).
 
-Part E (the option's declared surface): strings.json + both
-translations declare the write_control label + description naming
-the required verdict; the options flow schema carries the checkbox
-(default False, push-mode only, the save merge).
+Part E (the declared surface, spec 022): the write_control option is
+GONE from strings.json, both translations and the options flow
+schema — the options step carries exactly the poll interval + the
+display unit (AC-3/AC-8's gate-free world).
 
-Red-first on d9d7632 (0.12.0): none of the 017 surfaces exist —
-DEFAULT_WRITE_CONTROL, the guard's control_allowed thread,
-client.write_control, the coordinator's activation property and
-confirmation cycle, the climate's gate-aware surface and the
-options-flow checkbox — so every test below fails until the
-implementation lands.
+Spec 022 note: the 017 gate surfaces (the const default, the guard's
+control_allowed thread, the activation property, the gate-closed
+refusals, the read-only climate, the options checkbox) are INVERTED
+or removed — the gates are gone; the living behaviours (the funnel
+parity, the client rail, the confirmation cycle's verdict matrix, the
+end-to-end frames, the classic error propagation) keep their
+assertions.
 
 Run standalone:
 
@@ -157,55 +158,29 @@ def test_funnel_parity_pinned_frames() -> None:
     assert modbus.validate_crc(on) and modbus.validate_crc(off)
 
 
-def test_default_write_control_ships_inert() -> None:
-    """FR-1/AC-10: the shipped default is False — the integration stays
-    byte-identical to 0.12.0 until the owner's explicit act."""
-    assert const.DEFAULT_WRITE_CONTROL is False
-
-
-def test_guard_control_allowed_thread() -> None:
-    """FR-3 step 1 (the activation's funnel rule): `control_allowed`
-    threads the coordinator's OR-property into the guard — the OPTION
-    surface honors (1011, 0|1) while the module switch stays the
-    shipped default for every other caller; the value allowlist and the
-    base scope are untouched."""
-    assert registers.WRITE_CONTROL_PROVEN is False  # the shipped gate
-    # the default (no thread) keeps the 016 behavior: the switch alone
-    with expect_raises(ValueError, "WRITE_CONTROL_PROVEN"):
-        registers.ensure_writable(1011, 1)
-    # the activation (either surface) opens exactly (1011, 0|1)
-    registers.ensure_writable(1011, 0, control_allowed=True)  # must not raise
-    registers.ensure_writable(1011, 1, control_allowed=True)  # must not raise
+def test_guard_control_value_rail_permanent() -> None:
+    """FR-3/AC-4 (spec 022, the inversion of the control_allowed
+    thread): the thread is GONE with the gate — 1011 is writable BY
+    DEFAULT within its PERMANENT value rail ({0, 1}); the value
+    allowlist and the base scope are untouched; a read home is never
+    writable. (The const default and the activation property are gone
+    with the gates — pinned absent by the spec-022 symbol grep.)"""
+    registers.ensure_writable(1011, 0)  # must not raise
+    registers.ensure_writable(1011, 1)  # must not raise
     with expect_raises(ValueError, "accepts only values"):
-        registers.ensure_writable(1011, 2, control_allowed=True)
-    with expect_raises(ValueError, "WRITE_CONTROL_PROVEN"):
-        registers.ensure_writable(1011, 1, control_allowed=False)
-    # the base scope ignores the thread entirely (byte-identical rules)
-    registers.ensure_writable(8, 1, control_allowed=False)  # must not raise
-    registers.ensure_writable(14, 325, control_allowed=False)  # must not raise
+        registers.ensure_writable(1011, 2)
+    with expect_raises(ValueError, "accepts only values"):
+        registers.ensure_writable(1011, None)
+    # the base scope (byte-identical rules)
+    registers.ensure_writable(8, 1)  # must not raise
+    registers.ensure_writable(14, 325)  # must not raise
     with expect_raises(ValueError, "spec 003"):
-        registers.ensure_writable(15, 1, control_allowed=True)
+        registers.ensure_writable(15, 1)
     with expect_raises(ValueError, "spec 003"):
-        registers.ensure_writable(1012, 1, control_allowed=True)
-    # a read home is never writable — even with the activation on
+        registers.ensure_writable(1012, 1)
+    # a read home is never writable
     with expect_raises(ValueError, "not writable"):
-        registers.ensure_writable(2011, 0, control_allowed=True)
-
-
-def test_write_control_gate_property_paths() -> None:
-    """FR-1/AC-4/AC-5: the activation property — the per-entry option
-    OR the global registers switch; both off = locked."""
-    pkg_regs = sys.modules[f"{PKG}.registers"]
-    closed = _make_coordinator(options={})
-    option = _make_coordinator(options={"write_control": True})
-    assert closed.write_control_allowed is False
-    assert option.write_control_allowed is True
-    with _patch_attr(pkg_regs, "WRITE_CONTROL_PROVEN", True):
-        assert closed.write_control_allowed is True  # the switch ORs
-        assert option.write_control_allowed is True  # both on
-    assert pkg_regs.WRITE_CONTROL_PROVEN is False  # restored
-    assert registers.WRITE_CONTROL_PROVEN is False  # the standalone module untouched
-    assert coordinator_mod.registers is not registers  # separate instances
+        registers.ensure_writable(2011, 0)
 
 
 # ===========================================================================
@@ -505,16 +480,6 @@ def _make_coordinator(client=None, options=None):
     )
 
 
-def _open_options() -> dict:
-    """The open-gate option set: the 015 control-confirmation gate +
-    the 017 write-control activation."""
-    return {
-        "push_control_confirmed": True,
-        "push_temp_confirmed": True,
-        "write_control": True,
-    }
-
-
 def _ns_capture(raws: dict[int, int], *, last_seen: float | None = None) -> SimpleNamespace:
     """A duck-typed PushCapture for the 2001 block (the 016 pattern)."""
     ts = time.monotonic() if last_seen is None else last_seen
@@ -529,7 +494,7 @@ def _push_snapshot(*, power: bool):
         2001: _ns_capture(CONTROL_BLOCK_ON if power else CONTROL_BLOCK_OFF),
         2046: _ns_capture(T_WINDOW_RAWS),
     }
-    return coordinator_mod.AquaTempData.from_pushes(caps, True, True)
+    return coordinator_mod.AquaTempData.from_pushes(caps)
 
 
 class _LogCap(logging.Handler):
@@ -704,6 +669,7 @@ class ScriptedControlClient:
         self.disconnected = False
         self.read_calls = 0
         self.control_writes: list[tuple[int, int]] = []
+        self.setpoint_writes: list[int] = []
         self.probe_writes: list[bytes] = []
         self.funnel_writes: list[tuple[int, list[int]]] = []
         self._store: dict[int, SimpleNamespace] = {}
@@ -733,6 +699,9 @@ class ScriptedControlClient:
             error = self.write_errors[len(self.control_writes) - 1]
             if error is not None:
                 raise error
+
+    async def write_setpoint(self, value_raw: int) -> None:
+        self.setpoint_writes.append(value_raw)
 
     async def write_probe_frame(self, frame: bytes) -> None:
         self.probe_writes.append(bytes(frame))
@@ -774,23 +743,26 @@ def _run_control(mirrors, *, value, write_errors=None, trigger_error=None,
     return client, coordinator, cap, result
 
 
-def test_cycle_gate_closed_raises_before_io() -> None:
-    """AC-3/AC-10: with both activation surfaces off the cycle refuses
-    with the 016 message BEFORE any connect, lock or I/O."""
-    client = ScriptedControlClient()
-    coordinator = _make_coordinator(client, options={})
-    with expect_raises(ValueError, "WRITE_CONTROL_PROVEN"):
-        asyncio.run(coordinator.async_control_write_power(1))
-    assert client.read_calls == 0
-    assert client.control_writes == []
-    assert client.connect_kwargs is None, "the guard fires BEFORE the connect"
+def test_cycle_runs_without_options() -> None:
+    """Spec 022 (the inversion of the 017 closed-gate refusal): the
+    cycle proceeds with NO options — the write goes out, ONE trigger
+    fires, the mirror decides (the pre-I/O refusal world is dead with
+    the gate)."""
+    client, coordinator, cap, result = _run_control([1], value=1)
+    assert result["verdict"] == "confirmed", result
+    assert result["value"] == 1
+    assert result["mirror_raw"] == 1
+    assert client.control_writes == [(1011, 1)], client.control_writes
+    assert client.read_calls == 1
+    assert client.connect_kwargs is None  # already connected: no connect call
+    assert not client.disconnected, "the confirmation must NOT disconnect"
 
 
 def test_cycle_value_discipline_zero_io() -> None:
     """FR-3 step 1's value half: with the activation on, value 2 raises
     the funnel's value-allowlist message with ZERO client I/O."""
     client = ScriptedControlClient()
-    coordinator = _make_coordinator(client, options=_open_options())
+    coordinator = _make_coordinator(client, options={})
     with expect_raises(ValueError, "accepts only values"):
         asyncio.run(coordinator.async_control_write_power(2))
     assert client.read_calls == 0
@@ -802,7 +774,7 @@ def test_cycle_confirmed_pushes_mirror_snapshot() -> None:
     INFO verdict (FR-4's exact lines), the snapshot pushed reflects the
     MIRROR, ONE trigger, NO disconnect on completion."""
     pn = _attach_pn()
-    client, coordinator, cap, result = _run_control([1], value=1, options=_open_options())
+    client, coordinator, cap, result = _run_control([1], value=1, options={})
     assert result["verdict"] == "confirmed", result
     assert result["value"] == 1
     assert result["mirror_raw"] == 1
@@ -830,7 +802,7 @@ def test_cycle_connects_when_disconnected() -> None:
     spec 021: no pair kwarg anymore; the pair_on_connect option was
     pruned with the pairing ladder)."""
     client, _coord, _cap, result = _run_control(
-        [1], value=1, is_connected=False, options=_open_options()
+        [1], value=1, is_connected=False, options={}
     )
     assert result["verdict"] == "confirmed"
     assert client.connect_kwargs == {}, client.connect_kwargs
@@ -841,7 +813,7 @@ def test_cycle_mismatch_shows_mirror_and_notifies_off() -> None:
     BOTH values; the tile shows the MIRROR's truth (never the request);
     a contradicted OFF raises the persistent notification (§5.5)."""
     pn = _attach_pn()
-    client, coordinator, cap, result = _run_control([1], value=0, options=_open_options())
+    client, coordinator, cap, result = _run_control([1], value=0, options={})
     assert result["verdict"] == "not-confirmed", result
     assert result["mirror_raw"] == 1 and result["value"] == 0
     warns = [
@@ -873,7 +845,7 @@ def test_cycle_no_report_unconfirmed_off_notification() -> None:
     line, NO snapshot push (the state stays), the persistent
     notification for the OFF — and a later CONFIRMED cycle dismisses it."""
     pn = _attach_pn()
-    client, coordinator, cap, result = _run_control([None], value=0, options=_open_options())
+    client, coordinator, cap, result = _run_control([None], value=0, options={})
     assert result["verdict"] == "unconfirmed", result
     assert result["mirror_raw"] is None
     warns = [
@@ -891,7 +863,7 @@ def test_cycle_no_report_unconfirmed_off_notification() -> None:
     assert pn.created[0][0] == NOTIFICATION_ID
     assert "check the panel" in pn.created[0][1]
     # a later CONFIRMED cycle for the same unit dismisses it
-    _client2, _coord2, _cap2, result2 = _run_control([0], value=0, options=_open_options())
+    _client2, _coord2, _cap2, result2 = _run_control([0], value=0, options={})
     assert result2["verdict"] == "confirmed"
     assert pn.dismissed == [NOTIFICATION_ID], pn.dismissed
 
@@ -901,7 +873,7 @@ def test_cycle_stale_capture_never_confirms() -> None:
     satisfies the wait — a stale mirror cannot confirm a write."""
     pn = _attach_pn()
     client, coordinator, cap, result = _run_control(
-        [], value=1, pre_stale=True, options=_open_options()
+        [], value=1, pre_stale=True, options={}
     )
     assert result["verdict"] == "unconfirmed", result
     assert result["mirror_raw"] is None  # the stale capture was refused
@@ -918,7 +890,7 @@ def test_cycle_write_error_propagates_zero_reads() -> None:
     cross-check, NO snapshot push, NO notification."""
     pn = _attach_pn()
     client = ScriptedControlClient([], write_errors=[RuntimeError("link down")])
-    coordinator = _make_coordinator(client, options=_open_options())
+    coordinator = _make_coordinator(client, options={})
     coordinator.data = None
     with _patch_attr(coordinator_mod.const, "PROBE_MIRROR_TIMEOUT", 0.15):
         with _control_logs():
@@ -937,7 +909,7 @@ def test_cycle_trigger_failure_propagates() -> None:
     propagates — the write itself already went out."""
     trigger_error = pkg_aqua_client.AquaTempError("trigger transport failed")
     client = ScriptedControlClient([], trigger_error=trigger_error)
-    coordinator = _make_coordinator(client, options=_open_options())
+    coordinator = _make_coordinator(client, options={})
     with _control_logs() as cap:
         with expect_raises(pkg_aqua_client.AquaTempError, "trigger transport failed"):
             asyncio.run(coordinator.async_control_write_power(1))
@@ -997,52 +969,36 @@ def _added_entity(hass, entry):
     return added[0]
 
 
-def test_climate_locked_surface_byte_identical() -> None:
-    """AC-3: with both activation surfaces off the push-mode climate is
-    the 015 read-only surface, byte-identical — no modes, no features,
-    no diagnostics attributes, every write refused with the 015
-    message, ZERO client I/O."""
+def test_climate_surface_shape_unconditional() -> None:
+    """AC-3 (spec 022, the inversion of the 015/017 locked surface):
+    the push-mode climate is created with NO options and advertises the
+    FULL surface — [OFF, HEAT] modes, TURN_ON|TURN_OFF|
+    TARGET_TEMPERATURE features, no diagnostics before any write;
+    the read-only refusal world is dead with the gates."""
     snapshot = _push_snapshot(power=True)
     client = ScriptedControlClient()
-    hass, entry, _coord = _make_platform({"push_control_confirmed": True}, snapshot, client)
-    entity = _added_entity(hass, entry)
-    assert entity._attr_hvac_modes == []  # the 015 assertion still holds
-    assert entity.hvac_modes == []
-    assert entity.supported_features == ClimateEntityFeature(0)
-    assert not (entity.supported_features & ClimateEntityFeature.TARGET_TEMPERATURE)
-    assert entity.extra_state_attributes is None
-    for call in (
-        lambda: entity.async_turn_on(),
-        lambda: entity.async_turn_off(),
-        lambda: entity.async_set_hvac_mode(HVACMode.HEAT),
-        lambda: entity.async_set_temperature(temperature=20.0),
-    ):
-        with expect_raises(HomeAssistantError, "read-only"):
-            asyncio.run(call())
-    assert client.control_writes == []
-    assert client.read_calls == 0
-    assert client.funnel_writes == []
-
-
-def test_climate_option_path_full_surface() -> None:
-    """AC-4: the option path — hvac_modes [OFF, HEAT], the TURN_ON |
-    TURN_OFF features (never TARGET_TEMPERATURE), the commands wired
-    to the confirmation cycle, COOL/AUTO refused (heat-only),
-    set_temperature keeps the 015 refusal, the diagnostics attributes
-    carry the gate + the last verdict."""
-    snapshot = _push_snapshot(power=False)
-    client = ScriptedControlClient([1, 1, 0, 0])
-    hass, entry, coordinator = _make_platform(
-        {"push_control_confirmed": True, "write_control": True}, snapshot, client
-    )
+    hass, entry, _coord = _make_platform({}, snapshot, client)
     entity = _added_entity(hass, entry)
     assert entity.hvac_modes == [HVACMode.OFF, HVACMode.HEAT]
     assert entity.supported_features == (
-        ClimateEntityFeature.TURN_ON | ClimateEntityFeature.TURN_OFF
+        ClimateEntityFeature.TURN_ON
+        | ClimateEntityFeature.TURN_OFF
+        | ClimateEntityFeature.TARGET_TEMPERATURE
     )
-    assert not (entity.supported_features & ClimateEntityFeature.TARGET_TEMPERATURE)
-    attrs = entity.extra_state_attributes
-    assert attrs is not None and attrs["write_control"] == "allowed", attrs
+    assert entity.extra_state_attributes is None  # no write yet
+    assert entity.hvac_mode == HVACMode.HEAT  # the display follows power
+
+
+def test_climate_commands_wire_to_cycles() -> None:
+    """AC-4 (spec 022): the commands are wired to the confirmation
+    cycles UNCONDITIONALLY — each power command consumes one scripted
+    mirror; COOL/AUTO refused (heat-only); set_temperature routes to
+    the SETPOINT cycle (the setpoint gate is gone too); the diagnostics
+    carry the last verdicts (no gate markers)."""
+    snapshot = _push_snapshot(power=False)
+    client = ScriptedControlClient([1, 1, 0, 0])
+    hass, entry, coordinator = _make_platform({}, snapshot, client)
+    entity = _added_entity(hass, entry)
     # the commands (each consumes one scripted mirror)
     with _patch_attr(coordinator_mod.const, "PROBE_MIRROR_TIMEOUT", 0.15):
         asyncio.run(entity.async_turn_on())
@@ -1058,34 +1014,20 @@ def test_climate_option_path_full_surface() -> None:
         asyncio.run(entity.async_set_hvac_mode(HVACMode.COOL))
     with expect_raises(HomeAssistantError, "heat-only"):
         asyncio.run(entity.async_set_hvac_mode(HVACMode.AUTO))
-    # set_temperature keeps the 015 refusal (no setpoint surface, FR-8)
-    with expect_raises(HomeAssistantError, "read-only"):
-        asyncio.run(entity.async_set_temperature(temperature=20.0))
-    # the diagnostics surface the last write verdict (FR-3 step 9's dict)
+    # set_temperature routes to the SETPOINT cycle (spec 022: the gate
+    # is gone) — the write reaches the rail; the silent window ends it
+    # unconfirmed (honest, never a crash)
+    with _patch_attr(coordinator_mod.const, "PROBE_MIRROR_TIMEOUT", 0.05):
+        asyncio.run(entity.async_set_temperature(temperature=30.0))
+    assert client.setpoint_writes == [300], client.setpoint_writes
+    # the diagnostics surface the last write verdicts (no gate markers)
     attrs2 = entity.extra_state_attributes
+    assert attrs2 is not None
     assert attrs2["last_power_write"]["verdict"] == "confirmed", attrs2
     assert attrs2["last_power_write"]["value"] == 0
     assert attrs2["last_power_write"]["mirror_raw"] == 0
-
-
-def test_climate_switch_path_same_surface() -> None:
-    """AC-5: the registers switch (test-patched WRITE_CONTROL_PROVEN)
-    opens the SAME surface as the option — both activation paths are
-    honored."""
-    pkg_regs = sys.modules[f"{PKG}.registers"]
-    snapshot = _push_snapshot(power=False)
-    client = ScriptedControlClient([1])
-    hass, entry, coordinator = _make_platform(
-        {"push_control_confirmed": True}, snapshot, client
-    )
-    with _patch_attr(pkg_regs, "WRITE_CONTROL_PROVEN", True):
-        entity = _added_entity(hass, entry)
-        assert entity.hvac_modes == [HVACMode.OFF, HVACMode.HEAT]
-        with _patch_attr(coordinator_mod.const, "PROBE_MIRROR_TIMEOUT", 0.15):
-            asyncio.run(entity.async_turn_on())
-        assert client.control_writes == [(1011, 1)], client.control_writes
-    assert pkg_regs.WRITE_CONTROL_PROVEN is False  # restored
-    assert registers.WRITE_CONTROL_PROVEN is False  # the standalone module untouched
+    assert "write_control" not in attrs2
+    assert "write_setpoint" not in attrs2
 
 
 def test_climate_commands_write_pinned_frames_end_to_end() -> None:
@@ -1101,7 +1043,7 @@ def test_climate_commands_write_pinned_frames_end_to_end() -> None:
         entry_id="e2e",
         title="Aqua Temp test",
         data={"address": ADDRESS, "mode": "push"},
-        options=dict(_open_options()),
+        options={},
     )
     coordinator = coordinator_mod.AquaTempCoordinator(hass=None, entry=entry, client=client)
     hass = SimpleNamespace(data={DOMAIN: {"e2e": {"coordinator": coordinator}}})
@@ -1142,9 +1084,7 @@ def test_climate_command_error_propagates() -> None:
     displayed state stays the last MIRROR's truth."""
     snapshot = _push_snapshot(power=False)
     client = ScriptedControlClient([], write_errors=[RuntimeError("link down")])
-    hass, entry, _coord = _make_platform(
-        {"push_control_confirmed": True, "write_control": True}, snapshot, client
-    )
+    hass, entry, _coord = _make_platform({}, snapshot, client)
     entity = _added_entity(hass, entry)
     with expect_raises(RuntimeError, "link down"):
         asyncio.run(entity.async_turn_on())
@@ -1156,70 +1096,53 @@ def test_climate_command_error_propagates() -> None:
 # ===========================================================================
 
 
-def test_write_control_option_declared_in_strings() -> None:
-    """FR-1: the option is labeled + described in strings.json and BOTH
-    translations — the description names the required probe verdict
-    (the UI carries contract 016 §4's discipline)."""
+def test_write_control_option_gone_from_strings() -> None:
+    """Spec 022 (AC-8, inverted): the write_control option label and
+    description are GONE from strings.json and BOTH translations (the
+    option is gone with the gate)."""
     strings = json.loads((COMPONENT_DIR / "strings.json").read_text())
     init = strings["options"]["step"]["init"]
-    assert "write_control" in init["data"], init["data"].keys()
-    assert "write_control" in init.get("data_description", {}), init.keys()
-    assert "EXECUTED + REVERSIBLE" in init["data_description"]["write_control"]
+    assert "write_control" not in init["data"], init["data"].keys()
+    assert "write_control" not in init.get("data_description", {}), init.keys()
+    for key in ("push_temp_confirmed", "push_control_confirmed", "write_setpoint"):
+        assert key not in init["data"], (key, init["data"].keys())
     for lang in ("en", "fr"):
         data = json.loads((COMPONENT_DIR / "translations" / f"{lang}.json").read_text())
         init_lang = data["options"]["step"]["init"]
-        assert "write_control" in init_lang["data"], (lang, init_lang["data"].keys())
-        assert "write_control" in init_lang.get("data_description", {}), (
+        assert "write_control" not in init_lang["data"], (lang, init_lang["data"].keys())
+        assert "write_setpoint" not in init_lang["data"], (lang, init_lang["data"].keys())
+        assert "write_control" not in init_lang.get("data_description", {}), (
             lang,
             init_lang.keys(),
         )
-        assert "EXECUTED + REVERSIBLE" in init_lang["data_description"]["write_control"], lang
 
 
-def test_options_flow_schema_has_write_control() -> None:
-    """FR-1/T1: the OptionsFlow carries the write_control checkbox —
-    default False (the shipped inert default), push-mode only, its
-    checked value kept as the default, and the save merge carries it."""
+def test_options_flow_schema_has_no_gate_keys() -> None:
+    """Spec 022 (AC-3, inverted): the options flow carries exactly the
+    poll interval + the display unit — the four gate keys are GONE
+    (the push and classic entries share the same two-field form)."""
     assert config_flow_mod is not None, (
         f"config_flow import failed: {_CONFIG_FLOW_IMPORT_ERROR}"
     )
     flow = config_flow_mod.AquaTempOptionsFlowHandler()
-    # push entry, fresh options -> the checkbox present, default False
     flow.config_entry = SimpleNamespace(options={}, data={"mode": "push"})
     result = asyncio.run(flow.async_step_init(None))
     assert result["type"] == "form" and result["step_id"] == "init", result
-    marker = next(
-        e for e in result["data_schema"] if getattr(e, "key", None) == "write_control"
-    )
-    assert marker.kwargs.get("default") is False
-    assert config_flow_mod.DEFAULT_WRITE_CONTROL is False
-    # an already-enabled entry keeps True as the default
-    flow.config_entry = SimpleNamespace(
-        options={"write_control": True}, data={"mode": "push"}
-    )
-    result = asyncio.run(flow.async_step_init(None))
-    marker = next(
-        e for e in result["data_schema"] if getattr(e, "key", None) == "write_control"
-    )
-    assert marker.kwargs.get("default") is True
-    # the save merge carries the option into the entry's options
+    keys = {getattr(e, "key", None) for e in result["data_schema"]}
+    assert keys == {"poll_interval", "temperature_unit"}, keys
+    # the save merge stores what the user submitted (the two fields)
     flow.config_entry = SimpleNamespace(options={}, data={"mode": "push"})
     result = asyncio.run(flow.async_step_init({
         "poll_interval": 30,
         "temperature_unit": "C",
-        "pair_on_connect": False,
-        "push_temp_confirmed": False,
-        "push_control_confirmed": False,
-        "write_control": True,
     }))
     assert result["type"] == "create_entry", result
-    assert result["data"]["write_control"] is True
-    # classic entries do not get the checkbox (the push-only precedent)
+    assert result["data"] == {"poll_interval": 30, "temperature_unit": "C"}
+    # classic entries: the same two-field form (the push-only branch is gone)
     flow.config_entry = SimpleNamespace(options={}, data={})
     result = asyncio.run(flow.async_step_init(None))
-    assert not any(
-        getattr(e, "key", None) == "write_control" for e in result["data_schema"]
-    )
+    keys = {getattr(e, "key", None) for e in result["data_schema"]}
+    assert keys == {"poll_interval", "temperature_unit"}, keys
 
 
 # ---------------------------------------------------------------------------
@@ -1229,18 +1152,16 @@ def test_options_flow_schema_has_write_control() -> None:
 
 def main() -> int:
     tests = [
-        # Part A — parity, the const default, the guard thread, the gate
+        # Part A — parity + the permanent value rail (spec 022)
         test_funnel_parity_pinned_frames,
-        test_default_write_control_ships_inert,
-        test_guard_control_allowed_thread,
-        test_write_control_gate_property_paths,
+        test_guard_control_value_rail_permanent,
         # Part B — the client rail
         test_control_send_records_pinned_frames,
         test_control_rail_refuses_before_any_byte,
         test_control_send_requires_connection,
         test_control_send_wraps_gatt_failure,
         # Part C — the confirmation cycle
-        test_cycle_gate_closed_raises_before_io,
+        test_cycle_runs_without_options,
         test_cycle_value_discipline_zero_io,
         test_cycle_confirmed_pushes_mirror_snapshot,
         test_cycle_connects_when_disconnected,
@@ -1250,15 +1171,14 @@ def main() -> int:
         test_cycle_write_error_propagates_zero_reads,
         test_cycle_trigger_failure_propagates,
         test_probe_trigger_lines_unchanged_after_refactor,
-        # Part D — the climate surface
-        test_climate_locked_surface_byte_identical,
-        test_climate_option_path_full_surface,
-        test_climate_switch_path_same_surface,
+        # Part D — the climate surface (spec 022: unconditional)
+        test_climate_surface_shape_unconditional,
+        test_climate_commands_wire_to_cycles,
         test_climate_commands_write_pinned_frames_end_to_end,
         test_climate_command_error_propagates,
-        # Part E — the option's declared surface
-        test_write_control_option_declared_in_strings,
-        test_options_flow_schema_has_write_control,
+        # Part E — the declared surface (spec 022: the gate keys are gone)
+        test_write_control_option_gone_from_strings,
+        test_options_flow_schema_has_no_gate_keys,
     ]
     failures = 0
     for test in tests:

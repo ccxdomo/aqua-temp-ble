@@ -33,7 +33,7 @@ confirmation, never an echo.
 **Confirmation cycle (coordinator.async_control_write_power):**
 
 ```
-ensure_writable(1011, value, control_allowed=<gate>)   # the funnel, FIRST
+ensure_writable(1011, value)                           # the funnel, FIRST
 → connect if needed → audit INFO line
 → [io lock] write frame → ONE trigger read
 → wait ≤ 20 s for a fresh 2001-block (last_seen > t_write)
@@ -95,20 +95,20 @@ changed the setpoint with the unit off [P owner]).
 **Proof record [P]:** the mirror followed S→T→S (300→295→300) in the
 probe; the owner then set the setpoint from HA in daily use.
 
-## 3. The pre-proof instruments (the only paths around the gates)
+## 3. The probe instruments (writes outside the funnel, by design)
 
 Both probes are **measurement instruments**, never control surfaces;
 their frames go through the client's own validated seams, NOT through
 the funnel:
 
 - **power_write_probe** (`coordinator.async_power_write_probe`): baseline
-  gate (mirror must read 0 — never toggles an unverified state) → ON
+  check (mirror must read 0 — never toggles an unverified state) → ON
   frame → mirror must follow to 1 → OFF frame → mirror must revert to 0
   → ONE WARNING verdict line (`power write probe: EXECUTED + REVERSIBLE
   (mirror 2011 followed 0→1→0)`). Writes only the two pinned strings;
   always aims to leave the unit OFF; a failed revert says so loudly.
 - **setpoint_write_probe** (`coordinator.async_setpoint_write_probe`):
-  four baseline gates (absent/sentinel/out-of-range/off-step → refuse,
+  four baseline checks (absent/sentinel/out-of-range/off-step → refuse,
   zero writes) → **phase A**: write the register's OWN value (a true
   no-op) and verify the WHOLE 45-register block is unchanged (the
   neighbor alarm catches a mis-aimed write before anything real runs) →
@@ -128,12 +128,12 @@ the funnel:
 - **Installer thresholds** (the setpoint map's other slots; the H/R/P
   families). An erroneous H04/R-limit write can damage the heat pump.
 - **Anything not in the allowlists** — see
-  [`security-gates-contract.md`](security-gates-contract.md).
+  [`write-protections-contract.md`](write-protections-contract.md).
 
 ## 5. Cross-cutting invariants
 
 1. **The funnel first** (`registers.ensure_writable`) — before any
-   connect, lock or I/O; zero bytes move while a gate is closed.
+   connect, lock or I/O; zero bytes move on a refused write.
 2. **The mirror decides** — the displayed state is only ever the fresh
    pushed mirror; a write error propagates with no trigger, no
    cross-check, no snapshot.

@@ -1688,9 +1688,9 @@ class AquaTempBleClient:
         per start (a re-push with one changed register replaces the
         window atomically, contract 013 §3.3); the FIRST push of each
         distinct start per connect logs the complete hex at WARNING
-        (contract 013 §2.1 — the U-1 2001-2045 capture mechanism; <= 4
-        lines per connect on the observed unit, bounded). Never raises
-        into the notify path.
+        (contract 013 §2.1, restored by spec 022 FR-13 — the U-1
+        2001-2045 capture mechanism; <= 4 lines per connect on the
+        observed unit, bounded). Never raises into the notify path.
         """
         start, qty = struct.unpack(">HH", frame[2:6])
         try:
@@ -1715,21 +1715,23 @@ class AquaTempBleClient:
                 last_seen=now,
                 count=1,
             )
-            # WARNING (contract 013 §2.1): the operator's HA log panel
-            # stores WARNING+ only (contract 012 §2) — this line IS the
-            # never-decoded block 2001-2045 capture (research 013 §2.3).
-            # Spec 021 (tasks.md C2): the full 99-byte hex payload moved
-            # to DEBUG — the one-line capture stays the WARNING evidence
-            # (the hex firehose was chatty on flaky links).
+            # WARNING (contract 013 §2.1, restored by spec 022 FR-13):
+            # the operator's HA log panel stores WARNING+ only
+            # (contract 012 §2) — this line IS the passive capture
+            # instrument (the never-decoded 2001-2045 fault-hunt
+            # evidence; research 013 §2.3). The 021 C2 demotion moved
+            # the hex to a DEBUG twin the panel never shows, deleting
+            # the only passive instrument — the live E03 reload proved
+            # the loss. The flood stays inherently bounded: one line
+            # per distinct start per connect (<= 4 lines on the
+            # observed unit); the flaky-link concern is overruled as
+            # the price of the evidence (owner's call, spec 022
+            # research Part 3.2).
             _LOGGER.warning(
-                "block push captured: start=%d qty=%d len=%d crc=OK",
+                "block push captured: start=%d qty=%d len=%d crc=OK hex=%s",
                 start,
                 qty,
                 len(frame),
-            )
-            _LOGGER.debug(
-                "block push captured: start=%d hex=%s",
-                start,
                 frame.hex(),
             )
         else:
@@ -2231,11 +2233,10 @@ class AquaTempBleClient:
         (the echo trap — contract 017 §4): the MIRROR (the fresh
         pushed 1046-block) is the confirmation, never an echo.
 
-        Only reachable behind the funnel (ensure_writable with the
-        setpoint_allowed thread — the coordinator's confirmation
-        cycle); this client-side rail is the defense in depth under
-        it (both layers enforce the same permanent value allowlist,
-        contract 019 §2.2)."""
+        Only reachable behind the funnel (ensure_writable — the
+        coordinator's confirmation cycle); this client-side rail is
+        the defense in depth under it (both layers enforce the same
+        permanent value allowlist, contract 019 §2.2)."""
         frame = self._setpoint_write_frame(value_raw)
         if not self.is_connected:
             raise AquaTempConnectionError("not connected")

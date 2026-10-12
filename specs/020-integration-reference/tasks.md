@@ -16,14 +16,23 @@ spec/Coder should consume. No code was touched by this audit.
 | 5 live temperatures + T01 `unknown` (sensor absent) | working, calibrated | photo match [P] |
 | Setpoint display (1046) | working | panel diff 290→300 [P] |
 | Power display (2011 → OFF/HEAT, heat-only rule) | working | diff-revert [P] |
-| Power control (1011 {0,1}) | working, gate `write_control` open | probe verdict + pump heard [P] |
-| Setpoint control (1046, 10.0-40.0/0.5) | working, gate `write_setpoint` open | probe verdict 300→295→300 [P] |
+| Power control (1011 {0,1}) | working, active by default (spec 022) | probe verdict + pump heard [P] |
+| Setpoint control (1046, 10.0-40.0/0.5) | working, active by default (spec 022) | probe verdict 300→295→300 [P] |
+| Active-by-default surfaces: no gates, no checkboxes, live values on the confirm screen (spec 022) | working | fresh-install pass + suite |
 | Mirror-confirmed writes, unconfirmed-OFF notification | working | code + live use |
-| Freshness gate, honest unavailable | working | code |
+| Freshness rule, honest unavailable | working | code |
 | Probes (register/power/setpoint) as diagnostics | working | live use |
-| Tests: ~33 files, per-spec suites + modbus self-test | green | repo |
+| Tests: ~30 files, per-spec suites + modbus self-test | green | repo |
 
 ## 2. Cleanup backlog (actionable, file + line + action)
+
+> **Status (2026-10-12).** This backlog is the historical audit
+> record — it fed the 021 cleanup pass (commit `0d32de2`: probe fix
+> A1-A4, text rewrites B, logging C, the prune decisions D — the
+> binary_sensor platform and the pairing ladder were pruned, the
+> classic plane stayed) and spec 022 (gate removal; FR-13 restored
+> the capture hex that 021's C2 had demoted). The rows below are
+> kept as written; the "gate" vocabulary is the gate era's.
 
 Audited against the push-mode production world. Items are grouped by
 the decision they need; **items D1-D3 need the owner's decision**
@@ -83,9 +92,11 @@ provenance — keep); root-level research tools (`ble_probe.py`,
 `modbus_ble.py`, `aqua_hooks.js`) are the original APK-analysis
 instruments — keep as provenance or move to `tools/` in a cleanup spec.
 
-## 3. Suggested next spec
+## 3. Suggested next spec (historical — consumed)
 
 A single **cleanup spec (021)** consuming §2: A1-A4 (probe fix) and
 B1-B11 (texts) as the mandatory core, C1-C3 (logging) as the polish,
-D1-D3 behind the owner's keep/prune decision. Everything else in the
+D1-D3 behind the owner's keep/prune decision — executed as the 021
+cleanup pass (commit `0d32de2`); spec 022 then removed the activation
+gates and documented the fault hunt. Everything else in the
 integration is proven and should not be touched.

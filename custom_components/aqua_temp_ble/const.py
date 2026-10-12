@@ -91,30 +91,12 @@ PUSH_HARVEST_STARTS = frozenset({1001, 1046, 2001, 2046})
 # import — tests patch the module attribute (the _now seam pattern).
 PROBE_MIRROR_TIMEOUT = 20.0
 
-# Spec 017 (the controlled climate — phase 2): the write-control
-# activation's shipped default. The activation is the OWNER's act
-# alone (contract 017 §2 — never automatic, never set by any code
-# path); False keeps the integration byte-identical to 0.12.0 until
-# he checks the option after recording the probe's EXECUTED +
-# REVERSIBLE verdict (research 017 §1 — the decision log). The
-# per-entry option is the no-restart surface (the push_control_confirmed
-# precedent); the global registers.WRITE_CONTROL_PROVEN switch stays
-# the alternative (the calibration-switch precedent; restart).
-DEFAULT_WRITE_CONTROL = False
-
-# Spec 019 (the setpoint control — phase 2, FR-9): the setpoint-write
-# ACTIVATION's shipped default. The THIRD gate, SEPARATE from
-# DEFAULT_WRITE_CONTROL by design (contract 019 §4's non-transference:
-# the power proof authorizes 1011 with {0,1} and NOTHING here — a
-# regulation VALUE is a different risk class from a boolean; the
-# owner may activate either without the other; the gates compose).
-# The owner's act alone opens it — ONLY after the setpoint write
-# probe's `EXECUTED + REVERSIBLE` verdict (quickstart 019 §1→§3);
-# False keeps the setpoint WRITE surface absent while the READ
-# display still appears behind the existing control gate (the home
-# is [P owner]). No code path, update or default may ever SET it
-# (contract 019 §4.1).
-DEFAULT_WRITE_SETPOINT = False
+# Spec 022 (Option B — "active by default"): the shipped write-gate
+# defaults were DELETED with the gates they defaulted. Power and
+# setpoint control are active from the moment the entry is created;
+# the PERMANENT value rails (registers.ensure_writable: 1011 with
+# {0, 1}; 1046 with raw 100..400 step 5) are the protection that
+# stays.
 
 # Config flow (spec 002) — scanning UX tuning (tasks.md block 1).
 # Flow-facing constants live here, next to the other integration-wide

@@ -246,10 +246,8 @@ def _capture(start: int, raws: dict[int, int], count: int = 1,
     )
 
 
-def _snapshot(caps, confirmed=True, control_confirmed=True):
-    return coordinator_mod.AquaTempData.from_pushes(
-        caps, confirmed, control_confirmed
-    )
+def _snapshot(caps):
+    return coordinator_mod.AquaTempData.from_pushes(caps)
 
 
 class _LogCap(logging.Handler):
@@ -403,20 +401,23 @@ def test_truth_table_power_off_never_reads_mode() -> None:
         assert not mode_records, (mode_raw, mode_records)
 
 
-def test_gate_closed_or_missing_capture_renders_unknown() -> None:
-    """AC-1 (honesty, unchanged from 015): the control gate CLOSED or
-    NO 2001 capture in the store -> hvac_mode None (the tile's honest
-    'unknown' — the power mirror is absent, nothing is invented)."""
+def test_missing_capture_renders_unknown() -> None:
+    """AC-1 (honesty, unchanged from 015): NO 2001 capture in the store
+    -> hvac_mode None (the tile's honest 'unknown' — the power mirror is
+    absent, nothing is invented). Spec 022: the gate-closed variant is
+    dead with the gate — the decode is UNCONDITIONAL; with a capture
+    the display follows power (the unconditional decode)."""
+    no_capture = _snapshot({2046: _capture(2046, T_WINDOW_RAWS)})
+    assert no_capture.power is None
+    assert no_capture.hvac_mode is None
+    # spec 022: the same capture now decodes the display (the gate is gone)
     caps = {
         2001: _capture(2001, CONTROL_BLOCK_ON_MODE0),
         2046: _capture(2046, T_WINDOW_RAWS),
     }
-    gate_closed = _snapshot(caps, confirmed=True, control_confirmed=False)
-    assert gate_closed.power is None
-    assert gate_closed.hvac_mode is None
-    no_capture = _snapshot({2046: _capture(2046, T_WINDOW_RAWS)}, True, True)
-    assert no_capture.power is None
-    assert no_capture.hvac_mode is None
+    decoded = _snapshot(caps)
+    assert decoded.power is True
+    assert decoded.hvac_mode == HVACMode.HEAT
 
 
 # ===========================================================================
@@ -558,7 +559,7 @@ def main() -> int:
         test_truth_table_power_on_mode_absent_renders_heat,
         test_truth_table_unmapped_mode_renders_heat_info_once,
         test_truth_table_power_off_never_reads_mode,
-        test_gate_closed_or_missing_capture_renders_unknown,
+        test_missing_capture_renders_unknown,
         test_block_census_logs_at_debug_only,
     ]
     failures = 0

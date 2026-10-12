@@ -144,7 +144,6 @@ class AquaTempData:
     # --- spec 013 pushed-plane fields (appended WITH defaults; the
     # classic from_regs call site above is untouched) ---
     mode: str = "classic"             # "classic" | "push" (spec 013 FR-3)
-    push_confirmed: bool = False      # the calibration gate (FR-5, contract 013 §4.3)
     push_counts: dict[int, int] = field(default_factory=dict)  # per-start push counts (FR-6)
     push_first_seen: float | None = None  # the T-block's first push ts (FR-6)
     push_last_seen: float | None = None   # the T-block's latest push ts (freshness gate)
@@ -225,39 +224,37 @@ class AquaTempData:
         )
 
     @classmethod
-    def from_pushes(
-        cls, captures: dict[int, Any], confirmed: bool, control_confirmed: bool = False
-    ) -> AquaTempData:
+    def from_pushes(cls, captures: dict[int, Any]) -> AquaTempData:
         """Build the snapshot from the pushed-block store (spec 013 FR-4,
-        contract 013 §4; spec 015 FR-7, contract 015-A §5).
+        contract 013 §4; spec 015 FR-7, contract 015-A §5; spec 022
+        FR-3: active by default — the confirmation gates are gone).
 
-        The T-family block (start registers.PUSH_TEMP_BLOCK_START) feeds
-        the temperature entities — and ONLY when the temperature gate is
-        open (contract 013 §4.3: unconfirmed raws never enter the entity
-        plane). The control block (start registers.PUSH_CONTROL_BLOCK_
-        START) feeds the control keys — power/mode_value/hvac_mode/
-        target_temp — ONLY when the CONTROL gate (spec 015 FR-6) is open;
-        the pinned homes live in registers.PUSHED_CONTROL (the owner's
-        2026-10-12 diff-revert evidence [P]): power decodes as a flag
-        (raw != 0), mode_value as the raw enum, and hvac_mode follows
-        POWER alone (contract 018-A §2, amending contract 015-A §5:
-        power False renders OFF, power True renders HEAT — this unit
-        is heat-only [P panel], so power on IS heating; the mode mirror
-        2019 is a diagnostic that NEVER gates the display, and an
-        unmapped NONZERO value logs ONE INFO per session per value),
-        and the setpoint decodes only when a home is ever pinned
-        (None today — no target is displayed, FR-5). Control-unconfirmed
-        => every control key is None — the exact 0.10.0 behaviour
-        (FR-11c). The FR-10 diagnostics raws (push_control_raws) ride
-        the snapshot GATE-INDEPENDENTLY: they are diagnostics with
-        evidence tags, never entity states. Fault/firmware have no
-        pushed home [P] — None by
-        design (contract 013 §4.4, optimistic state forbidden).
+        The T-family block (start registers.PUSH_TEMP_BLOCK_START)
+        ALWAYS feeds the temperature entities when its capture exists
+        (absent block -> the registers stay empty -> every temperature
+        decodes `unknown`). The control block (start registers.
+        PUSH_CONTROL_BLOCK_START) always feeds the control keys when
+        its capture exists — the pinned homes live in
+        registers.PUSHED_CONTROL (the owner's 2026-10-12 diff-revert
+        evidence [P]): power decodes as a flag (raw != 0), mode_value
+        as the raw enum, and hvac_mode follows POWER alone (contract
+        018-A §2, amending contract 015-A §5: power False renders OFF,
+        power True renders HEAT — this unit is heat-only [P panel],
+        so power on IS heating; the mode mirror 2019 is a diagnostic
+        that NEVER gates the display, and an unmapped NONZERO value
+        logs ONE INFO per session per value). The setpoint ALWAYS
+        decodes from the capture of the block that CONTAINS the home
+        (the 1046-block, research 019 §1 — NOT the 2001 window; a
+        store with only the 2001 block decodes NO target — the
+        block-source honesty rule). Absent block -> None;
+        sentinel/implausible -> unknown. The FR-10 diagnostics raws
+        (push_control_raws) ride the snapshot unconditionally: they
+        are diagnostics with evidence tags, never entity states.
+        Fault/firmware have no pushed home [P] — None by design
+        (contract 013 §4.4, optimistic state forbidden).
         """
         t_cap = captures.get(registers.PUSH_TEMP_BLOCK_START)
-        regs: dict[int, int] = {}
-        if t_cap is not None and confirmed:
-            regs = dict(t_cap.registers)
+        regs: dict[int, int] = dict(t_cap.registers) if t_cap is not None else {}
         counts = {int(start): cap.count for start, cap in captures.items()}
         # FR-10: the control-candidate raws — gate-independent diagnostics.
         control_raws: dict[int, int | None] = {}
@@ -265,64 +262,61 @@ class AquaTempData:
             block = registers.pushed_block_start(addr)
             cap = captures.get(block) if block is not None else None
             control_raws[addr] = cap.registers.get(addr) if cap is not None else None
-        # FR-7 (contract 015-A §5, amended by contract 018-A §2):
-        # the confirmed control decode.
+        # The control decode (contract 015-A §5, amended by contract
+        # 018-A §2) — unconditional since spec 022 (FR-3).
         power: bool | None = None
         mode_value: int | None = None
         hvac_mode: HVACMode | None = None
         target_temp: float | None = None
-        if control_confirmed:
-            c_cap = captures.get(registers.PUSH_CONTROL_BLOCK_START)
-            if c_cap is not None:
-                cregs = c_cap.registers
-                p_addr = registers.PUSHED_CONTROL.get("power")
-                raw = cregs.get(p_addr) if p_addr is not None else None
-                power = registers.decode_flag(raw, active_when_nonzero=True)
-                m_addr = registers.PUSHED_CONTROL.get("mode")
-                mode_value = cregs.get(m_addr) if m_addr is not None else None
-                if power is False:
-                    hvac_mode = HVACMode.OFF
-                elif power is True:
-                    # Spec 018 (contract 018-A §2): the display follows
-                    # POWER on this heat-only unit (H06 [P panel]) — a
-                    # mode-gated display renders the machine's real
-                    # running state `unknown`, because our proven power
-                    # write (1011) updates the power mirror 2011 and
-                    # never the mode mirror 2019 (research 018 §3, M-1).
-                    hvac_mode = HVACMode.HEAT
-                    if (
-                        mode_value is not None
-                        and mode_value != 0
-                        and mode_value not in registers.PUSHED_MODE_VALUE_TO_NAME
-                        and mode_value not in _logged_unmapped_push_modes
-                    ):
-                        _logged_unmapped_push_modes.add(mode_value)
-                        _LOGGER.info(
-                            "pushed mode value %r (reg %s) unmapped — display "
-                            "follows power (heat-only, spec 018); update "
-                            "registers.PUSHED_MODE_VALUE_TO_NAME for the "
-                            "research map (quickstart 018 §2)",
-                            mode_value,
-                            m_addr,
-                        )
-            # Spec 019 FR-1 (AC-4): the setpoint decodes from the capture
-            # of the block that CONTAINS the home — pushed_block_start
-            # (the 1046-block), NOT the 2001 window (research 019 §1:
-            # the home lives in the 1046 ladder; the 015 code read every
-            # control key from the 2001 capture, which never carries it).
-            # The gate semantics are UNCHANGED: the home rides the
-            # EXISTING push_control_confirmed gate (the mapping is
-            # confirmed); a store with only the 2001 block decodes NO
-            # target (the block-source fix — the honesty rule, not a
-            # new gate).
-            s_addr = registers.PUSHED_CONTROL.get("setpoint")
-            if s_addr is not None:
-                s_block = registers.pushed_block_start(s_addr)
-                s_cap = captures.get(s_block) if s_block is not None else None
-                target_temp = decode_temp_logged(
-                    s_addr,
-                    s_cap.registers.get(s_addr) if s_cap is not None else None,
-                )
+        c_cap = captures.get(registers.PUSH_CONTROL_BLOCK_START)
+        if c_cap is not None:
+            cregs = c_cap.registers
+            p_addr = registers.PUSHED_CONTROL.get("power")
+            raw = cregs.get(p_addr) if p_addr is not None else None
+            power = registers.decode_flag(raw, active_when_nonzero=True)
+            m_addr = registers.PUSHED_CONTROL.get("mode")
+            mode_value = cregs.get(m_addr) if m_addr is not None else None
+            if power is False:
+                hvac_mode = HVACMode.OFF
+            elif power is True:
+                # Spec 018 (contract 018-A §2): the display follows
+                # POWER on this heat-only unit (H06 [P panel]) — a
+                # mode-gated display renders the machine's real
+                # running state `unknown`, because our proven power
+                # write (1011) updates the power mirror 2011 and
+                # never the mode mirror 2019 (research 018 §3, M-1).
+                hvac_mode = HVACMode.HEAT
+                if (
+                    mode_value is not None
+                    and mode_value != 0
+                    and mode_value not in registers.PUSHED_MODE_VALUE_TO_NAME
+                    and mode_value not in _logged_unmapped_push_modes
+                ):
+                    _logged_unmapped_push_modes.add(mode_value)
+                    _LOGGER.info(
+                        "pushed mode value %r (reg %s) unmapped — display "
+                        "follows power (heat-only, spec 018); update "
+                        "registers.PUSHED_MODE_VALUE_TO_NAME for the "
+                        "research map (quickstart 018 §2)",
+                        mode_value,
+                        m_addr,
+                    )
+        # Spec 019 FR-1 (AC-4): the setpoint decodes from the capture
+        # of the block that CONTAINS the home — pushed_block_start
+        # (the 1046-block), NOT the 2001 window (research 019 §1:
+        # the home lives in the 1046 ladder; the 015 code read every
+        # control key from the 2001 capture, which never carries it).
+        # Spec 022 FR-3: the decode is unconditional — a store with
+        # only the 2001 block decodes NO target (the block-source
+        # honesty rule, not a gate).
+        s_addr = registers.PUSHED_CONTROL.get("setpoint")
+        if s_addr is not None:
+            s_block = registers.pushed_block_start(s_addr)
+            s_cap = captures.get(s_block) if s_block is not None else None
+            target_temp = decode_temp_logged(
+                s_addr,
+                s_cap.registers.get(s_addr) if s_cap is not None else None,
+            )
         return cls(
             registers=regs,
             power=power,
@@ -338,7 +332,6 @@ class AquaTempData:
             fault_code=None,
             firmware=None,
             mode="push",
-            push_confirmed=confirmed,
             push_counts=counts,
             push_first_seen=t_cap.first_seen if t_cap is not None else None,
             push_last_seen=t_cap.last_seen if t_cap is not None else None,
@@ -347,7 +340,7 @@ class AquaTempData:
 
     @classmethod
     def from_merged(
-        cls, regs: dict[int, int], captures: dict[int, Any], confirmed: bool
+        cls, regs: dict[int, int], captures: dict[int, Any]
     ) -> AquaTempData:
         """Base-plane answer + pushed overlay (spec 014 FR-2, contract
         014 §5.2 — used ONLY when the trigger read completes: the
@@ -355,19 +348,15 @@ class AquaTempData:
 
         Typed fields come from the base answer (`from_regs` semantics —
         contract 013 §4.2: the base plane wins for shared quantities);
-        the `registers` dict is the base regs merged with the CONFIRMED
-        T-block raws — the windows are disjoint by construction (7-51 vs
+        the `registers` dict is the base regs merged with the T-block
+        raws — the windows are disjoint by construction (7-51 vs
         2046-2090 [P], data-model 014 §4), so the union is
-        collision-free. The honesty gate applies to pushed raws ONLY
-        (contract 013 §4.3 unchanged — base values are base-pinned
-        registers, not unconfirmed pushes); mode stays "push" (the
-        re-evaluation is a future spec's decision, contract 014 §5.3).
+        collision-free. Mode stays "push" (the re-evaluation is a
+        future spec's decision, contract 014 §5.3).
         """
         base = cls.from_regs(regs)
         t_cap = captures.get(registers.PUSH_TEMP_BLOCK_START)
-        pushed_regs = (
-            dict(t_cap.registers) if (t_cap is not None and confirmed) else {}
-        )
+        pushed_regs = dict(t_cap.registers) if t_cap is not None else {}
         counts = {int(start): cap.count for start, cap in captures.items()}
         return cls(
             registers={**regs, **pushed_regs},
@@ -384,7 +373,6 @@ class AquaTempData:
             fault_code=base.fault_code,
             firmware=base.firmware,
             mode="push",
-            push_confirmed=confirmed,
             push_counts=counts,
             push_first_seen=t_cap.first_seen if t_cap is not None else None,
             push_last_seen=t_cap.last_seen if t_cap is not None else None,
@@ -470,78 +458,12 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
         return max(2.0 * float(interval), 60.0)
 
     @property
-    def push_temp_confirmed(self) -> bool:
-        """The calibration gate (spec 013 FR-5, contract 013 §4.3): the
-        per-entry `push_temp_confirmed` option OR the global registers
-        switch (the one-line calibration fix, the WRITE_ECHO_EXPECTED
-        precedent). False until the side-by-side run matched the app's
-        T-family display (quickstart 013 §2) — no unconfirmed register
-        is ever displayed under a certain name."""
-        return bool(
-            registers.PUSH_TEMP_CONFIRMED
-            or self.config_entry.options.get("push_temp_confirmed", False)
-        )
-
-    @property
-    def push_control_confirmed(self) -> bool:
-        """The CONTROL confirmation gate (spec 015 FR-6, contract 015-A
-        §4): the per-entry `push_control_confirmed` option OR the global
-        registers switch (the push_temp_confirmed pattern). False until
-        the owner re-verifies the pinned control homes (power 2011 /
-        mode 2019, the 2026-10-12 diff-revert evidence) against the
-        app's display (quickstart 015 §5) — unconfirmed homes never
-        reach the entity plane: the control keys decode None and the
-        climate is not created."""
-        return bool(
-            registers.PUSH_CONTROL_CONFIRMED
-            or self.config_entry.options.get("push_control_confirmed", False)
-        )
-
-    @property
-    def write_control_allowed(self) -> bool:
-        """The write-control ACTIVATION gate (spec 017 FR-1, contract
-        017 §2): the global registers switch (WRITE_CONTROL_PROVEN,
-        016 T3 — the calibration-switch precedent; restart) OR the
-        per-entry `write_control` option (the push_control_confirmed
-        pattern — no restart; the climate reads this property live,
-        so saving the option re-renders the entity without a reload).
-        Never set by any code path: the owner's act alone opens it
-        (the option's description names the required probe verdict);
-        the shipped default is False on both surfaces — the
-        integration stays byte-identical to 0.12.0 until then (AC-10)."""
-        return bool(
-            registers.WRITE_CONTROL_PROVEN
-            or self.config_entry.options.get("write_control", False)
-        )
-
-    @property
     def last_control_write(self) -> dict[str, Any] | None:
         """Spec 017 FR-3 step 9: the last control write's stage dict
         (value, verdict, mirror raw + age relative to the write) — the
         climate's diagnostics attribute (FR-5); the entity state itself
         never reads it (never optimistic, FR-6)."""
         return self._last_control_write
-
-    @property
-    def write_setpoint_allowed(self) -> bool:
-        """The setpoint-write ACTIVATION gate (spec 019 FR-9, contract
-        019 §4): the THIRD gate, SEPARATE from write_control_allowed
-        (the power proof authorizes 1011 only — the non-transference
-        rule, contracts 016 §4/019 §4.3). The global registers switch
-        (WRITE_SETPOINT_PROVEN — the calibration-switch precedent;
-        restart) OR the per-entry `write_setpoint` option (the
-        write_control pattern — no restart; the climate reads this
-        property live, so saving the option re-renders the entity).
-        Never set by any code path: the owner's act alone opens it,
-        ONLY after the setpoint write probe's EXECUTED + REVERSIBLE
-        verdict (quickstart 019 §1→§3); the shipped default is False
-        on both surfaces — the setpoint WRITE surface stays absent
-        (the read display still appears behind the existing control
-        gate — the home is [P owner], FR-8)."""
-        return bool(
-            registers.WRITE_SETPOINT_PROVEN
-            or self.config_entry.options.get("write_setpoint", False)
-        )
 
     @property
     def last_setpoint_write(self) -> dict[str, Any] | None:
@@ -651,9 +573,7 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
             #    branch runs BEFORE the freshness failure.
             if regs is not None:
                 self._log_trigger_answered_once()
-                return AquaTempData.from_merged(
-                    regs, captures, self.push_temp_confirmed
-                )
+                return AquaTempData.from_merged(regs, captures)
             # 3. LISTEN (contract 014 §3): presence-based harvest on
             #    the already-subscribed pipe — instant when the burst
             #    already landed during the trigger window (the typical
@@ -684,20 +604,19 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
                 # Contract 013 §4.2: a base-plane frame in the store
                 # while in push mode — anomaly, logged once, ignored.
                 self._log_push_mode_base_anomaly()
-            return AquaTempData.from_pushes(
-                captures, self.push_temp_confirmed, self.push_control_confirmed
-            )
+            return AquaTempData.from_pushes(captures)
 
     async def async_write_register(self, address: int, value: int) -> None:
         """Serialize a write against reads, then confirm with one refresh."""
         # FR-9 + spec 016 FR-3: the single write funnel guard — before any
         # lock or I/O, so no code path can ever write outside {8, 13, 14}
-        # (+19-21 behind the WRITE_MODE_SETPOINT_TOO switch) or, behind
-        # WRITE_CONTROL_PROVEN, the control allowlist (1011 with 0/1).
-        # The VALUE threads through to the guard (spec 016 T3) so the
-        # control plane's value discipline is enforced at the funnel.
-        # Installer settings (H/R/P) and the high blocks 1001-2090 are
-        # never writable (spec 003 §6).
+        # (+19-21 behind the WRITE_MODE_SETPOINT_TOO switch) or the
+        # control/setpoint allowlists (1011 with 0/1; 1046 with raw
+        # 100..400 step 5 — spec 022: the value rails are the PERMANENT
+        # protection, the human gates are gone). The VALUE threads
+        # through to the guard (spec 016 T3) so the value disciplines
+        # are enforced at the funnel. Installer settings (H/R/P) and
+        # the high blocks 1001-2090 are never writable (spec 003 §6).
         registers.ensure_writable(address, value)
         async with self._io_lock:
             await self.client.write_registers(address, [value])
@@ -951,12 +870,11 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
         unverified state), and it always aims to leave the unit OFF —
         a failed or unconfirmed revert is never silent: the verdict
         line carries the remediation ("turn the unit OFF from the
-        vendor app or the panel", contract 016 §7). The climate stays
-        read-only regardless (FR-7): this method is the only code that
-        may write 1011 before the live proof opens
-        WRITE_CONTROL_PROVEN (contract 016 §4 — the funnel guard is
-        NOT used by the probe; the frames go through the client's own
-        pinned seam, contract 016 §5).
+        vendor app or the panel", contract 016 §7). Since spec 022
+        the control is ACTIVE BY DEFAULT; the probe remains the
+        informational instrument and still never uses the funnel —
+        its frames go through the client's own pinned seam
+        (contract 016 §5).
 
         Single-flight (the _io_lock, FR-4 step 9); disconnects on
         completion or failure (step 8, the push-mode convention).
@@ -1133,7 +1051,8 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
                 return _finish(
                     "executed+reversible",
                     f"EXECUTED + REVERSIBLE (mirror {mirror_addr} followed "
-                    "0→1→0) — evidence for phase 2 (WRITE_CONTROL_PROVEN)",
+                    "0→1→0) — the write is proven (spec 022: the control "
+                    "is active by default)",
                 )
             finally:
                 # step 8: disconnect on completion or failure (the
@@ -1257,16 +1176,11 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
         """
         address = self.config_entry.data["address"]
         # 1. The funnel guard, FIRST — before any connect, lock or I/O
-        #    (the funnel rule). The ACTIVATION gate rides the
-        #    control_allowed thread (either owner surface — FR-1); the
-        #    address AND value allowlists stay permanent. While the
-        #    gate is closed this fails loudly with the 016 message and
-        #    ZERO bytes move (AC-3).
-        registers.ensure_writable(
-            registers.WRITE_REG_POWER,
-            value,
-            control_allowed=self.write_control_allowed,
-        )
+        #    (the funnel rule). The PERMANENT value rail: 1011 accepts
+        #    only {0, 1} — the address AND value allowlists stay forever
+        #    (spec 022: the human gate is gone; an off-rail value fails
+        #    loudly with ZERO bytes moving).
+        registers.ensure_writable(registers.WRITE_REG_POWER, value)
         # 2. Connect if needed (the cycle's connect pattern); transport
         #    failures propagate to the caller (the entity surfaces the
         #    error).
@@ -1347,11 +1261,7 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
             #    the MIRROR's truth, never the request; NO push on the
             #    unconfirmed path, AC-8).
             if result["verdict"] in ("confirmed", "not-confirmed"):
-                data = AquaTempData.from_pushes(
-                    dict(self.client.pushed_blocks),
-                    self.push_temp_confirmed,
-                    self.push_control_confirmed,
-                )
+                data = AquaTempData.from_pushes(dict(self.client.pushed_blocks))
                 # async_set_updated_data is a PLAIN (sync) DataUpdateCoordinator
                 # method — awaiting it raised "'NoneType' object can't be
                 # awaited" after every control write (the frame had already
@@ -1428,9 +1338,7 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
         out-of-range / off-step S aborts with refused-baseline and
         ZERO writes), and its frames go through the client's own
         validated seam (write_setpoint_probe_frame — FR-6), NEVER
-        through the funnel (contract 019 §3: the probe is the ONLY
-        code that may write 1046 before the proof; the funnel stays
-        closed). Phase B never runs unless phase A held (the neighbor
+        through the funnel. Phase B never runs unless phase A held (the neighbor
         alarm is the hard stop). A failed revert is never silent: the
         not-reversible line states the CURRENT setpoint and the
         remediation. Epistemics: phase A proves HARMLESSNESS, not
@@ -1440,9 +1348,9 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
         minutes, then returns (quickstart 019 §0).
 
         Single-flight (the _io_lock); disconnects on completion or
-        failure (the probe convention). Runs with BOTH setpoint gate
-        surfaces closed — it is the gate's CAUSE, never its consumer
-        (contract 019 §4.1).
+        failure (the probe convention). Since spec 022 the setpoint
+        control is ACTIVE BY DEFAULT; the probe remains the
+        informational instrument (the owner's evidence record).
 
         Returns the stage dict (the mirror observations with raws +
         times, the frames sent, the verdict, the resolved write UUID).
@@ -1691,8 +1599,8 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
                 return _finish(
                     "executed+reversible",
                     f"EXECUTED + REVERSIBLE (mirror {mirror_addr} followed "
-                    f"{s_raw}→{t_raw}→{s_raw}) — evidence for "
-                    "WRITE_SETPOINT_PROVEN",
+                    f"{s_raw}→{t_raw}→{s_raw}) — the write is proven "
+                    "(spec 022: the control is active by default)",
                 )
             finally:
                 # Disconnect on completion or failure (the probe
@@ -1715,13 +1623,12 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
         setpoint value that was not explicitly requested — no
         clamping, no rounding): a non-finite value, a non-0.5 multiple
         and an out-of-range value all raise ValueError BEFORE any byte
-        moves. The funnel (ensure_writable with the setpoint_allowed
-        thread — FR-9's live OR-property, the 017 pattern) is the
-        second gate, still BEFORE any connect, lock or I/O. The write
-        goes through the client's write_setpoint rail (FR-6's control
-        successor — the same value discipline), NEVER through the
-        classic funnel and NEVER write_registers (the echo trap,
-        contract 017 §4/019 §2.4).
+        moves. The funnel (ensure_writable — the PERMANENT value rail,
+        spec 022) is the second gate, still BEFORE any connect, lock
+        or I/O. The write goes through the client's write_setpoint
+        rail (FR-6's control successor — the same value discipline),
+        NEVER through the classic funnel and NEVER write_registers
+        (the echo trap, contract 017 §4/019 §2.4).
 
         Never optimistic (contract 019 §5.2): the only state mutation
         is the snapshot push, built by the SAME from_pushes the poll
@@ -1771,16 +1678,11 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
                 "— a regulation value is never clamped (contract 019 §2.2)"
             )
         # 2. The funnel guard, FIRST — before any connect, lock or I/O
-        #    (the funnel rule). The setpoint gate rides the
-        #    setpoint_allowed thread (either owner surface — FR-9); the
-        #    address AND value allowlists stay permanent. While the gate
-        #    is closed this fails loudly with the 019 message and ZERO
-        #    bytes move (AC-2).
-        registers.ensure_writable(
-            registers.WRITE_REG_SETPOINT,
-            raw,
-            setpoint_allowed=self.write_setpoint_allowed,
-        )
+        #    (the funnel rule). The PERMANENT value rail: 1046 accepts
+        #    only raw 100..400 in steps of 5 — the address AND value
+        #    allowlists stay forever (spec 022: the human gate is gone;
+        #    an off-rail value fails loudly with ZERO bytes moving).
+        registers.ensure_writable(registers.WRITE_REG_SETPOINT, raw)
         # 3. Connect if needed (the cycle's connect pattern); transport
         #    failures propagate to the caller (the entity surfaces the
         #    error).
@@ -1856,11 +1758,7 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
             #    the MIRROR's truth, never the request; NO push on the
             #    unconfirmed path).
             if result["verdict"] in ("confirmed", "not-confirmed"):
-                data = AquaTempData.from_pushes(
-                    dict(self.client.pushed_blocks),
-                    self.push_temp_confirmed,
-                    self.push_control_confirmed,
-                )
+                data = AquaTempData.from_pushes(dict(self.client.pushed_blocks))
                 # async_set_updated_data is a PLAIN (sync)
                 # DataUpdateCoordinator method — never await it (the
                 # 017 production lesson).

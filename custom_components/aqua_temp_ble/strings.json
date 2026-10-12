@@ -49,11 +49,9 @@
       },
       "confirm_push": {
         "title": "Name your device",
-        "description": "The connection test to {address} succeeded in push mode: the unit does not answer classic reads with register data, but it answers every request with a live-data report that the integration reads — one request per poll cycle.\n\nWhat you get in push mode:\n- The temperature sensors appear once the captured values are confirmed below (or later in the options).\n- The climate entity appears once the power/mode calibration is confirmed below (or later in the options): it shows OFF/HEAT following the unit's power state and the current heat target, read-only.\n- Power control (on/off) and setpoint control can be enabled later in the integration's options, each after running its built-in write probe (a diagnostic that verifies the write is executed and reversible).\n- The fault code and the firmware version are not available (no data home was identified in the report).\n\n- Power: {power}\n- Mode: {mode}\n- Inlet water temperature: {inlet}\n- Outlet water temperature: {outlet}\n- Ambient temperature: {ambient}\n\nChoose a friendly name for this heat pump:",
+        "description": "The connection test to {address} succeeded.\n\nThe unit reports live data over Bluetooth: your heat pump's sensors, power state and heat target are read directly, and its power and setpoint can be controlled from Home Assistant.\n\nWhat the test captured:\n- Power: {power}\n- Heat target: {setpoint}\n- Inlet water temperature: {inlet}\n- Outlet water temperature: {outlet}\n- Ambient temperature: {ambient}\n\nChoose a friendly name for this heat pump:",
         "data": {
-          "name": "Name",
-          "push_temp_confirmed": "The captured temperatures match the app's parameter view (calibration verified)",
-          "push_control_confirmed": "The captured power/mode registers match the app's display (diff-toggle calibration verified)"
+          "name": "Name"
         }
       }
     },
@@ -75,15 +73,7 @@
       "init": {
         "data": {
           "poll_interval": "Polling interval (seconds)",
-          "temperature_unit": "Display temperature unit",
-          "push_temp_confirmed": "The captured temperatures match the app's parameter view (calibration verified)",
-          "push_control_confirmed": "The captured power/mode registers match the app's display (diff-toggle calibration verified)",
-          "write_control": "Allow power control (write)",
-          "write_setpoint": "Allow setpoint control (write)"
-        },
-        "data_description": {
-          "write_control": "Requires your own probe verdict: power write probe: EXECUTED + REVERSIBLE (mirror 2011 followed 0→1→0). While enabled, the climate's Heat/Off buttons really start and stop the pump — the same register write the vendor app's power slide sends.",
-          "write_setpoint": "Requires your own probe verdict: setpoint write probe: EXECUTED + REVERSIBLE (mirror 1046 followed <S>→<T>→<S>). While enabled, the climate's target slider really sets the heat setpoint (register 1046, 10.0-40.0 °C in 0.5 steps) — the same register write the vendor app's setpoint control sends. Writes outside 10.0-40.0 °C or off the 0.5 step are refused, never silently rounded."
+          "temperature_unit": "Display temperature unit"
         }
       }
     }

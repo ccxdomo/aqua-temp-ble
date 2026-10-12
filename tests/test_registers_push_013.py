@@ -3,18 +3,19 @@
 
 Part A (registers-level, standalone import): the pushed-plane
 constants transcribed VERBATIM from data-model 013 §6 (PUSH_TEMP_BLOCK_
-START, PUSH_TEMP_CONFIRMED, PUSHED_TEMPS, the PUSHED_MIRRORS pairs and
+START, PUSHED_TEMPS, the PUSHED_MIRRORS pairs and
 the PUSHED_SENSORS push-only registry) and the check_registry_integrity
 extension (FR-7, contract 013 §7.1): a pushed address must lie in
 2001-2090, duplicates within the pushed plane raise, a pushed key must
 be a shipped temperature entity (H/R/P are never entities — spec 003
-§6), and the shipped registries pass.
+§6), and the shipped registries pass. (Spec 022: the confirmation
+switches are DELETED — active by default.)
 
 Part B (sensor-platform surface, synthetic-package import — the
 test_coordinator_probe pattern extended): the entity creation rules of
-FR-5 — confirmed=False => push-only keys absent + base keys decode
-`unknown` in push mode; confirmed=True (the entry option OR the global
-registers switch) => keys present, 2047 -> 14.5 from the pinned
+FR-5, amended by spec 022 — ALL six T-family keys are created
+UNCONDITIONALLY in push mode (active by default; the confirmation
+gates are gone), 2047 -> 14.5 from the pinned
 vector; the T01 sentinel at 2046 decodes `unknown` (the vendor's
 3276.5 degC display bug must never replicate); a permuted mapping edit
 (swapping 2047/2048 in PUSHED_TEMPS) swaps the sources — the
@@ -92,7 +93,6 @@ def test_pushed_plane_constants_transcribed() -> None:
     the single source of truth (a permuted calibration outcome is a
     one-line edit in PUSHED_TEMPS)."""
     assert registers.PUSH_TEMP_BLOCK_START == 2046
-    assert registers.PUSH_TEMP_CONFIRMED is False  # the shipped default
     assert registers.PUSHED_TEMPS == {
         "suction_temp": 2046,      # T01 — sentinel on this unit -> unknown
         "inlet_water_temp": 2047,  # T02 — the live-proven register [P]
@@ -347,7 +347,7 @@ class _FakeClient:
 
 
 def _make_platform(
-    data: dict, options: dict, confirmed: bool
+    data: dict, options: dict
 ):
     """A coordinator + entry + hass triple wired for the platform."""
     entry = SimpleNamespace(
@@ -360,7 +360,7 @@ def _make_platform(
         hass=None, entry=entry, client=_FakeClient()
     )
     caps = {registers.PUSH_TEMP_BLOCK_START: _capture(2046, T_WINDOW_RAWS, count=2)}
-    coordinator.data = coordinator_mod.AquaTempData.from_pushes(caps, confirmed)
+    coordinator.data = coordinator_mod.AquaTempData.from_pushes(caps)
     hass = SimpleNamespace(
         data={DOMAIN: {entry.entry_id: {"coordinator": coordinator}}}
     )
@@ -387,30 +387,13 @@ def _sensor_keys(added: list) -> set[str]:
     }
 
 
-def test_push_mode_creation_unconfirmed() -> None:
-    """AC-5: confirmed=False => push-only keys ABSENT; base mirror keys
-    present (decoding `unknown` — no unconfirmed data under a certain
-    name); fault_code/firmware NOT created (no pushed home); the
-    push_stream diagnostic IS created."""
-    hass, entry, _coord = _make_platform(
-        data={"mode": "push"}, options={}, confirmed=False
-    )
-    added = _added_entities(hass, entry)
-    keys = _sensor_keys(added)
-    assert keys == {"inlet_water_temp", "outlet_water_temp", "ambient_temp"}, keys
-    assert any(
-        isinstance(e, sensor_mod.AquaTempPushStreamEntity) for e in added
-    ), [type(e).__name__ for e in added]
-
-
-def test_push_mode_creation_confirmed_via_entry_option() -> None:
-    """AC-5: confirmed=True (the entry option, quickstart §2) => the
-    push-only keys appear too — the full T-family surface."""
-    hass, entry, _coord = _make_platform(
-        data={"mode": "push"},
-        options={"push_temp_confirmed": True},
-        confirmed=True,
-    )
+def test_push_mode_creation_unconditional() -> None:
+    """AC-5 (spec 022): ALL six T-family keys are created
+    UNCONDITIONALLY in push mode — active by default, no options, no
+    gates; fault_code/firmware NOT created (no pushed home); the
+    push_stream diagnostic IS created. Inverts the 013 closed-gate
+    world (the withholding behaviour is gone with the gate)."""
+    hass, entry, _coord = _make_platform(data={"mode": "push"}, options={})
     added = _added_entities(hass, entry)
     keys = _sensor_keys(added)
     assert keys == {
@@ -421,53 +404,38 @@ def test_push_mode_creation_confirmed_via_entry_option() -> None:
         "coil_temp",
         "exhaust_temp",
     }, keys
+    assert any(
+        isinstance(e, sensor_mod.AquaTempPushStreamEntity) for e in added
+    ), [type(e).__name__ for e in added]
 
 
-def test_push_mode_creation_confirmed_via_global_switch() -> None:
-    """AC-5: the global registers.PUSH_TEMP_CONFIRMED switch (the
-    one-line calibration fix, the WRITE_ECHO_EXPECTED precedent) also
-    opens the gate — the OR of both sources."""
-    pkg_registers = sys.modules[f"{PKG}.registers"]
-    old = pkg_registers.PUSH_TEMP_CONFIRMED
-    pkg_registers.PUSH_TEMP_CONFIRMED = True
-    try:
-        hass, entry, _coord = _make_platform(
-            data={"mode": "push"}, options={}, confirmed=True
-        )
-        added = _added_entities(hass, entry)
-        keys = _sensor_keys(added)
-        assert "suction_temp" in keys and "exhaust_temp" in keys, keys
-    finally:
-        pkg_registers.PUSH_TEMP_CONFIRMED = old
-
-
-def test_push_mode_decode_unknown_when_unconfirmed() -> None:
-    """AC-5: confirmed=False => the base mirror keys decode `unknown`
-    in push mode (contract 013 §4.3 — no unconfirmed register is ever
-    displayed under a certain name)."""
+def test_push_mode_decode_live_raws_unconditional() -> None:
+    """AC-5 (spec 022, inverted): the pushed raws ALWAYS enter the
+    entity plane — the inlet decodes the live value with NO options set
+    (active by default; the withholding behaviour is gone with the
+    gate)."""
     hass, entry, coordinator = _make_platform(
-        data={"mode": "push"}, options={}, confirmed=False
+        data={"mode": "push"}, options={}
     )
     added = _added_entities(hass, entry)
     for entity in added:
         if isinstance(entity, sensor_mod.AquaTempSensorEntity) and (
             entity._regdef.key == "inlet_water_temp"
         ):
-            assert entity.native_value is None  # unknown
+            assert entity.native_value == 14.5  # 2047 = 145 raw
             break
     else:
         raise AssertionError("inlet entity not found")
 
 
-def test_push_mode_decode_pinned_vector_when_confirmed() -> None:
-    """AC-5: confirmed=True => 2047 -> 14.5 degC from the pinned vector
-    (the live-proven register [P]); the T01 sentinel at 2046 decodes
+def test_push_mode_decode_pinned_vector() -> None:
+    """AC-5: 2047 -> 14.5 degC from the pinned vector (the
+    live-proven register [P]); the T01 sentinel at 2046 decodes
     `unknown` — the vendor's 3276.5 degC display bug must never
-    replicate (data-model 013 §5)."""
+    replicate (data-model 013 §5). No options needed (spec 022 —
+    active by default)."""
     hass, entry, coordinator = _make_platform(
-        data={"mode": "push"},
-        options={"push_temp_confirmed": True},
-        confirmed=True,
+        data={"mode": "push"}, options={}
     )
     added = _added_entities(hass, entry)
     values: dict[str, object] = {}
@@ -498,9 +466,7 @@ def test_push_mode_permuted_mapping_swaps_sources() -> None:
     )
     try:
         hass, entry, _coord = _make_platform(
-            data={"mode": "push"},
-            options={"push_temp_confirmed": True},
-            confirmed=True,
+            data={"mode": "push"}, options={}
         )
         added = _added_entities(hass, entry)
         values: dict[str, object] = {}
@@ -518,7 +484,7 @@ def test_push_stream_diagnostic_attributes() -> None:
     counts and the first/last push ages — the owner watches stream
     health without a terminal."""
     hass, entry, coordinator = _make_platform(
-        data={"mode": "push"}, options={}, confirmed=False
+        data={"mode": "push"}, options={}
     )
     added = _added_entities(hass, entry)
     stream = [
@@ -537,7 +503,7 @@ def test_classic_mode_creation_unchanged() -> None:
     """US-6 non-regression: without the push mode the platform keeps
     today's exact surface — fault_code + firmware created (addresses
     pinned), placeholders skipped (None), and NO push_stream."""
-    hass, entry, _coord = _make_platform(data={}, options={}, confirmed=False)
+    hass, entry, _coord = _make_platform(data={}, options={})
     added = _added_entities(hass, entry)
     keys = _sensor_keys(added)
     assert keys == {"inlet_water_temp", "outlet_water_temp", "ambient_temp",
@@ -555,11 +521,9 @@ def main() -> int:
         test_pushed_integrity_outside_window_raises,
         test_pushed_integrity_non_temperature_key_raises,
         test_pushed_integrity_permuted_mapping_is_legal,
-        test_push_mode_creation_unconfirmed,
-        test_push_mode_creation_confirmed_via_entry_option,
-        test_push_mode_creation_confirmed_via_global_switch,
-        test_push_mode_decode_unknown_when_unconfirmed,
-        test_push_mode_decode_pinned_vector_when_confirmed,
+        test_push_mode_creation_unconditional,
+        test_push_mode_decode_live_raws_unconditional,
+        test_push_mode_decode_pinned_vector,
         test_push_mode_permuted_mapping_swaps_sources,
         test_push_stream_diagnostic_attributes,
         test_classic_mode_creation_unchanged,

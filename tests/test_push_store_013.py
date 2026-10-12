@@ -13,9 +13,10 @@ Pinned by this file:
   the store with the exact register tables (spot: 1021=1050, 1046=290,
   1056=-70, 2046=32765, 2047 140→145 latest-wins, count=2);
 - the FIRST push per distinct start logs a one-line capture at
-  WARNING (contract 013 §2.1, spec 021 C2: `block push captured:
-  start=… qty=… len=… crc=OK`, ≤ 4 per connect — the full 99-byte hex
-  payload rides a DEBUG twin line, the U-1 capture mechanism);
+  WARNING carrying the COMPLETE frame hex (contract 013 §2.1,
+  restored byte-exact by spec 022 FR-13: `block push captured:
+  start=… qty=… len=… crc=OK hex=…`, ≤ 4 per connect — the 021 C2
+  DEBUG twin is DELETED; the operator's panel keeps WARNING+ only);
 - repeat pushes keep the 008/009 census grammar byte-identical (INFO);
 - the idle-window summary moved INFO → WARNING (contract 013 §2.2,
   the only level amendment — message byte-identical);
@@ -213,9 +214,10 @@ def test_four_pinned_pushes_land_in_store_with_capture_lines() -> None:
     """AC-1 — THE vector run: the four pinned frames (1001, 1046,
     2001-mock, 2046×2) fake-notified during a pending read land in the
     store with the exact register tables; exactly 4 one-line WARNING
-    capture lines (first per distinct start; the full 198-char hex
-    rides DEBUG — spec 021 C2); repeats keep the 008/009 census grammar
-    at DEBUG (byte-identical)."""
+    capture lines (first per distinct start) each carrying the COMPLETE
+    frame hex byte-exact (spec 022 FR-13 restores contract 013 §2.1);
+    NO DEBUG hex twin exists (AC-17); repeats keep the 008/009 census
+    grammar at DEBUG (byte-identical)."""
     clock = StepClock(1000.0)
     feed = [
         bytes.fromhex(FRAME_BLOCK_1001),
@@ -265,37 +267,33 @@ def test_four_pinned_pushes_land_in_store_with_capture_lines() -> None:
     assert caps[2046].qty == 45 and caps[2046].length == 99
 
     # --- the capture lines: exactly 4 WARNING, one per distinct start
-    #     (spec 021 C2: the one-line evidence; the full hex rides DEBUG) ---
+    #     (spec 022 FR-13 restores contract 013 §2.1 byte-exact: the
+    #     WARNING line carries the COMPLETE frame hex — the operator's
+    #     panel keeps WARNING+ only, the DEBUG twin is gone) ---
     capture = [
         m
         for lvl, m in cap.records
         if lvl == logging.WARNING and m.startswith("block push captured:")
     ]
     assert len(capture) == 4, capture
-    assert all(
-        lvl == logging.WARNING
-        for lvl, m in cap.records
-        if lvl == logging.WARNING and m.startswith("block push captured:")
-    ), [(lvl, m) for lvl, m in cap.records if m.startswith("block push captured:")]
     starts_in_order = [line.split("start=")[1].split()[0] for line in capture]
     assert starts_in_order == ["1001", "1046", "2001", "2046"], capture
     for line in capture:
-        # contract 013 §2.1 byte-exact, spec 021 C2: start/qty/len/crc=OK
-        # on ONE line — the hex payload moved to the DEBUG twin line
-        assert " qty=45 len=99 crc=OK" in line, line
-        assert "hex=" not in line, line
-    # the FULL hex rides DEBUG, one line per first capture (the U-1 evidence)
-    hex_lines = [
+        # contract 013 §2.1 byte-exact, restored by spec 022 FR-13:
+        # start/qty/len/crc=OK AND the full hex on ONE WARNING line
+        assert " qty=45 len=99 crc=OK hex=" in line, line
+    hexes = [line.split("hex=")[1] for line in capture]
+    assert hexes[0] == FRAME_BLOCK_1001
+    assert hexes[1] == FRAME_BLOCK_1046
+    assert hexes[2] == FRAME_BLOCK_2001_MOCK.hex()  # the mock frame is bytes
+    assert hexes[3] == FRAME_BLOCK_2046_PUSH1  # the FIRST push of 2046
+    # NO DEBUG hex twin exists (021 C2's twin deleted — AC-17)
+    hex_twins = [
         m
         for lvl, m in cap.records
-        if lvl == logging.DEBUG
-        and m.startswith("block push captured: start=")
-        and "hex=" in m
+        if lvl == logging.DEBUG and m.startswith("block push captured:")
     ]
-    assert len(hex_lines) == 4, hex_lines
-    hexes = [line.split("hex=")[1] for line in hex_lines]
-    assert hexes[0] == FRAME_BLOCK_1001
-    assert hexes[3] == FRAME_BLOCK_2046_PUSH1  # the FIRST push of 2046
+    assert hex_twins == [], hex_twins
 
     # --- repeat census lines: the 008/009 grammar byte-identical;
     #     level DEBUG per contract 018-B (spec 018 FR-4) ---

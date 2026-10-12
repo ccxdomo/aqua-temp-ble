@@ -49,11 +49,9 @@
       },
       "confirm_push": {
         "title": "Nommez votre appareil",
-        "description": "Le test de connexion vers {address} a réussi en mode push : l'unité ne répond pas aux lectures classiques avec des données de registres, mais elle répond à chaque requête par un rapport de données vivantes que l'intégration lit — une requête par cycle de sondage.\n\nCe que vous obtenez en mode push :\n- Les capteurs de température apparaissent une fois les valeurs capturées confirmées ci-dessous (ou plus tard dans les options).\n- L'entité climate apparaît une fois la calibration marche/arrêt/mode confirmée ci-dessous (ou plus tard dans les options) : elle affiche OFF/HEAT selon l'état d'alimentation de l'unité et la consigne de chauffe actuelle, en lecture seule.\n- Le pilotage marche/arrêt et le contrôle de la consigne peuvent être activés plus tard dans les options de l'intégration, chacun après avoir exécuté sa sonde d'écriture intégrée (un diagnostic qui vérifie que l'écriture est exécutée et réversible).\n- Le code de défaut et la version du firmware ne sont pas disponibles (aucune donnée identifiée dans le rapport).\n\n- Alimentation : {power}\n- Mode : {mode}\n- Température d'eau entrante : {inlet}\n- Température d'eau sortante : {outlet}\n- Température ambiante : {ambient}\n\nChoisissez un nom convivial pour cette pompe à chaleur :",
+        "description": "Le test de connexion vers {address} a réussi.\n\nL'unité transmet ses données en direct via Bluetooth : les capteurs de votre pompe à chaleur, son état d'alimentation et sa consigne de chauffe sont lus directement, et son alimentation et sa consigne peuvent être pilotées depuis Home Assistant.\n\nCe que le test a capturé :\n- Alimentation : {power}\n- Consigne de chauffe : {setpoint}\n- Température d'eau entrante : {inlet}\n- Température d'eau sortante : {outlet}\n- Température ambiante : {ambient}\n\nChoisissez un nom convivial pour cette pompe à chaleur :",
         "data": {
-          "name": "Nom",
-          "push_temp_confirmed": "Les températures capturées correspondent à la vue des paramètres de l'application (calibration vérifiée)",
-          "push_control_confirmed": "Les registres marche/arrêt et mode capturés correspondent à l'affichage de l'application (calibration par bascule vérifiée)"
+          "name": "Nom"
         }
       }
     },
@@ -75,15 +73,7 @@
       "init": {
         "data": {
           "poll_interval": "Intervalle d'interrogation (secondes)",
-          "temperature_unit": "Unité de température affichée",
-          "push_temp_confirmed": "Les températures capturées correspondent à la vue des paramètres de l'application (calibration vérifiée)",
-          "push_control_confirmed": "Les registres marche/arrêt et mode capturés correspondent à l'affichage de l'application (calibration par bascule vérifiée)",
-          "write_control": "Autoriser le pilotage marche/arrêt (écriture)",
-          "write_setpoint": "Autoriser le contrôle de la consigne (écriture)"
-        },
-        "data_description": {
-          "write_control": "Requiert votre propre verdict de sonde : power write probe: EXECUTED + REVERSIBLE (mirror 2011 followed 0→1→0). Activé, les boutons Chauffage/Arrêt du climate démarrent et arrêtent réellement la pompe — la même écriture de registre que le bouton marche/arrêt de l'application du fabricant.",
-          "write_setpoint": "Requiert votre propre verdict de sonde : setpoint write probe: EXECUTED + REVERSIBLE (mirror 1046 followed <S>→<T>→<S>). Activé, le curseur de consigne du climate règle réellement la consigne de chauffe (registre 1046, 10.0-40.0 °C par pas de 0.5) — la même écriture de registre que le réglage de consigne de l'application du fabricant. Les écritures hors de 10.0-40.0 °C ou hors du pas de 0.5 sont refusées, jamais arrondies silencieusement."
+          "temperature_unit": "Unité de température affichée"
         }
       }
     }

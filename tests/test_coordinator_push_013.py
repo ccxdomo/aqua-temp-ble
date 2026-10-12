@@ -273,7 +273,7 @@ def _capture_logs():
 
 # --------------------------------------------------------------------- tests
 def test_push_cycle_single_trigger_builds_snapshot() -> None:
-    """AC-4: a fresh store (confirmed) => a snapshot built from the
+    """AC-4: a fresh store => a snapshot built from the
     pushes with exactly ONE read_registers(7, 45) call per cycle — the
     TRIGGER (contract 014 §1.1 re-pin of the 013 zero-read vector) —
     and NO harvest."""
@@ -281,7 +281,7 @@ def test_push_cycle_single_trigger_builds_snapshot() -> None:
     coord = _make_coordinator(
         client,
         data={"mode": "push"},
-        options={"poll_interval": 30, "push_temp_confirmed": True},
+        options={"poll_interval": 30},
     )
     with _ClockPatch(1000.0):
         data = asyncio.run(coord._async_update_data())
@@ -292,11 +292,11 @@ def test_push_cycle_single_trigger_builds_snapshot() -> None:
     assert data.mode == "push"
     assert data.registers[2047] == 145
     assert data.registers[2046] == 32765
-    assert data.push_confirmed is True
     assert data.push_counts == {2046: 2}
     assert data.push_last_seen == 1000.0
     assert data.push_first_seen == 990.0
-    # no pushed home [P/V]: control keys are None by design (contract 013 §4.4)
+    # no 2001 capture in the store: the control keys decode None (the
+    # absent-block honesty rule; spec 022: the decode is unconditional)
     assert data.power is None
     assert data.hvac_mode is None
     assert data.target_temp is None
@@ -304,10 +304,10 @@ def test_push_cycle_single_trigger_builds_snapshot() -> None:
     assert data.firmware is None
 
 
-def test_push_cycle_unconfirmed_withholds_raws() -> None:
-    """AC-4/AC-5: an UNCONFIRMED entry still cycles (fresh store, zero
-    reads) but the raws never enter the entity plane — the mirrored
-    keys decode `unknown` (contract 013 §4.3)."""
+def test_push_cycle_decodes_raws_unconditionally() -> None:
+    """AC-4/AC-5 (spec 022, the inversion of the withholding world): an
+    entry with NO options still cycles and the raws ALWAYS enter the
+    entity plane — the mirrored keys decode live (active by default)."""
     client = FakePushClient(captures={2046: _capture(2046, T_WINDOW_RAWS)})
     coord = _make_coordinator(
         client, data={"mode": "push"}, options={"poll_interval": 30}
@@ -316,8 +316,7 @@ def test_push_cycle_unconfirmed_withholds_raws() -> None:
         data = asyncio.run(coord._async_update_data())
     assert client.read_calls == [(7, 45)]  # the one trigger (contract 014 §1.1)
     assert data.mode == "push"
-    assert data.registers == {}, data.registers  # the honesty gate
-    assert data.push_confirmed is False
+    assert data.registers == dict(T_WINDOW_RAWS), data.registers  # unconditional
     assert data.push_counts == {2046: 1}  # the diagnostic still counts
 
 
@@ -358,7 +357,7 @@ def test_push_cycle_reharvest_recovers() -> None:
     coord = _make_coordinator(
         client,
         data={"mode": "push"},
-        options={"poll_interval": 30, "push_temp_confirmed": True},
+        options={"poll_interval": 30},
     )
     with _ClockPatch(1000.0):
         data = asyncio.run(coord._async_update_data())
@@ -425,7 +424,7 @@ def test_push_mode_base_capture_is_anomaly_logged_once_and_ignored() -> None:
     coord = _make_coordinator(
         client,
         data={"mode": "push"},
-        options={"poll_interval": 30, "push_temp_confirmed": True},
+        options={"poll_interval": 30},
     )
     cap, logger, old_level = _capture_logs()
     try:
@@ -446,7 +445,7 @@ def test_push_mode_base_capture_is_anomaly_logged_once_and_ignored() -> None:
 def main() -> int:
     tests = [
         test_push_cycle_single_trigger_builds_snapshot,
-        test_push_cycle_unconfirmed_withholds_raws,
+        test_push_cycle_decodes_raws_unconditionally,
         test_push_cycle_stale_store_update_failed,
         test_push_cycle_reharvest_recovers,
         test_push_cycle_connects_bare,

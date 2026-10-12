@@ -5,13 +5,13 @@ the "Aqua Temp" app (`com.phinx.poolheater4`, Piscina Temp, …). It talks to
 the unit directly over **Bluetooth Low Energy** — no vendor cloud, no
 account, no WiFi needed (the unit does not even have WiFi).
 
-> **Status: calibrated and owner-proven.** The register map was recovered
-> from the vendor APK disassembly, then verified live on the production
-> unit (photo calibration, panel diffs, diff-revert probes). The complete,
-> current reference lives in
+> **Status: calibrated, owner-proven, active by default.** The register
+> map was recovered from the vendor APK disassembly, then verified live on
+> the production unit (photo calibration, panel diffs, diff-revert
+> probes). The complete, current reference lives in
 > [`specs/020-integration-reference/`](specs/020-integration-reference/) —
-> read its `spec.md` first. Unverified data is **never** shown under a
-> label: quantities appear only behind owner-verified gates.
+> read its `spec.md` first. Everything works the moment you add the
+> device (spec 022); the protections that remain are automatic.
 
 ## How it reads: trigger + listen
 
@@ -32,8 +32,8 @@ cycle is the **expected** world, not an error.
 | Suction temperature (T01) | sensor absent on this unit — shows `unknown` | 1 sensor |
 | Power state (OFF/HEAT display, heat-only rule) | **proven** (app diff-revert) | climate tile |
 | Heat setpoint display | **proven** (panel diff) | climate target |
-| Power control (on/off) | **proven** (pump heard; behind the `write_control` gate) | climate Heat/Off buttons |
-| Setpoint control (10.0-40.0 °C, 0.5 steps) | **proven** (mirror followed; behind the `write_setpoint` gate) | climate target slider |
+| Power control (on/off) | **proven** (pump heard) | climate Heat/Off buttons |
+| Setpoint control (10.0-40.0 °C, 0.5 steps) | **proven** (mirror followed) | climate target slider |
 | Push stream health | diagnostic | 1 sensor (diagnostic) |
 | Register / power / setpoint probes | calibration instruments | 3 buttons + 3 services |
 
@@ -129,8 +129,9 @@ The flow starts with a **menu** offering three choices:
 2. HA performs a live connection test: connect → request → listen for the
    unit's data report. A wrong pick simply fails with a clear error and
    returns to the same list — retry or pick another device.
-3. Name the device; the two calibration checkboxes ship **unchecked** (see
-   *The gates* below — do not check them blind).
+3. Name the device — the confirm screen shows what the test captured
+   (temperatures, power state, heat target). Done: the sensors, the
+   climate tile and both controls work immediately.
 
 ### Options (Configure on the device card)
 
@@ -138,32 +139,40 @@ The flow starts with a **menu** offering three choices:
   cycle — the heat pump is never flooded.
 - **Temperature unit**: °C/°F display only. The wire is always ×10 Celsius;
   °F values are converted at the entity boundary.
-- **The four gates** (see below) — only on push-mode entries.
 
-## The gates (the honesty system)
+## What you get (and what protects the machine)
 
-Nothing unproven is ever displayed, and nothing unproven is ever written.
-Each surface opens only behind an **owner-verified gate**, opened by your
-own act, never automatically:
+Everything works immediately after you add the device: the six
+temperature sensors, the climate tile (OFF/HEAT display + heat target),
+power control (Heat/Off buttons) and setpoint control (the target
+slider). There is nothing to confirm, no checkbox, no options toggle.
 
-| Gate (option) | Opens | Required evidence (your own act) |
-|---|---|---|
-| `push_temp_confirmed` | the 6 temperature sensors | compare the captured values with the vendor app's parameter view — the photo calibration |
-| `push_control_confirmed` | the climate entity (OFF/HEAT display + target) | the power/mode diff-revert against the app's display |
-| `write_control` | power writes (Heat/Off buttons) | the power write probe's `EXECUTED + REVERSIBLE` verdict (the probe physically starts and stops the pump, then reverts) |
-| `write_setpoint` | setpoint writes (target slider) | the setpoint write probe's `EXECUTED + REVERSIBLE` verdict (dip −0.5 °C → revert → verify) |
+What still protects the machine — automatically, all the time:
+
+- **Write allowlists**: writes go only to the two proven registers (power
+  **1011**, heat setpoint **1046**); every other register — the mode pair,
+  the mute, the installer families — is refused, forever.
+- **Value rails**: power accepts only on/off; the setpoint only 10.0-40.0 °C
+  in 0.5 steps. Out-of-range requests are refused loudly, never rounded or
+  clamped.
+- **Mirror confirmation**: a write is confirmed by a fresh data report
+  that postdates it; until then the tile does not change, and an
+  unconfirmed OFF raises a persistent notification.
+- **Read honesty**: absent sensors decode to `unknown`, never to a number;
+  a stale stream fails the cycle honestly.
 
 The probes are **diagnostic buttons** on the device — measurement
 instruments, not control surfaces. They always start from a verified
 baseline and always aim to leave the unit unchanged; their verdict line
 (at WARNING, visible on Settings → System → Logs) names the required
-remediation when something could not be verified.
+remediation when something could not be verified. Since spec 022 they are
+informational — the controls are already active.
 
 ## Entities (push mode)
 
 | Entity | Source | Notes |
 |---|---|---|
-| Climate (behind `push_control_confirmed`) | mirrors 2011 / 1046 / 2047 | `hvac_mode` OFF/HEAT follows the power mirror alone (heat-only unit); `target_temperature` is the setpoint mirror; `current_temperature` is the inlet water; bounds 10.0-40.0 °C, step 0.5 |
+| Climate | mirrors 2011 / 1046 / 2047 | `hvac_mode` OFF/HEAT follows the power mirror alone (heat-only unit); `target_temperature` is the setpoint mirror; `current_temperature` is the inlet water; bounds 10.0-40.0 °C, step 0.5 |
 | Inlet water temperature (T02) | pushed 2047 | ÷10, sentinel → `unknown` |
 | Outlet water temperature (T03) | pushed 2048 | ÷10 |
 | Coil temperature (T04) | pushed 2049 | ÷10 |
@@ -182,11 +191,11 @@ notification — a possibly-running pump is never a silent end state.
 vendor app's own display of an absent sensor as **3276.5 °C** is a display
 bug this integration deliberately does not replicate.
 
-## Calibration / verification on a new unit
+## Verifying a new unit (optional)
 
 The full push-world runbook (photo comparison, diff-revert, the two write
-probes) lives in **[`docs/CALIBRATION.md`](docs/CALIBRATION.md)**; the
-authoritative reference is
+probes) lives in **[`docs/CALIBRATION.md`](docs/CALIBRATION.md)** — optional
+confidence checks for a new or unknown unit; the authoritative reference is
 [`specs/020-integration-reference/quickstart.md`](specs/020-integration-reference/quickstart.md)
 §4.
 
@@ -214,7 +223,7 @@ data:
 | Unit not listed in the flow | powered off / out of range → power on, stay in range, **Scan again** |
 | Entities unavailable; `cannot_connect` | the vendor app holds the single BLE link — close it completely |
 | `push stream silent after trigger` | no data report within the window (rebooting unit? radio) — the cycle retries; check distance |
-| Entities `unknown`/absent | a gate is closed (the honesty rule) — do that gate's verification step |
+| Fault code / firmware not displayed | no reliable source has been identified in the unit's data report so far (the vendor app's own fault table lives in the APK; see specs/022) |
 | `unconfirmed` write, persistent notification | the fresh report never came back — check the panel; the notification says what to do |
 | Log lines at WARNING | the deliberate evidence lines (probe verdicts, block captures, test markers) — read them, they are the diagnostics |
 
@@ -222,10 +231,10 @@ data:
 
 Local-only BLE; no cloud, no account, no credentials, no data leaves the LAN.
 
-Writes go **only** to the two proven registers, each behind its gate:
-**1011** (power, values 0/1 only) and **1046** (heat setpoint, raw 100-400
-in steps of 5 — out-of-range or off-step requests are **refused loudly,
-never rounded, never clamped**). The single write funnel
+Writes go **only** to the two proven registers, each within its permanent
+value guard: **1011** (power, values 0/1 only) and **1046** (heat setpoint,
+raw 100-400 in steps of 5 — out-of-range or off-step requests are
+**refused loudly, never rounded, never clamped**). The single write funnel
 (`registers.ensure_writable`) enforces the allowlists at every layer.
 
 **Everything else is refused, forever:** the mode write (1012/1013 — a pair
@@ -239,5 +248,5 @@ There is deliberately **no generic "write register" service**.
 ## License & disclaimer
 
 Provided as-is for personal use. This controls a pool heat pump — always
-verify temperatures and behaviour on the device panel after installation,
-and keep the write gates closed until you have run the probes.
+verify temperatures and behaviour on the device panel after installation;
+the optional verification runbook lives in docs/CALIBRATION.md.

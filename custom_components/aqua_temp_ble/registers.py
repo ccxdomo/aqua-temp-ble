@@ -113,11 +113,6 @@ REG_DATA_LITTLE_ENDIAN = False     # [A] register data byte order; flip if the p
 # mapping — a permuted calibration outcome is a ONE-LINE edit in
 # PUSHED_TEMPS (quickstart 013 §2).
 PUSH_TEMP_BLOCK_START = 2046          # [P] the T-family live-temperature block
-PUSH_TEMP_CONFIRMED = False           # calibration switch (quickstart 013 §2):
-# False until the owner's side-by-side run matched the app's T-family
-# display (contract 013 §5) — no unconfirmed register is ever displayed
-# under a certain name. The per-entry `push_temp_confirmed` option ORs
-# with this global switch (the WRITE_ECHO_EXPECTED precedent).
 
 # member -> pushed register; the T-window hypothesis (research 013 §2.4).
 PUSHED_TEMPS: dict[str, int] = {
@@ -144,12 +139,6 @@ PUSH_PLANE_LAST = 2090
 # READ-ONLY sources, and `ensure_writable` stays byte-identical (the
 # allowlist {8, 13, 14} + 19-21 — contract 015-B §1/§3.4).
 PUSH_CONTROL_BLOCK_START = 2001  # [P] the control block of the pushed plane
-PUSH_CONTROL_CONFIRMED = False  # the control confirmation gate (contract 015-A §4):
-# False (the shipped default) until the owner re-verifies the pinned homes
-# against the app's display (quickstart 015 §5) and checks the
-# `push_control_confirmed` option OR flips this global switch — the
-# PUSH_TEMP_CONFIRMED precedent. Unconfirmed homes never reach the entity
-# plane: the keys decode None and the climate is not created.
 
 # The control plane window (spec 015 FR-11d): the two pushed series — the
 # machine-settings ladder 1001-1090 included, because a future setpoint
@@ -175,10 +164,9 @@ PUSHED_CONTROL: dict[str, int | None] = {
     # Spec 019 [P owner diff 2026-10-12 — research 019 §1]: register
     # 1046 IS the heat setpoint — the owner's panel change (+1.0 °C)
     # moved the first register of the pushed 1046-block 290 -> 300
-    # (29.0 -> 30.0 °C, x10 scaled). The home rides the EXISTING
-    # push_control_confirmed gate (the mapping is confirmed); the
-    # decode reads the capture of the block that CONTAINS the home
-    # (coordinator.from_pushes, FR-1) — NOT the 2001 window.
+    # (29.0 -> 30.0 °C, x10 scaled). The decode reads the capture of
+    # the block that CONTAINS the home (coordinator.from_pushes,
+    # FR-1) — NOT the 2001 window.
     "setpoint": 1046,
 }
 
@@ -208,6 +196,12 @@ PUSH_CONTROL_CANDIDATES: dict[int, str] = {
     2011: "power home [P owner diff-revert 2026-10-12]",
     2019: "mode home [P owner diff-revert 2026-10-12]",
     2012: "flag candidate [V] — static 1 across the 2026-10-12 diff",
+    # Spec 022 FR-8: the already-nonzero wildcards join the candidate
+    # list — diagnostics only (the Push stream attributes + the probe
+    # labels), for the owner's E03 fault hunt (quickstart 022 §3). No
+    # entity, no decode, no label claim.
+    2017: "unknown [V] — candidate, spec 022 fault hunt",
+    2018: "unknown [V] — candidate, spec 022 fault hunt",
     # Spec 019 T1: the tag updated to the proven wording — 1046 is no
     # longer a candidate (the panel diff proved it, research 019 §1).
     1046: "setpoint home (heat) [P owner diff 2026-10-12]",
@@ -281,8 +275,8 @@ def decode_flag(raw: int | None, active_when_nonzero: bool) -> bool | None:
 # the read plane are DIFFERENT registers (power: write 1011, read the
 # pushed mirror 2011; mode: write 1012, read 2019 — the offset is NOT
 # constant, research 016 §3). DATA ONLY (FR-1/NFR-3): unreachable by
-# any write path — the guard below admits 1011 only behind the
-# evidence gate, and 1012/1013/1076 never (each needs its own proof,
+# any write path — the guard below admits 1011 only within its value
+# allowlist, and 1012/1013/1076 never (each needs its own proof,
 # contract 016 §4).
 WRITE_REG_POWER = 1011        # [P — disassembly, research 016 §2]
 WRITE_REG_MODE = 1012         # [P shape / A semantics — research 016 §5]
@@ -368,118 +362,68 @@ ALLOWED_WRITE_BASE: frozenset[int] = frozenset(
 )
 
 # --- write security, control plane (spec 016 FR-3, contract 016 §4) ---
-# The evidence-gated CONTROL allowlist: the address AND the value
-# allowlist — power 1011 accepts ONLY 0/1, forever, even when proven
-# (contract 016 §4's value discipline: extending the values requires
-# a new contract). The mode (1012-1013), mute (1076) and every other
-# write-plane register is NOT extended here: each needs its own §2
-# evidence (its own pinned frame, mirror and §3 proof — the power
+# The CONTROL allowlist: the address AND the value allowlist — power
+# 1011 accepts ONLY 0/1, FOREVER (contract 016 §4's value discipline:
+# extending the values requires a new contract). Spec 022 removed
+# the human confirmation gate; this PERMANENT value rail is the
+# protection that stays. The mode (1012-1013), mute (1076) and every
+# other write-plane register is NOT extended here: each needs its own
+# §2 evidence (its own pinned frame, mirror and §3 proof — the power
 # proof does not transfer).
 ALLOWED_WRITE_CONTROL: dict[int, frozenset[int]] = {
     WRITE_REG_POWER: frozenset({0, 1}),
 }
 
 # --- write security, setpoint plane (spec 019 FR-4, contract 019 §4) ---
-# The THIRD gate's value discipline: the address AND the value
-# allowlist — 1046 accepts ONLY raw 100..400 in steps of 5 (10.0-40.0
-# °C, the 0.5 °C granularity), FOREVER, even when proven (contract 019
-# §2.2: a bounded RANGE instead of the power plane's {0, 1} — a
-# regulation value needs it; a 30.3 °C request is REFUSED, never
-# rounded; a 41.0 °C request is REFUSED, never clamped). The ladder's
-# other members (1049/1050/1051/1054/1055/1068…) are NEVER writable
-# here — installer thresholds (contract 019 §7.2).
+# The setpoint value discipline: the address AND the value allowlist —
+# 1046 accepts ONLY raw 100..400 in steps of 5 (10.0-40.0 °C, the 0.5
+# °C granularity), FOREVER (contract 019 §2.2: a bounded RANGE instead
+# of the power plane's {0, 1} — a regulation value needs it; a
+# 30.3 °C request is REFUSED, never rounded; a 41.0 °C request is
+# REFUSED, never clamped). Spec 022 removed the human confirmation
+# gate; this PERMANENT value rail is the protection that stays. The
+# ladder's other members (1049/1050/1051/1054/1055/1068…) are NEVER
+# writable here — installer thresholds (contract 019 §7.2).
 ALLOWED_WRITE_SETPOINT: dict[int, frozenset[int]] = {
     WRITE_REG_SETPOINT: frozenset(
         range(SETPOINT_MIN_RAW, SETPOINT_MAX_RAW + 1, SETPOINT_STEP_RAW)
     ),
 }
 
-# The evidence gate (the WRITE_ECHO_EXPECTED / PUSH_TEMP_CONFIRMED
-# calibration-switch precedent): False is the SHIPPED default — with
-# it, ensure_writable refuses 1011 exactly as 0.11.0 refused it
-# (AC-2/AC-4: byte-identical). Flip to True ONLY after the power-write
-# probe's live verdict line
-#   power write probe: EXECUTED + REVERSIBLE (mirror 2011 followed 0→1→0)
-# is recorded (contract 016 §4 — the owner quotes it in the spec's
-# decision log / PR), then restart Home Assistant. Flipping it
-# without that verdict is a contract violation; the phase-2 climate
-# wiring (spec 016 tasks.md T7/AC-11) stays parked until then.
-WRITE_CONTROL_PROVEN = False
-
-# The THIRD gate (spec 019 FR-9, contract 019 §4): SEPARATE from
-# WRITE_CONTROL_PROVEN by design — (a) contract 016 §4's
-# non-transference, restated: every register needs its own proof (the
-# power proof authorizes 1011 with {0, 1} and NOTHING here); (b) a
-# different risk class: a regulation VALUE whose misuse changes the
-# machine's thermal behavior, vs a reversible boolean; (c) independent
-# activation: the owner may want power control but not setpoint
-# control (the gates compose); (d) a different value discipline: a
-# bounded range with a granularity rule, not {0, 1}. False is the
-# SHIPPED default — with it, ensure_writable refuses 1046 exactly as
-# 0.13.2 refused it (AC-2: byte-identical). Flip to True ONLY after
-# the setpoint write probe's live verdict line
-#   setpoint write probe: EXECUTED + REVERSIBLE (mirror 1046 followed <S>→<T>→<S>)
-# is recorded (contract 019 §4 — the owner quotes it in the spec's
-# decision log / PR), then restart Home Assistant; the per-entry
-# `write_setpoint` option (const.DEFAULT_WRITE_SETPOINT) is the
-# no-restart twin (the write_control precedent). No code path, update
-# or default may ever SET either surface (contract 019 §4.1).
-WRITE_SETPOINT_PROVEN = False
+# Spec 022 (FR-3, Option B — "active by default"): the human
+# confirmation gates (the global proven switches and their per-entry
+# option twins) are DELETED. Every surface they gated
+# is owner-proven (the power write probe's EXECUTED + REVERSIBLE
+# verdict, the setpoint probe's verdict, the mirror diff-reverts —
+# specs 016/017/019), so the gates re-asked an answered question.
+# What protects the machine is AUTOMATIC and stays byte-identical: the
+# address allowlists above and the value rails ({0, 1} for 1011;
+# 100..400 step 5 for 1046) are PERMANENT (contracts 016 §4 / 019
+# §2.2) — extending either needs a new contract. The probes remain as
+# informational instruments (spec 022 keeps them unchanged).
 
 
-def ensure_writable(
-    address: int,
-    value: int | None = None,
-    *,
-    control_allowed: bool | None = None,
-    setpoint_allowed: bool | None = None,
-) -> None:
+def ensure_writable(address: int, value: int | None = None) -> None:
     """Guard the single write funnel: raise ValueError unless allowed.
 
     coordinator.async_write_register calls this as its first statement,
     so no code path — present or future — can write outside the
     allowlists. The base-block rules (spec 003 §6) are UNTOUCHED:
     {8, 13, 14} + 19-21 behind WRITE_MODE_SETPOINT_TOO, and value=None
-    keeps the old semantics for those callers (spec 016 FR-3's
-    backward-compatible signature).
+    keeps the old semantics for those callers.
 
-    Spec 016 FR-3 adds the CONTROL plane, default-locked: a register in
-    ALLOWED_WRITE_CONTROL (today: power 1011) is writable ONLY when
-    WRITE_CONTROL_PROVEN is True AND the value is in the entry's
-    allowlist ({0, 1}) — a control write must always name its value.
-    With the switch False (shipped), 1011 is refused exactly as 0.11.0
-    refused it — the ONLY pre-proof write path is the owner-triggered
-    power-write probe (coordinator.async_power_write_probe, which
-    sends the pinned frames through the client's own seam, NOT through
-    this funnel — contract 016 §5).
-
-    Spec 017 FR-3 step 1 adds the `control_allowed` thread: the
-    coordinator passes its activation property (registers.
-    WRITE_CONTROL_PROVEN OR the per-entry `write_control` option —
-    FR-1) so the OPTION surface honors the control write without a
-    restart. None (the default and every shipped caller) keeps the
-    module switch as the gate, byte-identical to 0.12.0 — no code path
-    may ever SET either surface (contract 017 §2); this thread only
-    reads the caller's own activation state per call. The base-block
-    rules ignore the thread entirely; the address AND value allowlists
-    stay permanent (contract 016 §4's value discipline).
-
-    Spec 019 FR-4 adds the SETPOINT plane — the THIRD gate, separate
-    by design (contract 019 §4): a register in ALLOWED_WRITE_SETPOINT
-    (today: 1046) is writable ONLY when the setpoint gate is open
-    (WRITE_SETPOINT_PROVEN, or the caller's own activation state via
-    the `setpoint_allowed` thread — the 017 pattern, read per call;
-    None keeps the module switch) AND the value is in the entry's
-    allowlist (100..400 in steps of 5 — a REGULATION value is never
-    rounded or clamped, contract 019 §2.2). With the gate False
-    (shipped), 1046 is refused exactly as 0.13.2 refused it (AC-2:
-    byte-identical) — the ONLY pre-proof write path is the
-    owner-triggered setpoint write probe (coordinator.
-    async_setpoint_write_probe, whose frames go through the client's
-    own validated seam, NOT through this funnel — contract 019 §3).
-    The base and power rules are untouched by the new thread; the
-    non-transference rule stands (contract 016 §4/019 §4.3): the power
-    proof authorizes NOTHING here.
+    Spec 022 (FR-3/FR-4): the integration is ACTIVE BY DEFAULT — the
+    owner-confirmation gates are gone. What guards the write plane is
+    PERMANENT (contracts 003 §6 / 016 §4 / 019 §2.2): the ADDRESS
+    allowlists (1011 and 1046 ONLY — the mode pair 1012/1013, mute
+    1076, the installer thresholds and the whole read plane are
+    refused forever) and the VALUE rails — a register in
+    ALLOWED_WRITE_CONTROL (today: power 1011) is writable ONLY with a
+    value in its allowlist ({0, 1}; a control write must always name
+    its value); a register in ALLOWED_WRITE_SETPOINT (today: 1046)
+    ONLY with a value in raw 100..400 in steps of 5 (10.0-40.0 °C in
+    0.5 steps — a regulation value is never rounded, never clamped).
+    Every other register is refused with the spec-003 message.
     """
     allowed = ALLOWED_WRITE_BASE
     if WRITE_MODE_SETPOINT_TOO:
@@ -491,38 +435,17 @@ def ensure_writable(
     if address in allowed:
         return
     if address in ALLOWED_WRITE_CONTROL:
-        gate = (
-            WRITE_CONTROL_PROVEN if control_allowed is None else bool(control_allowed)
-        )
-        if not gate:
-            raise ValueError(
-                f"register {address} is not writable (spec 003 §6; the "
-                "control plane stays locked until the power-write probe's "
-                "EXECUTED + REVERSIBLE verdict flips WRITE_CONTROL_PROVEN "
-                "— contract 016 §4)"
-            )
+        # The permanent value rail: {0, 1} only, forever.
         values = ALLOWED_WRITE_CONTROL[address]
         if value is None or value not in values:
             raise ValueError(
                 f"register {address} accepts only values {sorted(values)} "
-                "(contract 016 §4 — the value allowlist is part of the guard)"
+                "(the value allowlist is part of the guard)"
             )
         return
     if address in ALLOWED_WRITE_SETPOINT:
-        # Spec 019 FR-4: the setpoint branch — gate closed → the locked
-        # message naming the probe verdict + WRITE_SETPOINT_PROVEN;
-        # gate open + a value outside the allowlist → the
-        # value-discipline message (the range and the step in the text).
-        gate = (
-            WRITE_SETPOINT_PROVEN if setpoint_allowed is None else bool(setpoint_allowed)
-        )
-        if not gate:
-            raise ValueError(
-                f"register {address} is not writable (spec 003 §6; the "
-                "setpoint plane stays locked until the setpoint write "
-                "probe's EXECUTED + REVERSIBLE verdict flips "
-                "WRITE_SETPOINT_PROVEN — contract 019 §4)"
-            )
+        # The permanent value rail: the range AND the step — never
+        # rounded, never clamped (contract 019 §2.2).
         values = ALLOWED_WRITE_SETPOINT[address]
         if value is None or value not in values:
             raise ValueError(
@@ -583,9 +506,9 @@ SENSORS: tuple[RegDef, ...] = (
 # PUSHED_MIRRORS: the base-pinned keys with their pushed registers — the
 # same physical quantity on two planes (contract 013 §4.1: one entity
 # key per quantity, never two entities). In push mode these entities
-# exist as today and take their values from the mirrors, but ONLY once
-# the calibration gate is open (contract 013 §4.3) — until then they
-# decode `unknown`.
+# exist as today and take their values from the mirrors (spec 022:
+# active by default — the calibration gate is gone; the sentinel and
+# plausibility rules still guard every decode).
 PUSHED_MIRRORS: dict[str, int] = {
     "inlet_water_temp": PUSHED_TEMPS["inlet_water_temp"],
     "outlet_water_temp": PUSHED_TEMPS["outlet_water_temp"],
@@ -593,9 +516,9 @@ PUSHED_MIRRORS: dict[str, int] = {
 }
 
 # PUSHED_SENSORS: the push-only keys (no base home [V base]) — created
-# only behind the PUSH_TEMP_CONFIRMED gate (FR-5). Addresses come from
-# PUSHED_TEMPS — the single source of truth (a permuted calibration
-# outcome is a one-line edit there, data-model 013 §6).
+# unconditionally in push mode (spec 022: active by default). Addresses
+# come from PUSHED_TEMPS — the single source of truth (a permuted
+# calibration outcome is a one-line edit there, data-model 013 §6).
 PUSHED_SENSORS: tuple[RegDef, ...] = tuple(
     RegDef(
         d.key,

@@ -5,15 +5,16 @@ and 14 only. Writes go through the coordinator (serialized, confirmed by a
 debounced refresh) so the entity state always reflects the *device-confirmed*
 value, never an optimistic guess.
 
-Spec 015 (FR-8): a "push" entry gets the climate ONLY behind the control
-confirmation gate (`push_control_confirmed`, contract 015-A §4) — and then
-strictly READ-ONLY. The pinned control homes (registers.PUSHED_CONTROL —
-the owner's 2026-10-12 diff-revert evidence) prove what the pushed registers
-REFLECT, never what writing them controls (contract 015-A §8): no write
-feature is advertised, no write method succeeds, and nothing ever reaches
-the coordinator's write funnel (`ensure_writable` stays byte-identical,
-contract 015-B §3.4). Classic entries keep today's exact entity
-(byte-identical, US-6).
+Spec 022 (FR-1/FR-3): the push-mode climate is ACTIVE BY DEFAULT — the
+owner-confirmation gates are gone. A push entry always gets the full
+surface: the OFF/HEAT display (the heat-only rule, spec 018), the setpoint
+read, power writes through the confirmation cycle (1011) and setpoint
+writes through the setpoint cycle (1046). The AUTOMATIC protections stay
+byte-identical: the permanent value rails (registers.ensure_writable), the
+mirror confirmation (the state only follows a fresh pushed block that
+postdates the write) and the heat-only rule (OFF/HEAT only — the mode is
+not pilotable). Classic entries keep today's exact entity (byte-identical,
+US-6).
 """
 
 from __future__ import annotations
@@ -47,18 +48,12 @@ async def async_setup_entry(
 ) -> None:
     coordinator: AquaTempCoordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
     if str(entry.data.get("mode", "classic")) == "push":
-        # Spec 015 FR-8 (contract 013 §4.4): in push mode the climate exists
-        # ONLY behind the control confirmation gate — unconfirmed control
-        # homes never reach the entity plane (the 0.10.0 code created the
-        # entity unconditionally with an all-unknown state; this closes that
-        # contract gap). Classic entries keep today's exact path (US-6).
-        if not coordinator.push_control_confirmed:
-            _LOGGER.debug(
-                "climate skipped in push mode: control mapping not confirmed "
-                "yet (quickstart 015 §5)"
-            )
-            return
-        async_add_entities([AquaTempClimateEntity(coordinator, entry, read_only=True)])
+        # Spec 022 FR-1/FR-3: the push-mode climate is created
+        # UNCONDITIONALLY, with the full surface — active by default
+        # (the owner-confirmation gates are gone; the protections that
+        # remain are automatic: value rails, mirror confirmation,
+        # heat-only rule). Classic entries keep today's exact path (US-6).
+        async_add_entities([AquaTempClimateEntity(coordinator, entry, push=True)])
         return
     async_add_entities([AquaTempClimateEntity(coordinator, entry)])
 
@@ -76,92 +71,61 @@ class AquaTempClimateEntity(ClimateEntity, AquaTempEntity):
     )
 
     def __init__(
-        self, coordinator: AquaTempCoordinator, entry: ConfigEntry, read_only: bool = False
+        self, coordinator: AquaTempCoordinator, entry: ConfigEntry, push: bool = False
     ) -> None:
         ClimateEntity.__init__(self)
         AquaTempEntity.__init__(self, coordinator, entry, "climate")
-        # Spec 015 FR-8: the push-mode climate is READ-ONLY while the
-        # 017 activation gate is closed — no write feature advertised,
-        # no settable hvac_modes (an empty list renders no mode buttons;
-        # the reported hvac_mode stays a free-form state). Spec 017
-        # FR-5 layers the gate-open surface on TOP via the live
-        # properties below (the option flips without a reload).
-        self._read_only = read_only
-        if read_only:
-            self._attr_supported_features = ClimateEntityFeature(0)
-            self._attr_hvac_modes = []
+        # Spec 022 FR-3: the push flag distinguishes the two entity
+        # shapes — the push entity's surface is UNCONDITIONAL (the
+        # gates are gone); the classic entity is byte-identical (US-6).
+        self._push = push
 
-    # ------------------------------------------------- live gate surface
-    # Spec 017 FR-5: the properties read the coordinator's activation
-    # gate LIVE (entry.options is the live mapping), so saving the
-    # write_control option re-renders the entity without a reload —
-    # the quickstart 017 §1 promise. While the gate is closed these
-    # return exactly the 015 read-only surface (byte-identical, AC-3);
-    # the classic entity never enters the branches at all.
+    # ------------------------------------------------- the push surface
+    # Spec 022 (FR-1/FR-3): active by default — the push entity always
+    # advertises the full surface. The protections that shape it are
+    # AUTOMATIC and permanent: the heat-only rule (OFF/HEAT only — the
+    # mode is not pilotable), the value rails behind the write cycles
+    # and the mirror confirmation.
     @property
     def hvac_modes(self) -> list[HVACMode]:
-        if self._read_only:
-            if self.coordinator.write_control_allowed:
-                # Heat-only unit (FR-8): COOL/AUTO are unsupported —
-                # the vendor's own app refuses mode changes here and
-                # its mode write would clobber an unpinned pair
-                # register (research 017 §5). OFF/HEAT map to the
-                # proven power writes only.
-                return [HVACMode.OFF, HVACMode.HEAT]
-            return []
+        if self._push:
+            # Heat-only unit (the 017 FR-8 rule stands): COOL/AUTO are
+            # unsupported — the vendor's own app refuses mode changes
+            # here and its mode write would clobber an unpinned pair
+            # register (research 017 §5). OFF/HEAT map to the proven
+            # power writes only.
+            return [HVACMode.OFF, HVACMode.HEAT]
         return self._attr_hvac_modes
 
     @property
     def supported_features(self) -> ClimateEntityFeature:
-        if self._read_only:
-            # Spec 019 FR-8/FR-9: the gates COMPOSE — TURN_ON/TURN_OFF
-            # behind write_control_allowed (017), TARGET_TEMPERATURE
-            # behind write_setpoint_allowed (the THIRD gate, separate
-            # by design: the owner may activate either without the
-            # other; the power proof authorizes NOTHING setpoint —
-            # non-transference, contract 019 §4.3). With both closed:
-            # the exact 015-era surface (byte-identical, AC-2).
+        if self._push:
+            # Spec 022: unconditional — TURN_ON/TURN_OFF (where the
+            # installed HA defines them) + TARGET_TEMPERATURE.
             features = ClimateEntityFeature(0)
-            if self.coordinator.write_control_allowed:
-                # The shipped HA climate API's turn-on/turn-off
-                # features where the installed HA defines them.
-                if getattr(ClimateEntityFeature, "TURN_ON", None) is not None:
-                    features |= ClimateEntityFeature.TURN_ON
-                if getattr(ClimateEntityFeature, "TURN_OFF", None) is not None:
-                    features |= ClimateEntityFeature.TURN_OFF
-            if self.coordinator.write_setpoint_allowed:
-                # The setpoint write affordance — ONLY behind the
-                # setpoint gate (the read display needs no gate: the
-                # home is [P owner]).
-                features |= ClimateEntityFeature.TARGET_TEMPERATURE
+            if getattr(ClimateEntityFeature, "TURN_ON", None) is not None:
+                features |= ClimateEntityFeature.TURN_ON
+            if getattr(ClimateEntityFeature, "TURN_OFF", None) is not None:
+                features |= ClimateEntityFeature.TURN_OFF
+            features |= ClimateEntityFeature.TARGET_TEMPERATURE
             return features
         return self._attr_supported_features
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
-        """Spec 017 FR-5 diagnostics + the spec 019 twin: each open
-        gate's marker and its last-write stage dict. The locked surface
-        (both write gates closed) keeps its exact prior surface (None,
-        byte-identical, AC-2/US-6); the classic entity never enters the
-        branches."""
-        if not self._read_only:
+        """The write diagnostics: each cycle's last stage dict (the
+        mirror's verdict — never an entity state; the tile's truth
+        stays the pushed mirror alone, contracts 017 §5 / 019 §5.2).
+        The classic entity has none."""
+        if not self._push:
             return None
         attrs: dict[str, Any] = {}
-        if self.coordinator.write_control_allowed:
-            attrs["write_control"] = "allowed"
-            last = self.coordinator.last_control_write
-            if last is not None:
-                attrs["last_power_write"] = dict(last)
-        # Spec 019 FR-11: the setpoint gate's marker + stage dict — the
-        # gates compose, so the setpoint diagnostics appear with EITHER
-        # gate open (the read display needs no gate at all — the home
-        # is [P owner]; the tile's truth stays the pushed mirror
-        # alone, contract 019 §5.2).
-        if self.coordinator.write_setpoint_allowed:
-            attrs["write_setpoint"] = "allowed"
-            last_sp = self.coordinator.last_setpoint_write
-            if last_sp is not None:
-                attrs["last_setpoint_write"] = dict(last_sp)
+        last = self.coordinator.last_control_write
+        if last is not None:
+            attrs["last_power_write"] = dict(last)
+        last_sp = self.coordinator.last_setpoint_write
+        if last_sp is not None:
+            attrs["last_setpoint_write"] = dict(last_sp)
         return attrs or None
 
     # ------------------------------------------------------------- unit conv
@@ -213,11 +177,13 @@ class AquaTempClimateEntity(ClimateEntity, AquaTempEntity):
         if data is None:
             return None
         if data.mode == "push":
-            # Spec 015: the pushed inlet mirror (contract 013 §4.1 — one
-            # quantity, one source): the same confirmed T-block register
-            # the sensor entity reads, through the shared decode helper;
-            # unconfirmed temperatures decode None (honest, never a
-            # certain name on unconfirmed data).
+            # FR-12 (spec 022): the climate's current temperature is
+            # the INLET water temperature — the quantity the machine
+            # regulates (register 2047, T02 — the live-proven inlet
+            # [P]; the same source, sentinel and plausibility rules
+            # as the inlet sensor entity — one quantity, one source,
+            # contract 013 §4.1). The ambient temperature (2050) NEVER
+            # feeds the climate.
             address = registers.PUSHED_TEMPS.get("inlet_water_temp")
             if address is None:
                 return None
@@ -233,7 +199,7 @@ class AquaTempClimateEntity(ClimateEntity, AquaTempEntity):
 
     @property
     def min_temp(self) -> float:
-        if self._read_only:
+        if self._push:
             # Spec 019 FR-8: the push-mode bounds are the guard's own
             # range — one source of truth with ALLOWED_WRITE_SETPOINT
             # (the static [D] bounds 10.0/40.0; the [A-weak] ladder
@@ -251,7 +217,7 @@ class AquaTempClimateEntity(ClimateEntity, AquaTempEntity):
 
     @property
     def max_temp(self) -> float:
-        if self._read_only:
+        if self._push:
             # Spec 019 FR-8: the push-mode upper bound — the guard's own
             # constant (40.0 °C), the same number the funnel enforces.
             celsius = registers.SETPOINT_MAX_RAW / registers.TEMP_SCALE
@@ -265,66 +231,45 @@ class AquaTempClimateEntity(ClimateEntity, AquaTempEntity):
         return fallback if fallback is not None else registers.FALLBACK_MAX_TARGET
 
     # ------------------------------------------------------------ write path
-    def _refuse_write(self) -> None:
-        """Spec 015 FR-8: the push-mode climate never writes — the pinned
-        homes prove what the registers REFLECT, not what writing them
-        controls (contract 015-A §8), and the write allowlist is
-        unchanged (contract 015-B §1). Refuse loudly, never silently."""
-        raise HomeAssistantError(
-            "the push-mode climate is read-only (spec 015 FR-8); control "
-            "writes are not available"
-        )
-
     async def async_turn_on(self) -> None:
-        """Spec 015 FR-8 / Spec 017 FR-5: while the activation gate is
-        closed the read-only entity refuses (the 015 surface,
-        byte-identical); with the gate open it sends the PROVEN
-        power-ON write (1011 = 1) through the confirmation cycle —
-        the mirror decides the displayed state, never the button.
-        The classic entity defers to the base implementation
-        (byte-identical)."""
-        if self._read_only:
-            if self.coordinator.write_control_allowed:
-                await self.coordinator.async_control_write_power(1)
-                return
-            self._refuse_write()
+        """The push entity sends the PROVEN power-ON write (1011 = 1)
+        through the confirmation cycle — the mirror decides the
+        displayed state, never the button (spec 022: unconditional).
+        The classic entity defers to the base implementation."""
+        if self._push:
+            await self.coordinator.async_control_write_power(1)
+            return
         await super().async_turn_on()
 
     async def async_turn_off(self) -> None:
-        """Spec 015 FR-8 / Spec 017 FR-5: the OFF twin — the PROVEN
-        power-OFF write (1011 = 0) through the confirmation cycle;
-        an unconfirmed OFF is never silent (the persistent
-        notification, FR-3 step 7). The classic entity defers to the
-        base implementation (byte-identical)."""
-        if self._read_only:
-            if self.coordinator.write_control_allowed:
-                await self.coordinator.async_control_write_power(0)
-                return
-            self._refuse_write()
+        """The OFF twin — the PROVEN power-OFF write (1011 = 0) through
+        the confirmation cycle; an unconfirmed OFF is never silent (the
+        persistent notification, FR-3 step 7). The classic entity
+        defers to the base implementation."""
+        if self._push:
+            await self.coordinator.async_control_write_power(0)
+            return
         await super().async_turn_off()
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
-        if self._read_only:
-            # Spec 017 FR-5/FR-8: with the gate open, OFF/HEAT are both
-            # PURE power writes (the proven pair); anything else is
-            # unsupported — the mode is NOT pilotable on this heat-only
-            # unit (the vendor's own app refuses mode changes and its
-            # mode write would clobber register 1013 with an unpinned
-            # setpoint-shaped value, research 017 §5). With the gate
-            # closed the 015 refusal stands (byte-identical).
-            if self.coordinator.write_control_allowed:
-                if hvac_mode == HVACMode.OFF:
-                    await self.coordinator.async_control_write_power(0)
-                    return
-                if hvac_mode == HVACMode.HEAT:
-                    await self.coordinator.async_control_write_power(1)
-                    return
-                raise HomeAssistantError(
-                    f"unsupported hvac mode {hvac_mode!r}: this unit is "
-                    "heat-only — set_hvac_mode exposes OFF and HEAT only, "
-                    "both pure power writes (spec 017 FR-8)"
-                )
-            self._refuse_write()
+        if self._push:
+            # OFF/HEAT are both PURE power writes (the proven pair);
+            # anything else is unsupported — the mode is NOT pilotable
+            # on this heat-only unit (the vendor's own app refuses
+            # mode changes and its mode write would clobber register
+            # 1013 with an unpinned setpoint-shaped value — spec 017
+            # FR-8).
+            if hvac_mode == HVACMode.OFF:
+                await self.coordinator.async_control_write_power(0)
+                return
+            if hvac_mode == HVACMode.HEAT:
+                await self.coordinator.async_control_write_power(1)
+                return
+            raise HomeAssistantError(
+                f"unsupported hvac mode {hvac_mode!r}: this unit is "
+                "heat-only — set_hvac_mode exposes OFF and HEAT only, "
+                "both pure power writes (spec 017 FR-8)"
+            )
         if hvac_mode == HVACMode.OFF:
             await self.coordinator.async_write_register(registers.REG_POWER, 0)
             return
@@ -339,25 +284,21 @@ class AquaTempClimateEntity(ClimateEntity, AquaTempEntity):
         await self.coordinator.async_write_register(registers.REG_MODE, mode_value)
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
-        if self._read_only:
-            # Spec 019 FR-11: with the setpoint gate open, the push-mode
-            # climate writes the target through the confirmation cycle
-            # (validate -> funnel -> write -> trigger -> the MIRROR
-            # decides — contract 019 §5). With the gate closed, the
-            # exact 015 refusal (byte-identical, AC-2). The write is
-            # allowed regardless of power state (contract 019 §5.4 —
-            # the register is the machine's stored parameter) and is
-            # NEVER clamped: a value off the 0.5 step or outside
-            # 10.0-40.0 °C raises loudly through the cycle
-            # (contract 019 §2.2).
-            if self.coordinator.write_setpoint_allowed:
-                temp = kwargs.get(ATTR_TEMPERATURE)
-                if temp is None:
-                    return
-                celsius = self._from_display_unit(temp)
-                await self.coordinator.async_control_write_setpoint(celsius)
+        if self._push:
+            # The push entity writes the target through the setpoint
+            # confirmation cycle (validate -> funnel -> write ->
+            # trigger -> the MIRROR decides — contract 019 §5). The
+            # write is allowed regardless of power state (contract
+            # 019 §5.4 — the register is the machine's stored
+            # parameter) and is NEVER clamped: a value off the 0.5
+            # step or outside 10.0-40.0 °C raises loudly through the
+            # cycle (contract 019 §2.2).
+            temp = kwargs.get(ATTR_TEMPERATURE)
+            if temp is None:
                 return
-            self._refuse_write()
+            celsius = self._from_display_unit(temp)
+            await self.coordinator.async_control_write_setpoint(celsius)
+            return
         temp = kwargs.get(ATTR_TEMPERATURE)
         if temp is None:
             return

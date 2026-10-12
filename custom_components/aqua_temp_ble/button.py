@@ -79,10 +79,10 @@ class AquaTempPowerProbeButtonEntity(AquaTempEntity, ButtonEntity):
     disassembly-pinned power frames (ON then OFF), verifies the pushed
     mirror register 2011 follows and reverts, and logs ONE verdict
     line at WARNING (quickstart 016 §2's table). It always returns the
-    unit to OFF when it can — and says so when it could not. The
-    climate stays read-only; flipping WRITE_CONTROL_PROVEN after an
-    EXECUTED + REVERSIBLE verdict is the owner's separate decision
-    (contract 016 §4).
+    unit to OFF when it can — and says so when it could not. Since
+    spec 022 the control is ACTIVE BY DEFAULT; the probe remains the
+    informational instrument (the owner's evidence record —
+    contract 016 §4).
     """
 
     def __init__(
@@ -114,9 +114,9 @@ class AquaTempSetpointProbeButtonEntity(AquaTempEntity, ButtonEntity):
     — inside the machine's own regulation hysteresis, and the unit
     accepts setpoint changes while off [P owner]. The ONE verdict line
     logs at WARNING (quickstart 019 §2's table); an `EXECUTED +
-    REVERSIBLE` verdict is the owner's evidence to open the
-    `write_setpoint` option — flipping it without that verdict is a
-    contract violation (contract 019 §4).
+    REVERSIBLE` verdict is the owner's evidence record (contract 019
+    §4). Since spec 022 the setpoint control is ACTIVE BY DEFAULT;
+    the probe remains the informational instrument.
     """
 
     def __init__(

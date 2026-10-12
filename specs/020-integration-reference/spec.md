@@ -1,12 +1,17 @@
 # Spec 020 — Aqua Temp BLE: the integration reference
 
 Date: 2026-10-12
-Repo state: main @ 3316217, manifest 0.14.0
+Revised: 2026-10-12, after spec 022
+Repo state: main @ 0d32de2 + spec 022, manifest 0.15.0
 Status: **REFERENCE** — this is not a work spec. It documents the
 integration **as it works today**, verified live on the owner's PHNIX
 pool heat pump (Aqua Temp app, BlueNRG module). Specs 001-019 are
 archived in [`../archive/`](../archive/) with their inventory in
 `../archive/README.md`.
+
+> **Revision note (2026-10-12).** Revised after spec 022: the
+> activation gates were removed; everything is active by default.
+> The automatic write protections are unchanged.
 
 Confidence legend (the repo-wide convention):
 
@@ -31,9 +36,12 @@ cloud, no account, no WiFi (the unit has none). On the production unit
 - **Displays** them as sensors plus one climate entity (heat-only).
 - **Controls** the power (on/off) and the heat setpoint — both written
   to the unit, both **mirror-confirmed**, never optimistic.
-- **Proves everything before exposing it**: quantities appear behind
-  owner-confirmed calibration gates; writes appear behind owner-opened
-  activation gates; diagnostic probes produce the evidence.
+- **Protects everything it exposes**: active by default (spec 022) —
+  but nothing unproven moves. Reads decode only from the pushed
+  blocks; writes pass only through the single funnel
+  (`registers.ensure_writable` + the address allowlists and value
+  rails); every write is mirror-confirmed, never optimistic; the
+  diagnostic probes remain the measurement instruments.
 
 ### The one mechanism to understand
 
@@ -74,22 +82,22 @@ diff-revert 0→1→0. [P]
 I want real power control. → The climate's turn-on/turn-off (and
 OFF/HEAT mode buttons) write register **1011** with the vendor's own
 frames — physically proven: the pump started and stopped, mirror 2011
-followed. Behind the `write_control` option. [P]
+followed. [P]
 
 ### US-5 — Set the heat setpoint from Home Assistant
 I want to change the pool's heat target. → The climate's target slider
 writes register **1046** with the vendor's own frame shape
 (10.0–40.0 °C, 0.5 steps, never clamped or rounded). Proven: mirror
 1046 followed 300 → 295 → 300, and the owner sets the target from HA
-in daily use. Behind the `write_setpoint` option. [P]
+in daily use. [P]
 
 ### US-6 — Trust the display
 I never want a lie on the tile. → The state is only ever updated from
 a **fresh pushed mirror** that postdates the write (the confirmation
 cycle); unconfirmed writes leave the state untouched and raise a
-persistent notification for an unconfirmed OFF. Unconfirmed quantities
-decode to `unknown`; the `push_stream` diagnostic exposes stream
-health. [P]
+persistent notification for an unconfirmed OFF. Absent-block and
+sentinel values decode to `unknown`; the `push_stream` diagnostic
+exposes stream health. [P]
 
 ## 3. Acceptance criteria (verified behaviours, not future work)
 
@@ -103,9 +111,10 @@ health. [P]
 - AC-4: setpoint writes from HA move the panel's setpoint display;
   the mirror confirms; out-of-range/off-step requests are refused with
   a loud error, never rounded. [P — verified]
-- AC-5: nothing unconfirmed is ever displayed under a certain name;
-  every write is guarded by the single funnel
-  (`registers.ensure_writable`) plus client-side value rails. [P — code]
+- AC-5: no value is ever displayed without a live pushed source
+  (absent block or sentinel → `unknown`); every write is guarded by
+  the single funnel (`registers.ensure_writable`) plus client-side
+  value rails. [P — code]
 - AC-6: a stale stream (unit unreachable, vendor app holding the
   single BLE link) fails the cycle honestly — entities go
   unavailable rather than showing stale values (freshness gate). [P — code]
@@ -135,22 +144,26 @@ log one INFO per session per value). [P — spec 018]
   units but are unreachable on this machine.
 - **Fault code & firmware in push mode.** No pushed home was ever
   identified for them; the entities are not created (never guessed).
+  Spec 022 documents the fault hunt instead: 2017/2018 are the
+  candidate raws (diagnostics only) and the owner's E03 protocol
+  carries the evidence bar for any future fault entity
+  ([`../022-defaults-and-faults/`](../022-defaults-and-faults/)).
 - **Binary sensors (compressor/pump/fan/valve/switches).** Their
   base-block registers were never pinned and have no pushed homes; no
   entity is created.
 - **Pairing/bonding.** The production verdict is `att-accepted-silent`
   — the write pipe is open at the ATT layer without bonding. The
-  pairing ladder remains available in the config-flow test as dormant
-  evidence tooling (`pair_on_connect` ships OFF).
+  pairing ladder never earned its evidence and was pruned in the 021
+  cleanup pass (commit `0d32de2`); no pairing surface ships.
 
 ## 6. Where the details live
 
 | Topic | File |
 |---|---|
-| Architecture (cycle, store, gates, entity surface) | [`plan.md`](plan.md) |
+| Architecture (cycle, store, write protections, entity surface) | [`plan.md`](plan.md) |
 | The wire protocol: frames, registers, sentinels, failure modes | [`research.md`](research.md) |
 | Register → quantity map (the complete data model) | [`data-model.md`](data-model.md) |
 | Write contracts (power 1011, setpoint 1046) | [`contracts/write-control-contract.md`](contracts/write-control-contract.md) |
-| Security & the gate ladder (the "portails") | [`contracts/security-gates-contract.md`](contracts/security-gates-contract.md) |
+| Write protections: the funnel, allowlists, value rails | [`contracts/write-protections-contract.md`](contracts/write-protections-contract.md) |
 | Install, configure, verify, calibrate, troubleshoot | [`quickstart.md`](quickstart.md) |
-| State of the world + maintenance backlog for the next spec | [`tasks.md`](tasks.md) |
+| State of the world + the historical cleanup backlog | [`tasks.md`](tasks.md) |

@@ -570,7 +570,6 @@ if __name__ == "__main__":
             and _registers_019.WRITE_SETPOINT_FAMILY_MAP[2][1] == 1046
             and 300 in _registers_019.ALLOWED_WRITE_SETPOINT[1046]
             and 297 not in _registers_019.ALLOWED_WRITE_SETPOINT[1046]
-            and _registers_019.WRITE_SETPOINT_PROVEN is False
         )
     except ImportError:  # pragma: no cover — registers.py sits beside modbus.py
         ok = False

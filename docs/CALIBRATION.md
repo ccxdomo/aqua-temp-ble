@@ -1,8 +1,10 @@
 # Calibration & verification runbook — the push world
 
 This runbook explains how to verify (and, where needed, correct) the
-register mapping **live on a unit**, and how to open the integration's
-four owner-verified gates. The authoritative, current reference is
+register mapping **live on a unit**. The four owner-verified gates it
+used to open were removed in spec 022 — everything is active by
+default; the verifications below remain as optional confidence checks
+for a new or unknown unit. The authoritative, current reference is
 [`specs/020-integration-reference/`](../specs/020-integration-reference/)
 — start with its `quickstart.md` §4 (the calibration + verification
 sequence performed and recorded on the production unit on 2026-10-12)
@@ -65,13 +67,14 @@ AquaTemp probe: XX:XX:XX:XX:XX:XX block=2001 (pushed capture, start=2001 qty=45 
 Standalone (no HA): `python3 tools/smoke_client.py XX:XX:XX:XX:XX:XX`
 (read-only trigger + store dump, requires only `pip install bleak`).
 
-## 2. The verification sequence (the four gates)
+## 2. Verifying a new unit (optional)
 
 Every step below was performed and recorded on the production unit
-(2026-10-12). On a new unit, redo them in order — each step's evidence
-opens one gate:
+(2026-10-12). On a new unit, they are optional confidence checks — no
+gates to open, no options to flip (spec 022: everything is active by
+default); each step's expected outcome is stated with it:
 
-### 2.1 Temperatures → `push_temp_confirmed` [P done]
+### 2.1 Temperatures (photo comparison) [P done]
 
 1. Open the vendor app's parameter view (see *Extra aid* below) and
    photograph the T-family page; note the time.
@@ -80,25 +83,25 @@ opens one gate:
    `2046=… 2047=… … 2051=…`.
 3. Compare with the photo: values must match (a 0.1-0.2 °C drift between
    the photo and the read is fine; a different *pattern* is not).
-4. Match → check **push_temp_confirmed** (confirm step or options) →
-   the sensors show live values. Mismatch → correct the ONE line in
+4. Match → the mapping is confirmed; the sensors already show live
+   values (active by default). Mismatch → correct the ONE line in
    `registers.PUSHED_TEMPS` (a permuted T-window is a one-line edit) and
-   re-verify. Never check the box on a mismatch.
+   re-verify.
 
-### 2.2 Power/mode display → `push_control_confirmed` [P done]
+### 2.2 Power/mode display (app diff) [P done]
 
 1. With the app open, toggle the app's power slide once, then back.
 2. Capture before/after (probe or the `block push captured` log lines)
    and DIFF: register **2011** must flip 0↔1 with the slide; **2019**
    moves with the mode flow (0/4 observed). Reversibility is the pinning
    rule — a one-way change pins nothing.
-3. Match the app's display → check **push_control_confirmed** → the
-   climate appears: `hvac_mode` follows power alone (OFF/HEAT —
-   heat-only unit, spec 018), the target shows the setpoint mirror.
+3. Match the app's display → the mapping is confirmed; the climate tile
+   already follows (`hvac_mode` follows power alone — OFF/HEAT,
+   heat-only unit, spec 018; the target shows the setpoint mirror).
    Live alternative: the `push_stream` diagnostic's `control_candidates`
    attribute exposes the candidate raws with their evidence tags.
 
-### 2.3 Power control → `write_control` [P done]
+### 2.3 Power control (the write probe) [P done]
 
 Unit OFF, vendor app closed → press **Power write probe** (or call
 `aqua_temp_ble.power_write_probe`). The probe writes the vendor's own
@@ -106,16 +109,16 @@ ON frame, verifies mirror 2011 follows, writes OFF, verifies the revert,
 and logs ONE verdict line at WARNING. Expected:
 
 ```
-power write probe: EXECUTED + REVERSIBLE (mirror 2011 followed 0→1→0) — write char …
+power write probe: EXECUTED + REVERSIBLE (mirror 2011 followed 0→1→0) — the write is proven (spec 022: the control is active by default) — write char …
 ```
 
-That verdict is your evidence → check **write_control** in the options →
-the climate's Heat/Off buttons now really start and stop the pump. Any
-other verdict: leave the gate closed and read the verdict line — it
-always names the state and the remediation. The probe only writes the
-two disassembly-pinned frames and always aims to leave the unit OFF.
+That verdict is your evidence record — the climate's Heat/Off buttons
+already start and stop the pump (active by default, spec 022). Any other
+verdict: read the verdict line — it always names the state and the
+remediation. The probe only writes the two disassembly-pinned frames
+and always aims to leave the unit OFF.
 
-### 2.4 Setpoint control → `write_setpoint` [P done]
+### 2.4 Setpoint control (the two-phase probe) [P done]
 
 Press **Setpoint write probe** (or call
 `aqua_temp_ble.setpoint_write_probe`). Phase A writes the register's
@@ -125,12 +128,12 @@ verifies mirror 1046 follows, reverts, verifies again. Physical effect:
 the pool's heat target dips half a degree for ~2 minutes. Expected:
 
 ```
-setpoint write probe: EXECUTED + REVERSIBLE (mirror 1046 followed <S>→<T>→<S>) — write char …
+setpoint write probe: EXECUTED + REVERSIBLE (mirror 1046 followed <S>→<T>→<S>) — the write is proven (spec 022: the control is active by default) — write char …
 ```
 
-That verdict is your evidence → check **write_setpoint** → the target
-slider really sets the heat setpoint (10.0-40.0 °C, 0.5 steps; requests
-outside the range or off the step are refused loudly, never rounded).
+That verdict is your evidence record — the target slider already sets
+the heat setpoint (10.0-40.0 °C, 0.5 steps; requests outside the range
+or off the step are refused loudly, never rounded).
 
 ### 2.5 The setpoint home (why 1046)
 
@@ -213,7 +216,7 @@ page and note the time; the unit state must match during the probe. The
 pushed T-family raws (displayed ×10): T02 Inlet `170/0x00AA`-style
 values, the absent T01 → `32765/0x7FFD` (or `−9990/0xD8FA`), H04 →
 `1050/0x041A`, etc. Compare the probe dump against the photos — the
-match opens the temperature gate (§2.1). Temperatures drift —
+match confirms the mapping (§2.1). Temperatures drift —
 re-photograph the T page at probe time if the session is not
 back-to-back.
 

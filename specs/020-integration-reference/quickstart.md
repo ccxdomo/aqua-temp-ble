@@ -30,50 +30,55 @@ Settings → Devices & Services → Add Integration → **Aqua Temp BLE**.
 2. **Connection test** (~1 min): connect → subscribe → the vendor read
    as trigger → (if silent) the acknowledged-write probe → the push
    harvest. The unit's burst makes the test succeed in **push mode**.
-3. **Confirm step**: name the device; the two calibration checkboxes
-   ship unchecked (see §4 — do not check them blind).
+3. **Confirm step**: name the device — the screen also shows what the
+   test captured (power, heat target, inlet/outlet/ambient
+   temperatures), decoded live from the burst.
 
 The created entry stores `mode: "push"` — the read plane of this
 firmware generation.
 
 ## 3. What you see right after setup
 
-- Six temperature sensors + the `Push stream` diagnostic, all
-  `unknown`/empty until the temperature gate opens (§4).
-- No climate entity until the control gate opens (§4).
+Everything is active by default (spec 022) — no checkboxes, no
+activation step:
+
+- Six temperature sensors showing live values within the first poll
+  cycles, + the `Push stream` diagnostic.
+- The climate entity: OFF/HEAT display, the setpoint read, the
+  Heat/Off buttons and the target slider all working immediately.
 - Three diagnostic buttons (probe / power probe / setpoint probe).
 
-## 4. The calibration + verification sequence (the gates)
+## 4. Verifying a new unit (optional — the confidence checks)
 
-On the production unit every step below was performed and recorded
-(2026-10-12). On a new unit, redo them in order:
+Spec 022 removed the confirmation gates: everything is active by
+default, and the automatic write protections are unchanged. The four
+verifications below are how the production unit was proven
+(2026-10-12) — on a new or unknown unit they are worth redoing as
+plain confidence checks; nothing to check, no option to flip.
 
 1. **Temperatures** — run one poll, compare the six captured values
-   (log: `block push captured: … hex=…`, or the probe service on a high
-   block) against the vendor app's parameter view. Match → check
-   **push_temp_confirmed** in the integration options → sensors show
-   live values. [P done — the photo comparison matched]
+   (log: `block push captured: … hex=…`, or the probe button's store
+   dump) against the vendor app's parameter view. [P done — the photo
+   comparison matched]
 2. **Power/mode display** — toggle the app's power slide, watch the
    diff-revert land on the same registers (2011 power, 2019 mode);
-   re-verify against the app's display → check
-   **push_control_confirmed** → the climate appears (read-only:
-   OFF/HEAT follows power; the target shows the setpoint). [P done]
+   re-verify against the app's display. [P done]
 3. **Power control** — unit OFF, vendor app closed → run the **Power
    write probe** (button or `aqua_temp_ble.power_write_probe` service).
    Expected verdict line at WARNING:
    `power write probe: EXECUTED + REVERSIBLE (mirror 2011 followed 0→1→0)`
-   → check **write_control** in options → the climate's Heat/Off
-   buttons now really start and stop the pump. [P done — pump heard]
+   → the climate's Heat/Off buttons really start and stop the pump.
+   [P done — pump heard]
 4. **Setpoint control** — run the **Setpoint write probe**
    (`aqua_temp_ble.setpoint_write_probe`). Expected verdict line:
    `setpoint write probe: EXECUTED + REVERSIBLE (mirror 1046 followed S→T→S)`
-   → check **write_setpoint** → the target slider sets the heat
-   setpoint (10.0–40.0 °C, 0.5 steps; out-of-range/off-step refused).
-   [P done — mirror followed 300→295→300]
+   → the target slider sets the heat setpoint (10.0–40.0 °C, 0.5
+   steps; out-of-range/off-step refused). [P done — mirror followed
+   300→295→300]
 
-Options apply without a restart. A verdict other than
-`EXECUTED + REVERSIBLE` means: leave the gate closed and read the
-verdict line — it always names the state and the remediation.
+A verdict other than `EXECUTED + REVERSIBLE` means: do not trust that
+surface on that unit yet — read the verdict line, it always names the
+state and the remediation.
 
 ## 5. Daily operation
 
@@ -110,7 +115,7 @@ verdict line — it always names the state and the remediation.
 |---|---|---|
 | `cannot_connect` in the flow / unavailable entities | the single BLE link is held (usually the vendor app) | close the vendor app; power-cycle the unit if stale |
 | `push stream silent after trigger` | no burst within the window | distance/radio; the cycle retries |
-| Entities `unknown`/absent | a gate is closed (that is the honesty rule) | do §4's verification for that gate |
+| Entities `unknown`/unavailable | the honesty rules, never a bug: T01 is sentinel (sensor absent), a block is missing, or the store is stale (freshness) | expected behaviour — no stale value is shown; the `Push stream` diagnostic and the probe button's store dump show the raws |
 | `unconfirmed` write | the fresh mirror never came back | check the panel; the notification/OFF case tells you what to do |
 | Log lines at WARNING | the deliberate evidence lines (probe verdicts, build marker, block captures) | read them — they are the diagnostics |
 | Per-cycle `trigger read timed out as expected` at INFO | normal-world heartbeat (verbose; cleanup backlog) | harmless — see tasks.md |

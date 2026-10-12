@@ -312,7 +312,7 @@ def test_query_cycle_timeout_trigger_harvests_snapshot() -> None:
     coord = _make_coordinator(
         client,
         data={"mode": "push"},
-        options={"poll_interval": 30, "push_temp_confirmed": True},
+        options={"poll_interval": 30},
     )
     cap, logger, old_level = _capture_logs()
     try:
@@ -329,12 +329,11 @@ def test_query_cycle_timeout_trigger_harvests_snapshot() -> None:
     assert data.mode == "push"
     assert data.registers[2047] == 140     # the second capture's raws
     assert data.registers[2046] == 32765   # the T01 sentinel raw stays raw
-    assert data.push_confirmed is True
     assert data.push_counts == {2046: 3}
     assert data.push_last_seen == 1000.0
     assert data.push_first_seen == 990.0
-    # no pushed home [P/V] for control keys: the listen snapshot is
-    # from_pushes, unchanged (contract 013 §4.4)
+    # no 2001 capture in the store: the control keys decode None (the
+    # absent-block honesty rule; spec 022: the decode is unconditional)
     assert data.power is None
     assert data.hvac_mode is None
     assert data.target_temp is None
@@ -406,8 +405,9 @@ def test_query_cycle_answered_trigger_merges_base_data() -> None:
     """AC-4 (FR-2, contract 014 §5): the trigger read COMPLETES (the
     revival world, never observed) => the from_merged snapshot: typed
     fields from the base answer (from_regs semantics — base wins,
-    contract 013 §4.2), the confirmed T-block raws merged into
-    `registers` (disjoint windows, collision-free [P]), mode "push"
+    contract 013 §4.2), the T-block raws merged into
+    `registers` (disjoint windows, collision-free [P] — spec 022:
+    the merge is unconditional), mode "push"
     preserved, and the revival WARNING logged ONCE per HA session —
     the second cycle does not re-log."""
     coordinator._logged_trigger_answered.clear()  # module state isolation
@@ -418,7 +418,7 @@ def test_query_cycle_answered_trigger_merges_base_data() -> None:
     coord = _make_coordinator(
         client,
         data={"mode": "push"},
-        options={"poll_interval": 30, "push_temp_confirmed": True},
+        options={"poll_interval": 30},
     )
     cap, logger, old_level = _capture_logs()
     try:
@@ -441,10 +441,10 @@ def test_query_cycle_answered_trigger_merges_base_data() -> None:
     assert data1.ambient_temp == -12.5
     assert data1.fault_code == 0
     assert data1.firmware == "2.2.1.2040"
-    # the disjoint-window merge: base regs + confirmed T-block raws [P]
+    # the disjoint-window merge: base regs + the T-block raws [P]
+    # (spec 022: the merge is unconditional — the gate is gone)
     assert data1.registers == {**BASE_REGS, **T_WINDOW_RAWS}, data1.registers
     assert data1.mode == "push"          # the mode stays (contract 014 §5.3)
-    assert data1.push_confirmed is True
     assert data1.push_counts == {2046: 2}
     assert data1.push_first_seen == 990.0
     assert data1.push_last_seen == 1000.0
@@ -459,11 +459,12 @@ def test_query_cycle_answered_trigger_merges_base_data() -> None:
     assert data2.mode == "push"
 
 
-def test_query_cycle_answered_trigger_unconfirmed_withholds_raws() -> None:
-    """AC-4 (FR-2, contract 013 §4.3 unchanged): an UNCONFIRMED entry
-    still merges, but the pushed raws are WITHHELD from `registers` —
-    the honesty gate applies to pushed raws only; the base values are
-    base-pinned registers, not unconfirmed pushes."""
+def test_query_cycle_answered_trigger_merges_pushed_raws() -> None:
+    """AC-4 (spec 022, the inversion of the unconfirmed-withholding
+    world): with NO options set the answered trigger still merges and
+    the pushed raws ALWAYS join `registers` — the withholding gate is
+    dead; the base values are base-pinned registers (the base wins for
+    shared quantities)."""
     coordinator._logged_trigger_answered.clear()  # module state isolation
     client = FakeQueryClient(
         captures={2046: _capture(2046, T_WINDOW_RAWS)},
@@ -474,11 +475,10 @@ def test_query_cycle_answered_trigger_unconfirmed_withholds_raws() -> None:
     )
     with _ClockPatch(1000.0):
         data = asyncio.run(coord._async_update_data())
-    assert data.registers == dict(BASE_REGS), data.registers  # the gate
-    assert 2047 not in data.registers
-    assert data.push_confirmed is False
-    assert data.push_counts == {2046: 1}   # the diagnostic still counts
-    assert data.power is True              # base values unaffected by the gate
+    assert data.registers == {**BASE_REGS, **T_WINDOW_RAWS}, data.registers
+    assert data.registers[2047] == 140    # the pushed raw merged (unconditional)
+    assert data.push_counts == {2046: 1}
+    assert data.power is True              # base values win (contract 013 §4.2)
     assert data.mode == "push"
 
 
@@ -509,7 +509,7 @@ def main() -> int:
         test_query_cycle_silence_after_trigger_fails_honestly,
         test_query_cycle_trigger_transport_failure,
         test_query_cycle_answered_trigger_merges_base_data,
-        test_query_cycle_answered_trigger_unconfirmed_withholds_raws,
+        test_query_cycle_answered_trigger_merges_pushed_raws,
         test_query_cycle_revival_precedes_freshness_failure,
     ]
     failures = 0
