@@ -187,6 +187,100 @@ PUSHED_MODE_VALUE_TO_NAME: dict[int, str] = {
     4: "heat",
 }
 
+# --- pushed fault plane (spec 023, research 023 §1) ---------------------
+# The fault word — PINNED by the owner's E03 diff-revert (2026-10-12):
+# healthy 0 -> fault 256 (0x0100, bit 8) while the panel displayed
+# E03 -> 0 again after the clear. The E03 frame is CRC-verified
+# byte-exact (research 023 §1.2); the register sits in the 2046-block
+# zero tail (offset (2074-2046)*2 = 56 in the block data). Read-only
+# forever: 2074 is in NO write allowlist (spec 003 §6 / contracts
+# 016 §4 / 019 §2.2 — the funnel refuses it).
+REG_PUSHED_FAULT = 2074  # [P owner diff-revert 2026-10-12]
+
+# The PROVEN raw<->code observations — DATA, one row per recorded
+# live diff-revert (contract 023 §3). Today: exactly one. raw 256
+# (bit 8) was captured while the panel displayed E03. Extending the
+# map = one new recorded observation + one row (quickstart 023 §4).
+# Bit-to-FLAG-NAME tables are FORBIDDEN here (the ten-flag list order
+# is an [A] hypothesis, research 023 §2 — never in entity code).
+PUSHED_FAULT_CODE_MAP: dict[int, str] = {
+    256: "E03",  # [P owner run 2026-10-12 — panel E03 while raw 256]
+}
+
+# The APP-oracle code labels [P owner, app display, 2026-10-12]: the
+# vendor's own app NAMES the panel codes — while the E03 fault
+# lived, it displayed "E03 probleme de debit d'eau" (water flow
+# problem). The label is therefore PROVEN for the CODE E03, by the
+# app itself — the app IS the vendor's documentation for code
+# meanings (upgrading research 023 Part 8's [V] "what E03 means"
+# for the CODE level); keyed by the panel code (the app names
+# codes, never bits). This is a CODE-label record, NOT a bit-name
+# table, and it resolves NOTHING about the bits: which protection
+# BIT 8 names stays OPEN [V/A] — the app's label ties the E03 code
+# to a water-flow fault, while the disassembly's ten-flag list order
+# would make bit 8 the *outlet water temp sensor fault* [A, research
+# 023 §2.3]; the two readings conflict and are NOT adjudicated here.
+# The next live fault diff adjudicates: the bit that moves + the
+# code the app displays (the spec 022 §3 protocol, now proven by the
+# E03 run — the app IS an oracle for code names).
+PUSHED_FAULT_CODE_APP_LABELS: dict[str, str] = {
+    "E03": "water flow problem",  # [P owner, app display 2026-10-12]
+}
+
+
+def decode_fault_flag(raw: int | None) -> bool | None:
+    """The fault word -> fault present; None when the register is absent.
+
+    The diff-revert rule (contract 023 §2): 0 = clear, non-zero = fault
+    present. Bit semantics are NOT decoded (unproven); only the binary
+    truth is.
+    """
+    if raw is None:
+        return None
+    return raw != 0
+
+
+def fault_code(raw: int | None) -> str | None:
+    """The panel-code string for a fault raw; None when clear/absent.
+
+    Only PROVEN observations map (PUSHED_FAULT_CODE_MAP); every other
+    non-zero raw reads 'unknown code (raw N)' — the contract 022 §3
+    rule against guessed tables, carried into entity code.
+    """
+    if raw is None or raw == 0:
+        return None
+    return PUSHED_FAULT_CODE_MAP.get(raw, f"unknown code (raw {raw})")
+
+
+def fault_code_app_label(raw: int | None) -> str | None:
+    """The vendor app's own label for a fault raw's code; None when
+    clear, absent, unmapped or never app-recorded.
+
+    Resolves raw -> code (the PROVEN map) -> the app's label
+    (PUSHED_FAULT_CODE_APP_LABELS). The app NAMES codes [P owner,
+    app display 2026-10-12]; it never names bits — this is a code
+    label, NOT a bit name (contract 023 §3's bit-name ban stands),
+    and a code with no recorded app label carries none (never
+    guessed).
+    """
+    if raw is None or raw == 0:
+        return None
+    code = PUSHED_FAULT_CODE_MAP.get(raw)
+    if code is None:
+        return None
+    return PUSHED_FAULT_CODE_APP_LABELS.get(code)
+
+
+def fault_set_bits(raw: int | None) -> list[int]:
+    """The indices of the set bits (arithmetic only, no names).
+
+    Exists so the NEXT fault observation records its bit pattern with
+    zero tooling (the opportunistic map protocol, quickstart 023 §4).
+    """
+    if raw is None:
+        return []
+    return [i for i in range(16) if raw & (1 << i)]
+
 # FR-10: the diagnostics candidates (address -> evidence tag). The
 # push_stream diagnostic exposes these raws gate-independently so the
 # owner can re-run the diff without a terminal (quickstart 015 §1);
@@ -209,6 +303,11 @@ PUSH_CONTROL_CANDIDATES: dict[int, str] = {
     1051: "setpoint candidate [A-weak] — Heating set / Auto. Set?",
     1055: "setpoint candidate [A-weak] — Max. cool?",
     1068: "setpoint candidate [A-weak] — Auto. set?",
+    # Spec 023 (FR-5): the pinned fault home joins the candidates —
+    # the 2011/2019/1046 pinned-homes precedent (a pinned home stays
+    # observable for diffs; the Push stream attributes and the probe
+    # labels pick it up automatically).
+    2074: "fault word [P owner diff-revert 2026-10-12 — spec 023]",
 }
 
 
@@ -607,6 +706,13 @@ KNOWN_LABELS.update({
     1012: "Mode (WRITE plane) [P shape / A semantics 016]",
     1013: "Mode pair (WRITE plane) [P shape / A semantics 016]",
     1076: "Mute (WRITE plane) [P frame / V semantics 016]",
+})
+
+# Spec 023 (FR-5): the fault word's probe label — the pushed fault
+# home (the owner's E03 diff-revert). Read-only forever: 2074 sits in
+# NO write allowlist (the funnel refuses it, contract 023 §5).
+KNOWN_LABELS.update({
+    2074: "Fault word (bitfield) [P owner diff-revert 2026-10-12]",
 })
 
 # Documentation-only mirror of the panel observation (2026-10,

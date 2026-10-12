@@ -167,9 +167,10 @@ def test_pushed_control_constants_transcribed() -> None:
     assert registers.PUSHED_MODE_VALUE_TO_NAME == {4: "heat"}
     # FR-10 + spec 022 FR-8: the diagnostics candidates (the homes +
     # the old candidates + the ladder five + the 2017/2018 fault-hunt
-    # wildcards), each with its evidence tag.
+    # wildcards), each with its evidence tag. Spec 023 FR-5 adds the
+    # pinned fault word 2074 (the owner's E03 diff-revert).
     assert set(registers.PUSH_CONTROL_CANDIDATES) == {
-        2011, 2019, 2012, 2017, 2018, 1046, 1049, 1051, 1055, 1068,
+        2011, 2019, 2012, 2017, 2018, 1046, 1049, 1051, 1055, 1068, 2074,
     }
     # the control plane window (FR-11d): the two pushed series.
     assert registers.PUSH_CONTROL_FIRST == 1001

@@ -8,9 +8,12 @@ DOMAIN = "aqua_temp_ble"
 
 # Platform names — identical to homeassistant.const.Platform values. Plain
 # strings are used on purpose (see module docstring). The binary_sensor
-# platform was pruned in the spec-021 cleanup: its registers were never
-# pinned and no pushed home exists, so no binary entity can ever be created.
-PLATFORMS = ["climate", "sensor", "button"]
+# platform was pruned in the spec-021 cleanup (registry placeholders with
+# no pinned register); spec 023 returns it for the ONE diff-proven binary
+# (the Fault word 2074 — the owner's E03 diff-revert). No other binary
+# entity exists: there is no registry and no placeholder — the platform
+# file creates exactly one literal entity per push entry.
+PLATFORMS = ["climate", "sensor", "button", "binary_sensor"]
 
 # GATT characteristics — the vendor app's OWN buckets, read from the
 # disassembled Dart session manager (research 010 §1: the discovery

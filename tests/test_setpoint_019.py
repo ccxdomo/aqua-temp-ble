@@ -333,9 +333,10 @@ def test_labels_corrected() -> None:
     # spec 022 FR-8: the 2017/2018 fault-hunt wildcards join the set
     assert "spec 022 fault hunt" in registers.PUSH_CONTROL_CANDIDATES[2017]
     assert "spec 022 fault hunt" in registers.PUSH_CONTROL_CANDIDATES[2018]
-    # the candidate key set (spec 022: + the 2017/2018 wildcards)
+    # the candidate key set (spec 022: + the 2017/2018 wildcards;
+    # spec 023 FR-5: + the pinned fault word 2074)
     assert set(registers.PUSH_CONTROL_CANDIDATES) == {
-        2011, 2019, 2012, 2017, 2018, 1046, 1049, 1051, 1055, 1068,
+        2011, 2019, 2012, 2017, 2018, 1046, 1049, 1051, 1055, 1068, 2074,
     }
 
 
