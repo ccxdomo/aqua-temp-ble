@@ -38,3 +38,23 @@ probe_registers:
               value: "2001"
             - label: "High block 2046-2090"
               value: "2046"
+power_write_probe:
+  name: Power write probe
+  description: >-
+    Run the power-write proof probe (spec 016): sends the vendor's own
+    power-ON frame, verifies the pushed mirror register 2011 follows it,
+    then sends the power-OFF frame and verifies the revert. One WARNING
+    verdict line is logged with the outcome. The unit must be OFF and the
+    vendor app must be closed (the unit accepts a single Bluetooth
+    connection). This is a diagnostic measurement, not a control surface:
+    it always returns the unit to OFF when it can, and the verdict line
+    tells you when it could not.
+  fields:
+    device_id:
+      name: Device
+      description: >-
+        Device to probe. Leave empty to probe every configured Aqua Temp unit.
+      required: false
+      selector:
+        device:
+          integration: aqua_temp_ble

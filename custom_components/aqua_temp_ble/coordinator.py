@@ -24,7 +24,12 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from . import const, modbus, registers
-from .aqua_client import AquaTempBleClient, AquaTempError, AquaTempTimeoutError
+from .aqua_client import (
+    AquaTempBleClient,
+    AquaTempError,
+    AquaTempTimeoutError,
+    exc_chain,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -612,11 +617,15 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
 
     async def async_write_register(self, address: int, value: int) -> None:
         """Serialize a write against reads, then confirm with one refresh."""
-        # FR-9: the single write funnel guard — before any lock or I/O, so no
-        # code path can ever write outside {8, 13, 14} (+19-21 behind the
-        # WRITE_MODE_SETPOINT_TOO switch). Installer settings (H/R/P) and the
-        # high blocks 1001-2090 are never writable (spec 003 §6).
-        registers.ensure_writable(address)
+        # FR-9 + spec 016 FR-3: the single write funnel guard — before any
+        # lock or I/O, so no code path can ever write outside {8, 13, 14}
+        # (+19-21 behind the WRITE_MODE_SETPOINT_TOO switch) or, behind
+        # WRITE_CONTROL_PROVEN, the control allowlist (1011 with 0/1).
+        # The VALUE threads through to the guard (spec 016 T3) so the
+        # control plane's value discipline is enforced at the funnel.
+        # Installer settings (H/R/P) and the high blocks 1001-2090 are
+        # never writable (spec 003 §6).
+        registers.ensure_writable(address, value)
         async with self._io_lock:
             await self.client.write_registers(address, [value])
         await self.async_request_refresh()  # debounced confirmation read
@@ -742,3 +751,280 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
             _LOGGER.info("  raw: %s", raw.hex())
             response["raw"] = raw.hex()
         return {address: response}
+
+    # ------------------------------------------------ spec 016 power probe
+    async def async_power_write_probe(self) -> dict[str, Any]:
+        """The power-write probe — spec 016 FR-4's diff-revert proof
+        instrument (contract 016 §3): baseline -> write the pinned ON
+        frame -> the pushed mirror 2011 must follow to 1 -> write the
+        pinned OFF frame -> the mirror must revert to 0 -> ONE verdict
+        line at WARNING (the operator's log page keeps WARNING+,
+        contract 012 §2).
+
+        A MEASUREMENT INSTRUMENT, not a control surface (FR-6): it
+        writes ONLY the two disassembly-pinned frames
+        (registers.WRITE_FRAME_POWER_*), ONLY after the mandatory
+        baseline gate confirms the unit is off (it never toggles an
+        unverified state), and it always aims to leave the unit OFF —
+        a failed or unconfirmed revert is never silent: the verdict
+        line carries the remediation ("turn the unit OFF from the
+        vendor app or the panel", contract 016 §7). The climate stays
+        read-only regardless (FR-7): this method is the only code that
+        may write 1011 before the live proof opens
+        WRITE_CONTROL_PROVEN (contract 016 §4 — the funnel guard is
+        NOT used by the probe; the frames go through the client's own
+        pinned seam, contract 016 §5).
+
+        Single-flight (the _io_lock, FR-4 step 9); disconnects on
+        completion or failure (step 8, the push-mode convention).
+        Non-timeout transport failures (connect, trigger) propagate
+        to the caller — the service reports them; every stage
+        observation and the verdict log at WARNING (the evidence
+        discipline).
+
+        Returns the stage dict (the mirror observations with raws +
+        times, the frames sent, the resolved write UUID — FR-6).
+        """
+        address = self.config_entry.data["address"]
+        write_uuid = getattr(self.client, "write_uuid", None) or const.UUID_WRITE
+        mirror_addr = registers.READ_MIRROR_POWER
+        result: dict[str, Any] = {
+            "verdict": "no-report",
+            "stage": "baseline",
+            "write_uuid": write_uuid,
+            "frames_sent": [],
+            "mirror": {},
+        }
+        t_probe = _now()
+
+        def _rel(ts: float) -> float:
+            return round(ts - t_probe, 1)
+
+        def _finish(verdict: str, detail: str) -> dict[str, Any]:
+            """FR-4 step 6: set the verdict, log ONE line at WARNING —
+            the resolved write UUID rides in it (FR-6) — and return
+            the stage dict."""
+            result["verdict"] = verdict
+            line = f"power write probe: {detail} — write char {write_uuid}"
+            result["verdict_line"] = line
+            _LOGGER.warning("%s", line)
+            return result
+
+        async with self._io_lock:
+            try:
+                if not self.client.is_connected:
+                    await self.client.connect(
+                        pair=self.config_entry.options.get(
+                            "pair_on_connect", const.DEFAULT_PAIR_ON_CONNECT
+                        )
+                    )
+                # -- step 1: the baseline — trigger + fresh harvest -----
+                t_mark = _now()
+                await self._probe_trigger()
+                cap = await self._probe_fresh_control(t_mark)
+                if cap is None:
+                    return _finish("no-report", "no-report (no fresh 2001 block)")
+                mirror0 = cap.registers.get(mirror_addr)
+                if mirror0 is None:
+                    return _finish("no-report", "no-report (no fresh 2001 block)")
+                result["mirror"]["baseline"] = {
+                    "raw": mirror0,
+                    "t": _rel(cap.last_seen),
+                }
+                _LOGGER.warning(
+                    "power write probe [%s]: baseline: mirror %d = %d (t+%.1fs)",
+                    address,
+                    mirror_addr,
+                    mirror0,
+                    result["mirror"]["baseline"]["t"],
+                )
+                # -- step 2: the mandatory baseline gate (FR-6) ---------
+                if mirror0 != 0:
+                    return _finish(
+                        "refused-baseline-not-off",
+                        f"refused-baseline-not-off (mirror {mirror_addr} = "
+                        f"{mirror0}) — nothing was written",
+                    )
+                # -- step 3: the ON write (without-response parity) ---
+                result["stage"] = "on-write"
+                t_on = _now()
+                _LOGGER.warning(
+                    "power write probe [%s]: sending power-ON frame %s on %s",
+                    address,
+                    registers.WRITE_FRAME_POWER_ON,
+                    write_uuid,
+                )
+                try:
+                    await self.client.write_probe_frame(
+                        bytes.fromhex(registers.WRITE_FRAME_POWER_ON)
+                    )
+                except Exception as exc:  # noqa: BLE001 — the chain IS the datum
+                    return _finish("att-error", f"att-error: {exc_chain(exc)}")
+                result["frames_sent"].append(registers.WRITE_FRAME_POWER_ON)
+                # -- step 4: harvest after ON (the robust order) --------
+                result["stage"] = "on-harvest"
+                cap = await self._probe_fresh_control(t_on, allow_retry=True)
+                if cap is None:
+                    return _finish(
+                        "no-report",
+                        "no-report (no fresh 2001 block after ON) — the "
+                        "unit's state is UNCONFIRMED: check the panel; if it "
+                        "is on, turn the unit OFF from the vendor app or "
+                        "the panel",
+                    )
+                mirror1 = cap.registers.get(mirror_addr)
+                if mirror1 is None:
+                    return _finish(
+                        "no-report", "no-report (no fresh 2001 block after ON)"
+                    )
+                result["mirror"]["after_on"] = {
+                    "raw": mirror1,
+                    "t": _rel(cap.last_seen),
+                }
+                _LOGGER.warning(
+                    "power write probe [%s]: after ON: mirror %d = %d (t+%.1fs)",
+                    address,
+                    mirror_addr,
+                    mirror1,
+                    result["mirror"]["after_on"]["t"],
+                )
+                if mirror1 != 1:
+                    return _finish(
+                        "not-executed",
+                        f"not-executed (mirror {mirror_addr} stayed {mirror1} "
+                        "after ON, expected 1)",
+                    )
+                # -- step 5: the OFF write + the revert check ----------
+                result["stage"] = "off-write"
+                t_off = _now()
+                _LOGGER.warning(
+                    "power write probe [%s]: sending power-OFF frame %s on %s",
+                    address,
+                    registers.WRITE_FRAME_POWER_OFF,
+                    write_uuid,
+                )
+                try:
+                    await self.client.write_probe_frame(
+                        bytes.fromhex(registers.WRITE_FRAME_POWER_OFF)
+                    )
+                except Exception as exc:  # noqa: BLE001 — the chain IS the datum
+                    return _finish(
+                        "att-error",
+                        f"att-error: {exc_chain(exc)} — the unit may still "
+                        "be ON: turn the unit OFF from the vendor app or "
+                        "the panel",
+                    )
+                result["frames_sent"].append(registers.WRITE_FRAME_POWER_OFF)
+                result["stage"] = "off-harvest"
+                cap = await self._probe_fresh_control(t_off, allow_retry=True)
+                if cap is None:
+                    return _finish(
+                        "no-report",
+                        "no-report (no fresh 2001 block after OFF) — the "
+                        "unit's final state is UNCONFIRMED: check the "
+                        "panel; if it is on, turn the unit OFF from the "
+                        "vendor app or the panel",
+                    )
+                mirror2 = cap.registers.get(mirror_addr)
+                if mirror2 is None:
+                    return _finish(
+                        "no-report", "no-report (no fresh 2001 block after OFF)"
+                    )
+                result["mirror"]["after_off"] = {
+                    "raw": mirror2,
+                    "t": _rel(cap.last_seen),
+                }
+                _LOGGER.warning(
+                    "power write probe [%s]: after OFF: mirror %d = %d (t+%.1fs)",
+                    address,
+                    mirror_addr,
+                    mirror2,
+                    result["mirror"]["after_off"]["t"],
+                )
+                if mirror2 != 0:
+                    return _finish(
+                        "not-reversible",
+                        f"not-reversible (mirror {mirror_addr} stayed "
+                        f"{mirror2} after OFF, expected 0) — the unit is "
+                        "still ON: turn the unit OFF from the vendor app "
+                        "or the panel",
+                    )
+                # -- step 6: the verdict -------------------------------
+                result["stage"] = "done"
+                return _finish(
+                    "executed+reversible",
+                    f"EXECUTED + REVERSIBLE (mirror {mirror_addr} followed "
+                    "0→1→0) — evidence for phase 2 (WRITE_CONTROL_PROVEN)",
+                )
+            finally:
+                # step 8: disconnect on completion or failure (the
+                # push-mode convention) — even when an AquaTempError
+                # propagates to the caller.
+                try:
+                    await self.client.disconnect()
+                except Exception:  # noqa: BLE001
+                    _LOGGER.debug("probe disconnect failed", exc_info=True)
+
+    async def _probe_trigger(self) -> None:
+        """ONE vendor base read — the proven trigger (spec 014 §6,
+        FR-4 step 1): the frame the unit answers with its block burst.
+        AquaTempTimeoutError is the EXPECTED world (the answer IS the
+        burst — spec 014 M-4); any other AquaTempError is an honest
+        transport failure: logged at WARNING (the stage evidence),
+        re-raised for the caller (the service/button) to report."""
+        address = self.config_entry.data["address"]
+        try:
+            await self.client.read_registers(
+                registers.BASE_BLOCK_START, registers.BASE_BLOCK_COUNT
+            )
+        except AquaTempTimeoutError:
+            _LOGGER.debug(
+                "power write probe [%s]: trigger timed out as expected "
+                "(the answer is the block burst, spec 014 M-4)",
+                address,
+            )
+        except AquaTempError as err:
+            _LOGGER.warning(
+                "power write probe [%s]: trigger read failed: %s", address, err
+            )
+            raise
+
+    async def _probe_fresh_control(
+        self, before: float, *, allow_retry: bool = False
+    ) -> Any:
+        """The fresh-mirror harvest (FR-4 step 4): wait for a 2001-block
+        push FRESHER than `before` — the oracle must postdate the
+        action it verifies (contract 016 §3's diff), so
+        harvest_pushes's PRESENCE semantics (spec 013) are not enough:
+        a capture from before the write would satisfy it instantly.
+        The wait polls the same store view (client.pushed_blocks) on
+        the harvest cadence (0.05 s).
+
+        The robust order: with `allow_retry`, when the first window
+        stays empty ONE base-read trigger goes out (the write itself
+        may not have woken the report — research 016 §4 Q4) and one
+        more wait follows."""
+        cap = await self._wait_fresh_control(before)
+        if cap is None and allow_retry:
+            _LOGGER.warning(
+                "power write probe [%s]: no fresh block after the write "
+                "— sending ONE base-read trigger (FR-4 step 4)",
+                self.config_entry.data["address"],
+            )
+            await self._probe_trigger()
+            cap = await self._wait_fresh_control(before)
+        return cap
+
+    async def _wait_fresh_control(self, before: float) -> Any:
+        """Poll the pushed-block store for a 2001 capture fresher than
+        `before` (monotonic ts), bounded by const.PROBE_MIRROR_TIMEOUT.
+        Returns the capture, or None when the window stayed empty."""
+        timeout = const.PROBE_MIRROR_TIMEOUT
+        deadline = _now() + timeout
+        while True:
+            cap = self.client.pushed_blocks.get(registers.PUSH_CONTROL_BLOCK_START)
+            if cap is not None and cap.last_seen > before:
+                return cap
+            if _now() >= deadline:
+                return None
+            await asyncio.sleep(0.05)

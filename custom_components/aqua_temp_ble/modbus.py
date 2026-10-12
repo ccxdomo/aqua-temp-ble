@@ -85,6 +85,27 @@ def build_write_registers(start: int, values: list[int]) -> bytes:
     return _frame(FC_WRITE_MULTI, payload)
 
 
+def build_write_control(address: int, value: int) -> bytes:
+    """FC10 single-register control write — the vendor app's home-screen
+    command shape (spec 016 FR-2):
+        63 10 <addr:2> 0001 02 <val:2> <crc:2>   (11 bytes)
+    qty is always 1 and bytecount always 02 — the disassembled
+    power/mute builder shape (research 016 §1.1/§2).
+    build_write_control(1011, 1) -> 631003f30001020001f131  [P — research 016 §2.1]
+    build_write_control(1011, 0) -> 631003f3000102000030f1
+
+    NORMATIVE note: this builder is for the single-register control
+    frames only; build_write_registers stays the generic funnel for
+    the base-block writes. The two pinned power frames live in
+    registers.WRITE_FRAME_POWER_* and are asserted byte-equal to this
+    builder's output by the self-test below and the spec-016 suite
+    (NFR-2's two-sources cross-check).
+    """
+    payload = struct.pack(">HHB", address, 1, 2)
+    payload += struct.pack(">H", value & 0xFFFF)
+    return _frame(FC_WRITE_MULTI, payload)
+
+
 def expected_response_length(buf: bytes) -> int | None:
     """Total Modbus frame length implied by the first bytes, or None if unknown.
 
@@ -434,6 +455,43 @@ if __name__ == "__main__":
     patho = bytes.fromhex("631020000001024b")
     ok = patho[6] == 0x02 and block_response_length(patho) == 11
     _check("block_response_length: pathological echo (CRC_lo == 2*qty) -> 11", ok, failures)
+
+    # 13. Spec 016 — the control-frame builder + the four pinned vectors
+    #     (research 016 §2.1: the power pair from the app's own
+    #     home-screen power handler disassembly, register 0x03F3 = 1011;
+    #     the mute pair from the mute handler, register 0x0434 = 1076).
+    CONTROL_VECTORS = [
+        ("power ON", 1011, 1, "631003f30001020001f131"),
+        ("power OFF", 1011, 0, "631003f3000102000030f1"),
+        ("mute ON", 1076, 1, "6310043400010200019746"),
+        ("mute OFF", 1076, 0, "6310043400010200005686"),
+    ]
+    for name, addr, val, hexstr in CONTROL_VECTORS:
+        frame = bytes.fromhex(hexstr)
+        ok = (
+            len(frame) == 11
+            and validate_crc(frame)
+            and build_write_control(addr, val) == frame
+        )
+        _check(f"control frame {name}: {hexstr}", ok, failures)
+    # NFR-2's two-sources cross-check: the builder reproduces
+    # registers' pinned strings exactly (a mismatch fails the self-
+    # test). registers is stdlib-only, so the standalone self-test can
+    # import it directly (this file's script directory).
+    try:
+        import registers as _registers
+
+        ok = (
+            _registers.WRITE_REG_POWER == 1011
+            and _registers.READ_MIRROR_POWER == 2011
+            and build_write_control(_registers.WRITE_REG_POWER, 1)
+            == bytes.fromhex(_registers.WRITE_FRAME_POWER_ON)
+            and build_write_control(_registers.WRITE_REG_POWER, 0)
+            == bytes.fromhex(_registers.WRITE_FRAME_POWER_OFF)
+        )
+    except ImportError:  # pragma: no cover — registers.py sits beside modbus.py
+        ok = False
+    _check("build_write_control == registers.WRITE_FRAME_* (NFR-2)", ok, failures)
 
     # 12. parse_block_response error paths (plan 008 §1.1 validation order)
     corrupt_block = bytearray(frame1001)

@@ -97,6 +97,16 @@
           "description": "Register block to read. High blocks are experimental."
         }
       }
+    },
+    "power_write_probe": {
+      "name": "Power write probe",
+      "description": "Runs the power-write proof probe: sends the vendor's own power-ON frame, verifies the pushed mirror register 2011 follows it, then sends the power-OFF frame and verifies the revert. One WARNING verdict line is logged with the outcome. The unit must be OFF and the vendor app must be closed. Diagnostic measurement, not a control surface.",
+      "fields": {
+        "device_id": {
+          "name": "Device",
+          "description": "Device to probe. Leave empty to probe every configured Aqua Temp unit."
+        }
+      }
     }
   }
 }

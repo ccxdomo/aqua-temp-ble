@@ -2443,6 +2443,32 @@ class AquaTempBleClient:
             raise AquaTempResponseError(exc) from exc
         _LOGGER.debug("write echo OK: %s", echo.hex())
 
+    async def write_probe_frame(self, frame: bytes) -> None:
+        """The power-write probe's ONLY send path (spec 016 FR-4/FR-6,
+        contract 016 §5): the SAME `_write_frame` seam as every other
+        write (the 011-suite override point), the session's resolved
+        write mode — without-response app parity on the production
+        ff03 bucket (spec 010 §2.3; the acknowledged path is never
+        used by the probe).
+
+        Safety rail (FR-6): only the two PINNED power frames
+        (registers.WRITE_FRAME_POWER_ON/OFF — the disassembly-proven
+        bytes) may ever pass; anything else raises ValueError BEFORE a
+        byte goes out. Never used by the poll path or the classic write
+        funnel — the probe (coordinator.async_power_write_probe) is the
+        only caller (spec 016 FR-7).
+        """
+        frame = bytes(frame)
+        if frame.hex() not in (
+            registers.WRITE_FRAME_POWER_ON,
+            registers.WRITE_FRAME_POWER_OFF,
+        ):
+            raise ValueError(
+                f"frame {frame.hex()!r} is not a pinned power frame "
+                "(spec 016 FR-6 — the probe writes only the pinned vectors)"
+            )
+        await self._write_frame(frame)
+
     # ------------------------------------------------- spec 013 harvest
     async def harvest_pushes(
         self,

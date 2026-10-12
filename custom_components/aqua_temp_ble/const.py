@@ -96,6 +96,15 @@ PAIR_ENABLE_PROP = "pair"
 PUSH_HARVEST_TIMEOUT = 30.0
 PUSH_HARVEST_STARTS = frozenset({1001, 1046, 2001, 2046})
 
+# Spec 016 (the power-write probe): the fresh-mirror wait window after
+# a trigger or write. The unit answers every request with its block
+# burst (spec 014 M-4, six runs) and all four observed starts arrive
+# within two consecutive 8 s request windows (~16 s, research 013
+# §5.4) — 20 s is the wide-margin bound for ONE fresh 2001 block
+# (contract 016 §3). The probe reads this at CALL time, never at
+# import — tests patch the module attribute (the _now seam pattern).
+PROBE_MIRROR_TIMEOUT = 20.0
+
 # Config flow (spec 002) — scanning UX tuning (tasks.md block 1).
 # Flow-facing constants live here, next to the other integration-wide
 # knobs; everything above stays protocol-only.

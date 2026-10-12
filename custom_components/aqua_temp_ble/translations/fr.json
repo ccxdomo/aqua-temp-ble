@@ -97,6 +97,16 @@
           "description": "Bloc de registres à lire. Les blocs hauts sont expérimentaux."
         }
       }
+    },
+    "power_write_probe": {
+      "name": "Sonde d'écriture marche/arrêt",
+      "description": "Exécute la sonde de preuve d'écriture : envoie la trame marche du fabricant, vérifie que le registre miroir 2011 la suit, puis envoie la trame arrêt et vérifie le retour. Une seule ligne de verdict (niveau WARNING) est journalisée avec le résultat. L'unité doit être ARRÊTÉE et l'application du fabricant fermée. Mesure de diagnostic, pas une surface de contrôle.",
+      "fields": {
+        "device_id": {
+          "name": "Appareil",
+          "description": "Appareil à sonder. Laissez vide pour sonder toutes les unités Aqua Temp configurées."
+        }
+      }
     }
   }
 }

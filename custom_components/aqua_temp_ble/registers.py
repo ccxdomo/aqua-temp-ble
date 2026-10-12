@@ -265,6 +265,40 @@ def decode_flag(raw: int | None, active_when_nonzero: bool) -> bool | None:
     return (raw != 0) if active_when_nonzero else (raw == 0)
 
 
+# --- write control plane (spec 016, research 016 §2/§5) ----------------
+# The vendor app's WRITE plane, recovered from the app's own
+# disassembly (research 016 §0/§2): the home-screen power slide
+# writes register 1011 with 1 (on) / 0 (off) — the ONLY hardcoded
+# power write in the whole binary (closure _Iwd: mov x2, #0x3f3,
+# mov x3, #1, bytecount "02"); the mode write targets 1012 plus the
+# pair register 1013, and the mute write 1076. The write plane and
+# the read plane are DIFFERENT registers (power: write 1011, read the
+# pushed mirror 2011; mode: write 1012, read 2019 — the offset is NOT
+# constant, research 016 §3). DATA ONLY (FR-1/NFR-3): unreachable by
+# any write path — the guard below admits 1011 only behind the
+# evidence gate, and 1012/1013/1076 never (each needs its own proof,
+# contract 016 §4).
+WRITE_REG_POWER = 1011        # [P — disassembly, research 016 §2]
+WRITE_REG_MODE = 1012         # [P shape / A semantics — research 016 §5]
+WRITE_REG_MODE_PAIR = 1013    # [P shape / A semantics — research 016 §5]
+WRITE_REG_MUTE = 1076         # [P frame / V semantics — research 016 §5]
+
+# The pinned power frames [P — research 016 §2.1, CRC-computed through
+# the app's own builder pipeline]:
+#   63 10 03F3 0001 02 0001 F131  (ON, 11 bytes)
+#   63 10 03F3 0001 02 0000 30F1  (OFF, 11 bytes)
+# One source of truth (NFR-2): modbus.build_write_control(1011, v) is
+# asserted byte-equal to these strings by the modbus self-test and the
+# spec-016 suite — a mismatch fails both.
+WRITE_FRAME_POWER_ON = "631003f30001020001f131"
+WRITE_FRAME_POWER_OFF = "631003f3000102000030f1"
+
+# The proof oracle: the pushed read home the owner's toggle-and-diff
+# pinned as the power STATE mirror (spec 015). NEVER written — a
+# read-diff proves what a register REFLECTS, never what writing it
+# CONTROLS (contract 016 §2); the probe only READS it.
+READ_MIRROR_POWER = PUSHED_CONTROL["power"]  # = 2011 [P]
+
 # --- write security (spec 003 §6 / FR-9) ---
 # The ONLY registers the integration may ever write: power, mode and the
 # current setpoint — all proven user-operational writes inside the base
@@ -277,12 +311,50 @@ ALLOWED_WRITE_BASE: frozenset[int] = frozenset(
     {REG_POWER, REG_MODE, REG_SET_CURRENT_TEMP}
 )
 
+# --- write security, control plane (spec 016 FR-3, contract 016 §4) ---
+# The evidence-gated CONTROL allowlist: the address AND the value
+# allowlist — power 1011 accepts ONLY 0/1, forever, even when proven
+# (contract 016 §4's value discipline: extending the values requires
+# a new contract). The mode (1012-1013), mute (1076) and every other
+# write-plane register is NOT extended here: each needs its own §2
+# evidence (its own pinned frame, mirror and §3 proof — the power
+# proof does not transfer).
+ALLOWED_WRITE_CONTROL: dict[int, frozenset[int]] = {
+    WRITE_REG_POWER: frozenset({0, 1}),
+}
 
-def ensure_writable(address: int) -> None:
-    """Guard the single write funnel: raise ValueError unless allowed (FR-9).
+# The evidence gate (the WRITE_ECHO_EXPECTED / PUSH_TEMP_CONFIRMED
+# calibration-switch precedent): False is the SHIPPED default — with
+# it, ensure_writable refuses 1011 exactly as 0.11.0 refused it
+# (AC-2/AC-4: byte-identical). Flip to True ONLY after the power-write
+# probe's live verdict line
+#   power write probe: EXECUTED + REVERSIBLE (mirror 2011 followed 0→1→0)
+# is recorded (contract 016 §4 — the owner quotes it in the spec's
+# decision log / PR), then restart Home Assistant. Flipping it
+# without that verdict is a contract violation; the phase-2 climate
+# wiring (spec 016 tasks.md T7/AC-11) stays parked until then.
+WRITE_CONTROL_PROVEN = False
 
-    coordinator.async_write_register calls this as its first statement, so
-    no code path — present or future — can write outside the allowlist.
+
+def ensure_writable(address: int, value: int | None = None) -> None:
+    """Guard the single write funnel: raise ValueError unless allowed.
+
+    coordinator.async_write_register calls this as its first statement,
+    so no code path — present or future — can write outside the
+    allowlists. The base-block rules (spec 003 §6) are UNTOUCHED:
+    {8, 13, 14} + 19-21 behind WRITE_MODE_SETPOINT_TOO, and value=None
+    keeps the old semantics for those callers (spec 016 FR-3's
+    backward-compatible signature).
+
+    Spec 016 FR-3 adds the CONTROL plane, default-locked: a register in
+    ALLOWED_WRITE_CONTROL (today: power 1011) is writable ONLY when
+    WRITE_CONTROL_PROVEN is True AND the value is in the entry's
+    allowlist ({0, 1}) — a control write must always name its value.
+    With the switch False (shipped), 1011 is refused exactly as 0.11.0
+    refused it — the ONLY pre-proof write path is the owner-triggered
+    power-write probe (coordinator.async_power_write_probe, which
+    sends the pinned frames through the client's own seam, NOT through
+    this funnel — contract 016 §5).
     """
     allowed = ALLOWED_WRITE_BASE
     if WRITE_MODE_SETPOINT_TOO:
@@ -291,8 +363,24 @@ def ensure_writable(address: int) -> None:
             REG_SET_HEAT_TARGET,
             REG_SET_AUTO_TARGET,
         }
-    if address not in allowed:
-        raise ValueError(f"register {address} is not writable (spec 003 §6)")
+    if address in allowed:
+        return
+    if address in ALLOWED_WRITE_CONTROL:
+        if not WRITE_CONTROL_PROVEN:
+            raise ValueError(
+                f"register {address} is not writable (spec 003 §6; the "
+                "control plane stays locked until the power-write probe's "
+                "EXECUTED + REVERSIBLE verdict flips WRITE_CONTROL_PROVEN "
+                "— contract 016 §4)"
+            )
+        values = ALLOWED_WRITE_CONTROL[address]
+        if value is None or value not in values:
+            raise ValueError(
+                f"register {address} accepts only values {sorted(values)} "
+                "(contract 016 §4 — the value allowlist is part of the guard)"
+            )
+        return
+    raise ValueError(f"register {address} is not writable (spec 003 §6)")
 
 
 @dataclass(frozen=True)
@@ -460,6 +548,18 @@ KNOWN_LABELS.update({
     1051: "setpoint candidate [A-weak] — Heating set / Auto. Set?",
     1055: "setpoint candidate [A-weak] — Max. cool?",
     1068: "setpoint candidate [A-weak] — Auto. set?",
+})
+
+# Spec 016 (FR-1): the WRITE-plane tags — the probe-log annotation
+# convention for the command registers (research 016 §5's map). The
+# tags carry the honesty: the power frame is [P] (disassembly), the
+# mode/mute semantics are [A]/[V] and stay unwritable regardless
+# (each needs its own proof, contract 016 §4).
+KNOWN_LABELS.update({
+    1011: "Power (WRITE plane) [P disassembly 016]",
+    1012: "Mode (WRITE plane) [P shape / A semantics 016]",
+    1013: "Mode pair (WRITE plane) [P shape / A semantics 016]",
+    1076: "Mute (WRITE plane) [P frame / V semantics 016]",
 })
 
 # Documentation-only mirror of the panel observation (2026-10,
