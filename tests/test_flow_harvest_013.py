@@ -510,6 +510,9 @@ async def test_world1_push_harvest_succeeds_with_mode_push() -> None:
     schema = result["data_schema"]
     schema_items = _schema_keys(schema)
     assert "push_temp_confirmed" in schema_items, schema_items
+    # Spec 015 FR-6 (additive): the CONTROL gate rides the same form —
+    # unchecked until the power/mode diff matched the app's display.
+    assert "push_control_confirmed" in schema_items, schema_items
 
 
 def _schema_keys(schema) -> set[str]:
@@ -542,6 +545,9 @@ async def test_world1_entry_records_push_mode() -> None:
     }, created
     assert created["options"]["push_temp_confirmed"] is True
     assert created["options"]["poll_interval"] == 30
+    # Spec 015 FR-6 (additive): the control gate defaults to False
+    # (unchecked — the shipped default, contract 015-A §4).
+    assert created["options"]["push_control_confirmed"] is False
     # unchecked variant: the option defaults to False
     flow2, _c2, result2, _cap2 = await _drive_to_confirm(
         script=[AquaTempTimeoutOutcome(FIRST_TIMEOUT), AquaTempTimeoutOutcome(FIRST_TIMEOUT)],
@@ -549,6 +555,32 @@ async def test_world1_entry_records_push_mode() -> None:
     )
     created2 = await flow2.async_step_confirm_push(user_input={"name": "X"})
     assert created2["options"]["push_temp_confirmed"] is False
+
+
+async def test_confirm_push_records_control_gate_option() -> None:
+    """Spec 015 FR-6: submitting the control gate checkbox stores it on
+    the entry — the option the coordinator's push_control_confirmed
+    property reads (the push_temp_confirmed pattern); a reload then
+    creates the READ-ONLY climate (spec 015 FR-8)."""
+    flow, _client, result, _cap = await _drive_to_confirm(
+        script=[
+            AquaTempTimeoutOutcome(FIRST_TIMEOUT),
+            AquaTempTimeoutOutcome(FIRST_TIMEOUT),
+        ],
+        harvest_result={2046: CAPTURE_2046},
+    )
+    assert result["step_id"] == "confirm_push", result
+    assert "push_control_confirmed" in _schema_keys(result["data_schema"])
+    created = await flow.async_step_confirm_push(
+        user_input={
+            "name": "Pool pump",
+            "push_temp_confirmed": True,
+            "push_control_confirmed": True,
+        }
+    )
+    assert created["type"] == "create_entry", created
+    assert created["options"]["push_control_confirmed"] is True
+    assert created["options"]["push_temp_confirmed"] is True
 
 
 async def test_world2_no_pushes_routes_no_response_byte_identical() -> None:
@@ -638,6 +670,7 @@ def main() -> int:
     tests = [
         test_world1_push_harvest_succeeds_with_mode_push,
         test_world1_entry_records_push_mode,
+        test_confirm_push_records_control_gate_option,
         test_world2_no_pushes_routes_no_response_byte_identical,
         test_world3_probe_answered_harvest_never_runs,
         test_harvest_budget_arithmetic,

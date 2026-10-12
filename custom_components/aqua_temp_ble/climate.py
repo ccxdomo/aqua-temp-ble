@@ -4,6 +4,16 @@ Reads the coordinator snapshot (regs 8/13/14/19-25/26) and writes regs 8, 13
 and 14 only. Writes go through the coordinator (serialized, confirmed by a
 debounced refresh) so the entity state always reflects the *device-confirmed*
 value, never an optimistic guess.
+
+Spec 015 (FR-8): a "push" entry gets the climate ONLY behind the control
+confirmation gate (`push_control_confirmed`, contract 015-A §4) — and then
+strictly READ-ONLY. The pinned control homes (registers.PUSHED_CONTROL —
+the owner's 2026-10-12 diff-revert evidence) prove what the pushed registers
+REFLECT, never what writing them controls (contract 015-A §8): no write
+feature is advertised, no write method succeeds, and nothing ever reaches
+the coordinator's write funnel (`ensure_writable` stays byte-identical,
+contract 015-B §3.4). Classic entries keep today's exact entity
+(byte-identical, US-6).
 """
 
 from __future__ import annotations
@@ -20,12 +30,13 @@ from homeassistant.components.climate import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util.unit_conversion import TemperatureConverter
 
 from . import registers
 from .const import DOMAIN
-from .coordinator import AquaTempCoordinator, HVAC_TO_MODE_VALUE
+from .coordinator import AquaTempCoordinator, HVAC_TO_MODE_VALUE, decode_temp_logged
 from .entity import AquaTempEntity
 
 _LOGGER = logging.getLogger(__name__)
@@ -35,6 +46,20 @@ async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
     coordinator: AquaTempCoordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
+    if str(entry.data.get("mode", "classic")) == "push":
+        # Spec 015 FR-8 (contract 013 §4.4): in push mode the climate exists
+        # ONLY behind the control confirmation gate — unconfirmed control
+        # homes never reach the entity plane (the 0.10.0 code created the
+        # entity unconditionally with an all-unknown state; this closes that
+        # contract gap). Classic entries keep today's exact path (US-6).
+        if not coordinator.push_control_confirmed:
+            _LOGGER.debug(
+                "climate skipped in push mode: control mapping not confirmed "
+                "yet (quickstart 015 §5)"
+            )
+            return
+        async_add_entities([AquaTempClimateEntity(coordinator, entry, read_only=True)])
+        return
     async_add_entities([AquaTempClimateEntity(coordinator, entry)])
 
 
@@ -46,10 +71,17 @@ class AquaTempClimateEntity(ClimateEntity, AquaTempEntity):
     _attr_target_temperature_step = 0.5
 
     def __init__(
-        self, coordinator: AquaTempCoordinator, entry: ConfigEntry
+        self, coordinator: AquaTempCoordinator, entry: ConfigEntry, read_only: bool = False
     ) -> None:
         ClimateEntity.__init__(self)
         AquaTempEntity.__init__(self, coordinator, entry, "climate")
+        # Spec 015 FR-8: the push-mode climate is READ-ONLY — no write
+        # feature advertised, no settable hvac_modes (an empty list renders
+        # no mode buttons; the reported hvac_mode stays a free-form state).
+        self._read_only = read_only
+        if read_only:
+            self._attr_supported_features = ClimateEntityFeature(0)
+            self._attr_hvac_modes = []
 
     # ------------------------------------------------------------- unit conv
     @property
@@ -96,7 +128,21 @@ class AquaTempClimateEntity(ClimateEntity, AquaTempEntity):
     @property
     def current_temperature(self) -> float | None:
         data = self.coordinator.data
-        return self._to_display_unit(data.inlet_temp) if data else None
+        if data is None:
+            return None
+        if data.mode == "push":
+            # Spec 015: the pushed inlet mirror (contract 013 §4.1 — one
+            # quantity, one source): the same confirmed T-block register
+            # the sensor entity reads, through the shared decode helper;
+            # unconfirmed temperatures decode None (honest, never a
+            # certain name on unconfirmed data).
+            address = registers.PUSHED_TEMPS.get("inlet_water_temp")
+            if address is None:
+                return None
+            return self._to_display_unit(
+                decode_temp_logged(address, data.registers.get(address))
+            )
+        return self._to_display_unit(data.inlet_temp)
 
     @property
     def target_temperature(self) -> float | None:
@@ -122,7 +168,33 @@ class AquaTempClimateEntity(ClimateEntity, AquaTempEntity):
         return fallback if fallback is not None else registers.FALLBACK_MAX_TARGET
 
     # ------------------------------------------------------------ write path
+    def _refuse_write(self) -> None:
+        """Spec 015 FR-8: the push-mode climate never writes — the pinned
+        homes prove what the registers REFLECT, not what writing them
+        controls (contract 015-A §8), and the write allowlist is
+        unchanged (contract 015-B §1). Refuse loudly, never silently."""
+        raise HomeAssistantError(
+            "the push-mode climate is read-only (spec 015 FR-8); control "
+            "writes are not available"
+        )
+
+    async def async_turn_on(self) -> None:
+        """Spec 015 FR-8: refused on the read-only entity; the classic
+        entity defers to the base implementation (byte-identical)."""
+        if self._read_only:
+            self._refuse_write()
+        await super().async_turn_on()
+
+    async def async_turn_off(self) -> None:
+        """Spec 015 FR-8: refused on the read-only entity; the classic
+        entity defers to the base implementation (byte-identical)."""
+        if self._read_only:
+            self._refuse_write()
+        await super().async_turn_off()
+
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
+        if self._read_only:
+            self._refuse_write()
         if hvac_mode == HVACMode.OFF:
             await self.coordinator.async_write_register(registers.REG_POWER, 0)
             return
@@ -137,6 +209,8 @@ class AquaTempClimateEntity(ClimateEntity, AquaTempEntity):
         await self.coordinator.async_write_register(registers.REG_MODE, mode_value)
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
+        if self._read_only:
+            self._refuse_write()
         temp = kwargs.get(ATTR_TEMPERATURE)
         if temp is None:
             return

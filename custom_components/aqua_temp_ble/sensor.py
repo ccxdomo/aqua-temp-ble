@@ -207,4 +207,15 @@ class AquaTempPushStreamEntity(AquaTempEntity, SensorEntity):
             attrs["first_push_age_s"] = round(now - data.push_first_seen, 1)
         if data.push_last_seen is not None:
             attrs["last_push_age_s"] = round(now - data.push_last_seen, 1)
+        # Spec 015 FR-10: the control-candidate raws with their evidence
+        # tags — the owner re-runs the diff (quickstart 015 §1) without a
+        # terminal. Gate-independent diagnostics, never entity states.
+        if data.mode == "push" and data.push_control_raws:
+            attrs["control_candidates"] = {
+                str(addr): {
+                    "raw": raw,
+                    "evidence": registers.PUSH_CONTROL_CANDIDATES[addr],
+                }
+                for addr, raw in sorted(data.push_control_raws.items())
+            }
         return attrs

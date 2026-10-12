@@ -260,9 +260,15 @@ def test_known_labels() -> None:
     assert registers.KNOWN_LABELS[26] == "InletWaterTemp [P] (T02)"
     assert registers.KNOWN_LABELS[27] == "OutletWaterTemp [P] (T03)"
     assert registers.KNOWN_LABELS[28] == "AT [P] (T05)"
-    # Every probe label addresses a register inside the base block.
+    # Every probe label addresses a readable register: the base block,
+    # or the pushed plane 1001-2090 (re-pinned by spec 015 FR-10 — the
+    # 2001-block control homes/candidates and the 1046-ladder setpoint
+    # candidates are annotated for the high-block probe output, the
+    # spec-008 surface that consumes the same KNOWN_LABELS map).
     for addr in registers.KNOWN_LABELS:
-        assert registers.in_base_block(addr)
+        assert registers.in_base_block(addr) or (
+            registers.PUSH_CONTROL_FIRST <= addr <= registers.PUSH_CONTROL_LAST
+        ), addr
     # While the placeholders are unpinned, no [V] family label exists yet —
     # new labels appear via this mechanism only after pinning.
     assert not any("T01" in label or "S01" in label or "O03" in label

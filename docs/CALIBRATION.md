@@ -270,6 +270,57 @@ raw matching many registers → use the two-state method, never pin on a
 single coincidence; binary states inverted vs the panel → flip that
 entry's `active_when_nonzero`, no code change.
 
+## 9. Spec 015 — the control diff (power / mode, push mode)
+
+The pushed block `2001-2045` carries the unit's control state. Its homes
+were pinned by the owner's **toggle-and-diff calibration** (2026-10-12,
+`specs/015-control-data/research.md` §8.1):
+
+| quantity | home | the diff evidence | status |
+|---|---|---|---|
+| Power (read) | **2025** | 0 (off) → 1 (on) → 0 (off) across the app's power slide + revert | [P] |
+| Mode (read) | **2034** | 0 → 4 → 0 across the same toggle | [P] |
+| Setpoint | none identified | no setpoint-shaped value in any push; the 1046-ladder candidates (1046/1049/1051/1055/1068) stay unconfirmed | [V] |
+
+The mode VALUE mapping (`4` → heat) is an **assumption** — this unit is
+heat-only, so "heat" is the only mode it can run; an unmapped value
+renders `unknown` and logs one warning.
+
+### 9.1 Re-running the diff (verify the mapping)
+
+1. **Baseline**: note the app's displayed on/off state, run one connection
+   test, save the four `block push captured` WARNING hex lines.
+2. **Toggle ONE control** in the app (power slide) → capture again →
+   DIFF the hex: register **2025** must flip 0↔1, **2034** 0↔4.
+3. **Toggle back** → capture → the registers must follow the revert
+   (reversibility is the pinning rule — a one-way change pins nothing).
+4. Watch it live instead of a terminal: the `push_stream` diagnostic
+   sensor exposes the candidate raws in its `control_candidates`
+   attribute (2025/2034/2012 + the 1046-ladder five), each with its
+   evidence tag. The `probe_registers` service (block `2001`) prints
+   the same registers with labels.
+
+### 9.2 Opening the gate (the read-only climate)
+
+Check **push_control_confirmed** in the integration's options (push
+entries only — or at the setup confirm step), then **reload** the
+integration. `climate.aqua_temp_heat_pump` appears as **READ-ONLY**:
+
+- `hvac_mode` reflects the unit's state (off / heat from power+mode);
+- `hvac_action` is `off` when powered down, `unknown` when running
+  (the compressor state is not calibrated — no optimistic activity);
+- **no target temperature** — no setpoint home is identified;
+- **no controls at all**: writes (set_hvac_mode, set_temperature, turn_on,
+  turn_off) are refused with a clear error. A read-diff proves what a
+  register REFLECTS, never what writing it controls — and the write
+  allowlist (`ensure_writable`: {8, 13, 14} + 19-21 behind the switch) is
+  unchanged by this spec.
+
+A mismatch → uncheck the option, re-run the diff, and correct the ONE
+line in `registers.PUSHED_CONTROL` (a mis-pin is recoverable, never
+masked). Until the box is checked, nothing control-related is created or
+displayed — the shipped default is the honest closed gate.
+
 ## Extra aid: debug password "66"
 
 In the vendor app, entering **`66`** in the settings/parameter view switches

@@ -757,6 +757,11 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
         (FR-5, quickstart 013 §2): the owner checks it ONLY after the
         side-by-side run matched the app's T-family display (contract
         013 §5); a mismatch is reported and pins nothing.
+        The `push_control_confirmed` checkbox is the CONTROL gate
+        (spec 015 FR-6, contract 015-A §4): the owner checks it ONLY
+        after the power/mode diff-revert (quickstart 015 §1/§5) matched
+        the app's display — it unlocks the READ-ONLY climate (FR-8);
+        a mismatch closes the gate and pins nothing.
         """
         if user_input is None:
             return self.async_show_form(
@@ -765,6 +770,7 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
                     {
                         vol.Required("name", default=DEFAULT_NAME): str,
                         vol.Optional("push_temp_confirmed", default=False): bool,
+                        vol.Optional("push_control_confirmed", default=False): bool,
                     }
                 ),
                 description_placeholders=_probe_placeholders(
@@ -789,6 +795,12 @@ class AquaTempConfigFlow(ConfigFlow, domain=DOMAIN):
                 # entry (contract 013 §5.3 — the shipped default False).
                 "push_temp_confirmed": bool(
                     user_input.get("push_temp_confirmed", False)
+                ),
+                # Spec 015 FR-6: the control confirmation gate — the
+                # shipped default False (contract 015-A §4); checking it
+                # unlocks the READ-ONLY push-mode climate after a reload.
+                "push_control_confirmed": bool(
+                    user_input.get("push_control_confirmed", False)
                 ),
             },
         )
@@ -851,6 +863,17 @@ class AquaTempOptionsFlowHandler(OptionsFlow):
                 vol.Required(
                     "push_temp_confirmed",
                     default=current.get("push_temp_confirmed", False),
+                )
+            ] = bool
+            # Spec 015 FR-6 (contract 015-A §4): the CONTROL gate's
+            # post-setup flip — the owner re-verifies the pinned control
+            # homes (power 2011 / mode 2019, quickstart 015 §5) against
+            # the app's display, then reloads so the READ-ONLY climate
+            # appears (spec 015 FR-8).
+            schema[
+                vol.Required(
+                    "push_control_confirmed",
+                    default=current.get("push_control_confirmed", False),
                 )
             ] = bool
         return self.async_show_form(step_id="init", data_schema=vol.Schema(schema))

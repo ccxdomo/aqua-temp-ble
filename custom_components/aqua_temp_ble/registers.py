@@ -138,6 +138,94 @@ PUSHED_TEMPS: dict[str, int] = {
 PUSH_PLANE_FIRST = 2001
 PUSH_PLANE_LAST = 2090
 
+# --- pushed control plane (spec 015, data-model 015 §7) -------------------
+# The control homes the owner's toggle-and-diff calibration pinned in the
+# 2001 block (start=0x07D1, research 015 §8.1) under the pinning rule of
+# contract 015-A §2.1: the register followed the app's control change AND
+# its revert (2026-10-12). A read-diff proves what a register REFLECTS,
+# never what writing it CONTROLS (contract 015-A §8): these homes are
+# READ-ONLY sources, and `ensure_writable` stays byte-identical (the
+# allowlist {8, 13, 14} + 19-21 — contract 015-B §1/§3.4).
+PUSH_CONTROL_BLOCK_START = 2001  # [P] the control block of the pushed plane
+PUSH_CONTROL_CONFIRMED = False  # the control confirmation gate (contract 015-A §4):
+# False (the shipped default) until the owner re-verifies the pinned homes
+# against the app's display (quickstart 015 §5) and checks the
+# `push_control_confirmed` option OR flips this global switch — the
+# PUSH_TEMP_CONFIRMED precedent. Unconfirmed homes never reach the entity
+# plane: the keys decode None and the climate is not created.
+
+# The control plane window (spec 015 FR-11d): the two pushed series — the
+# machine-settings ladder 1001-1090 included, because a future setpoint
+# home may land in the 1046 ladder (research 015 §2.2).
+PUSH_CONTROL_FIRST = 1001
+PUSH_CONTROL_LAST = 2090
+
+# quantity -> pushed register; None = no home identified (FR-5).
+PUSHED_CONTROL: dict[str, int | None] = {
+    # [P owner diff-revert 2026-10-12]: 0 (off, 07:47) -> 1 (on, 08:31)
+    # -> 0 (off, 08:37) across the app's power slide + revert — the
+    # aller-retour proof (quickstart 015 §1 step P). The 2012 flag
+    # candidate is EXCLUDED for power: static 1 across the whole diff.
+    # [P arithmetic on the owner's raw frames, review 015]: the frame is
+    # BIG-endian. The block's own start sits at index 9 of the payload
+    # (07 d1 -> 2001), which is an exact self-reference and proves the
+    # byte order. The two toggles therefore land at 2011 (power) and
+    # 2019 (mode) — not 2025/2034 (a miscount corrected in review).
+    "power": 2011,
+    # [P owner diff-revert 2026-10-12]: 0 -> 4 -> 0 across the same
+    # toggle (quickstart 015 §1); the enum's other members are unknown.
+    "mode": 2019,
+    # No setpoint home identified [P scan — research 015 §2.3]: no
+    # setpoint-shaped value in any pushed block; the 1046-ladder
+    # candidates stay unconfirmed — the climate displays NO target.
+    "setpoint": None,
+}
+
+# The pushed mode VALUE mapping — deliberately SEPARATE from the base
+# MODE_VALUE_TO_NAME (reg 13's enum, the classic write path's source): the
+# pushed enum is a different register's semantics, and polluting the base
+# map would corrupt HVAC_TO_MODE_VALUE's write values. [A] (D-3): the
+# diff proved 2019 follows the power state, not the enum's full
+# semantics; 4 = the on-state mode on this HEAT-ONLY unit (H06 heat-only
+# [P panel]; the app locks mode changes [P apk]) — "heat" is the honest
+# assumption until the logcat oracle or a mode diff corrects it. An
+# unmapped value renders unknown + ONE warning per session
+# (contract 015-A §5).
+PUSHED_MODE_VALUE_TO_NAME: dict[int, str] = {
+    4: "heat",
+}
+
+# FR-10: the diagnostics candidates (address -> evidence tag). The
+# push_stream diagnostic exposes these raws gate-independently so the
+# owner can re-run the diff without a terminal (quickstart 015 §1);
+# the probe logs annotate the same addresses via KNOWN_LABELS. The tags
+# carry the honesty — [P] pinned, [V] open, [A-weak] assumed candidate.
+PUSH_CONTROL_CANDIDATES: dict[int, str] = {
+    2011: "power home [P owner diff-revert 2026-10-12]",
+    2019: "mode home [P owner diff-revert 2026-10-12]",
+    2012: "flag candidate [V] — static 1 across the 2026-10-12 diff",
+    1046: "setpoint candidate [A-weak] — Cooling set?",
+    1049: "setpoint candidate [A-weak] — Heating set?",
+    1051: "setpoint candidate [A-weak] — Heating set / Auto. Set?",
+    1055: "setpoint candidate [A-weak] — Max. cool?",
+    1068: "setpoint candidate [A-weak] — Auto. set?",
+}
+
+
+def pushed_block_start(address: int) -> int | None:
+    """The start of the OBSERVED pushed block containing `address`.
+
+    The four blocks the unit pushes [P — research 013 §2, six censused
+    runs]: 1001/1046/2001/2046, 45 registers each (BASE_BLOCK_COUNT).
+    None when the address lies outside every observed block (e.g. the
+    never-pushed 1091/1136). Feeds the FR-10 diagnostics raws — a
+    candidate's block lookup, never an entity source.
+    """
+    for start in (1001, 1046, PUSH_CONTROL_BLOCK_START, PUSH_TEMP_BLOCK_START):
+        if start <= address <= start + BASE_BLOCK_COUNT - 1:
+            return start
+    return None
+
 
 def is_sentinel(raw: int | None) -> bool:
     """True when `raw` is a "sensor absent" sentinel (False for None)."""
@@ -356,6 +444,24 @@ for _reg, _label in (
         KNOWN_LABELS[_reg] = _label
 del _reg, _label
 
+# Spec 015 (FR-10/AC-5): the 2001-block control homes + neighbours and the
+# 1046-ladder setpoint candidates, annotated for the probe logs (the
+# block=2001 / block=1046 output) — the tags carry the evidence state,
+# so the owner can re-run the diff from the probe alone.
+KNOWN_LABELS.update({
+    2010: "self-reference 0x07D1 [V]",
+    2012: "flag [V] — static across the 2026-10-12 diff",
+    2017: "unknown (13) [V]",
+    2018: "unknown (168) [V]",
+    2011: "Power (pushed control) [P owner diff 2026-10-12]",
+    2019: "Mode (pushed control) [P owner diff 2026-10-12]",
+    1046: "setpoint candidate [A-weak] — Cooling set?",
+    1049: "setpoint candidate [A-weak] — Heating set?",
+    1051: "setpoint candidate [A-weak] — Heating set / Auto. Set?",
+    1055: "setpoint candidate [A-weak] — Max. cool?",
+    1068: "setpoint candidate [A-weak] — Auto. set?",
+})
+
 # Documentation-only mirror of the panel observation (2026-10,
 # specs/003-sensor-coverage/data-model.md). NO consumer — do not build logic
 # on it (plan.md §5); it exists so the seven families and their HA exposure
@@ -386,6 +492,7 @@ def check_registry_integrity(
     sensors: tuple[RegDef, ...] = SENSORS,
     binaries: tuple[RegDef, ...] = BINARIES,
     pushed_temps: dict[str, int] | None = None,
+    pushed_control: dict[str, int | None] | None = None,
 ) -> None:
     """Validate the entity registries (FR-11 / entity-contract.md §6).
 
@@ -407,8 +514,15 @@ def check_registry_integrity(
       collisions are impossible by the two window checks; mirror
       pairs (base+push for one key) are the documented legal case
       (data-model 013 §6).
-    The shipped registries must pass — asserted in tests/test_registers.py
-    and tests/test_registers_push_013.py.
+    - a pushed-CONTROL violation (spec 015 FR-11d, contract 015-A §6):
+      a key outside {power, mode, setpoint}, a non-None address outside
+      the control plane 1001-2090 (the machine-settings ladder included
+      — a setpoint home may land in the 1046 ladder), a duplicate
+      address within the control plane, or a collision with a pushed
+      temperature register (cross-plane duplicates). None homes are
+      legal — an unidentified quantity must stay unrepresented.
+    The shipped registries must pass — asserted in tests/test_registers.py,
+    tests/test_registers_push_013.py and tests/test_control_015.py.
     """
     seen_keys: set[str] = set()
     seen_addresses: dict[int, str] = {}
@@ -463,6 +577,39 @@ def check_registry_integrity(
                 f"{seen_pushed[address]!r} and {key!r} (spec 013 FR-7)"
             )
         seen_pushed[address] = key
+
+    # --- pushed control plane (spec 015 FR-11d, contract 015-A §6) --------
+    control = (
+        dict(pushed_control) if pushed_control is not None else dict(PUSHED_CONTROL)
+    )
+    unknown_keys = sorted(set(control) - {"power", "mode", "setpoint"})
+    if unknown_keys:
+        raise ValueError(
+            f"unknown pushed-control key(s) {unknown_keys} — the control "
+            "keys are power/mode/setpoint only (spec 015 FR-11d)"
+        )
+    seen_control: dict[int, str] = {}
+    for key, address in control.items():
+        if address is None:
+            continue  # no home identified — legal (the quantity stays unrepresented)
+        if not (PUSH_CONTROL_FIRST <= address <= PUSH_CONTROL_LAST):
+            raise ValueError(
+                f"pushed-control register {address} for {key!r} is outside "
+                f"the control plane {PUSH_CONTROL_FIRST}-{PUSH_CONTROL_LAST} "
+                "(spec 015 FR-11d)"
+            )
+        if address in seen_pushed:
+            raise ValueError(
+                f"pushed-control register {address} for {key!r} collides "
+                f"with the pushed temperature {seen_pushed[address]!r} — no "
+                "cross-plane duplicates (spec 015 FR-11d)"
+            )
+        if address in seen_control:
+            raise ValueError(
+                f"pushed-control register {address} pinned for both "
+                f"{seen_control[address]!r} and {key!r} (spec 015 FR-11d)"
+            )
+        seen_control[address] = key
 
 
 check_registry_integrity()

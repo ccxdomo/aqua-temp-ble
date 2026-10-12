@@ -260,10 +260,16 @@ success summary's `T-window raws:` line with the photo, then check
 reload. Until confirmed, the mirrored keys show `unknown`; a mismatch
 is reported and pins nothing (the mapping is one editable line in
 `registers.py`). The suction sensor stays `unknown` on this unit — its
-T01 sensor is absent; that is the honest state. Climate control, the
-fault code and the firmware version have **no identified home in the
-pushes** — those entities are simply not created in push mode, and no
-control is promised.
+T01 sensor is absent; that is the honest state. The control state has
+pinned homes in the pushed 2001 block — power at register **2025**,
+mode at **2034**, owner diff-verified (2026-10-12): check
+**push_control_confirmed** after matching the app's display, reload,
+and the climate appears as **read-only state** (`hvac_mode` from
+power+mode; no target — no setpoint home is identified; every write
+refused — the write allowlist is unchanged). The fault code and the
+firmware version have **no identified home in the pushes** — those
+entities are simply not created in push mode, and no control is
+promised.
 
 ## Troubleshooting
 

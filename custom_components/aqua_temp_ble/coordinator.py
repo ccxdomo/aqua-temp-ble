@@ -63,6 +63,13 @@ HIGH_BLOCKS: dict[str, int] = {
 # Log each unknown Mode value only once per HA session.
 _logged_unknown_modes: set[int | None] = set()
 
+# Spec 015 (FR-7/D-3): the same once-per-session rule for the PUSHED
+# mode enum — a separate set, because the two planes warn for different
+# registers with different calibration surfaces (PUSHED_MODE_VALUE_TO_NAME
+# vs the base MODE_VALUE_TO_NAME); a value warned on one plane never
+# silences the other.
+_logged_unknown_push_modes: set[int | None] = set()
+
 # Log one implausible-raw warning per register address per HA session (FR-2,
 # decode-contract.md §7). Sentinels are NOT logged — they are normal "sensor
 # absent" states, not errors; they stay visible as raw values in the probe
@@ -134,6 +141,10 @@ class AquaTempData:
     push_counts: dict[int, int] = field(default_factory=dict)  # per-start push counts (FR-6)
     push_first_seen: float | None = None  # the T-block's first push ts (FR-6)
     push_last_seen: float | None = None   # the T-block's latest push ts (freshness gate)
+    # Spec 015 FR-10: the control-candidate DIAGNOSTIC raws (address ->
+    # raw, registers.PUSH_CONTROL_CANDIDATES) — gate-independent (the
+    # owner re-runs the diff without a terminal); never an entity state.
+    push_control_raws: dict[int, int | None] = field(default_factory=dict)
 
     @classmethod
     def from_regs(cls, regs: dict[int, int]) -> AquaTempData:
@@ -217,33 +228,84 @@ class AquaTempData:
         )
 
     @classmethod
-    def from_pushes(cls, captures: dict[int, Any], confirmed: bool) -> AquaTempData:
+    def from_pushes(
+        cls, captures: dict[int, Any], confirmed: bool, control_confirmed: bool = False
+    ) -> AquaTempData:
         """Build the snapshot from the pushed-block store (spec 013 FR-4,
-        contract 013 §4).
+        contract 013 §4; spec 015 FR-7, contract 015-A §5).
 
-        Only the T-family block (start registers.PUSH_TEMP_BLOCK_START)
-        feeds the entity plane — and ONLY when the calibration gate is
+        The T-family block (start registers.PUSH_TEMP_BLOCK_START) feeds
+        the temperature entities — and ONLY when the temperature gate is
         open (contract 013 §4.3: unconfirmed raws never enter the entity
-        plane; the mirrored keys decode `unknown` instead). Every capture
-        still feeds the diagnostic counts (FR-6). Control keys
-        (power/mode/setpoint/fault/firmware) have NO pushed home [P/V]
-        — None by design; the climate entity is not created and no write
-        is ever attempted (contract 013 §4.4 — optimistic state is
-        forbidden, spec 001 precedent). Binaries stay empty (their
-        pushed homes are unknown [V]).
+        plane). The control block (start registers.PUSH_CONTROL_BLOCK_
+        START) feeds the control keys — power/mode_value/hvac_mode/
+        target_temp — ONLY when the CONTROL gate (spec 015 FR-6) is open;
+        the pinned homes live in registers.PUSHED_CONTROL (the owner's
+        2026-10-12 diff-revert evidence [P]): power decodes as a flag
+        (raw != 0), mode_value as the raw enum, hvac_mode via PUSHED_MODE_
+        VALUE_TO_NAME ([A], D-3 — an unmapped value renders None + ONE
+        warning per session; power False wins and renders OFF), and the
+        setpoint decodes only when a home is ever pinned (None today —
+        no target is displayed, FR-5). Control-unconfirmed => every
+        control key is None — the exact 0.10.0 behaviour (FR-11c). The
+        FR-10 diagnostics raws (push_control_raws) ride the snapshot
+        GATE-INDEPENDENTLY: they are diagnostics with evidence tags,
+        never entity states. Binaries stay empty (their pushed homes are
+        unknown [V]); fault/firmware have no pushed home [P] — None by
+        design (contract 013 §4.4, optimistic state forbidden).
         """
         t_cap = captures.get(registers.PUSH_TEMP_BLOCK_START)
         regs: dict[int, int] = {}
         if t_cap is not None and confirmed:
             regs = dict(t_cap.registers)
         counts = {int(start): cap.count for start, cap in captures.items()}
+        # FR-10: the control-candidate raws — gate-independent diagnostics.
+        control_raws: dict[int, int | None] = {}
+        for addr in registers.PUSH_CONTROL_CANDIDATES:
+            block = registers.pushed_block_start(addr)
+            cap = captures.get(block) if block is not None else None
+            control_raws[addr] = cap.registers.get(addr) if cap is not None else None
+        # FR-7 (contract 015-A §5): the confirmed control decode.
+        power: bool | None = None
+        mode_value: int | None = None
+        hvac_mode: HVACMode | None = None
+        target_temp: float | None = None
+        c_cap = captures.get(registers.PUSH_CONTROL_BLOCK_START)
+        if c_cap is not None and control_confirmed:
+            cregs = c_cap.registers
+            p_addr = registers.PUSHED_CONTROL.get("power")
+            raw = cregs.get(p_addr) if p_addr is not None else None
+            power = registers.decode_flag(raw, active_when_nonzero=True)
+            m_addr = registers.PUSHED_CONTROL.get("mode")
+            mode_value = cregs.get(m_addr) if m_addr is not None else None
+            if power is False:
+                hvac_mode = HVACMode.OFF
+            elif power is True:
+                name = (
+                    registers.PUSHED_MODE_VALUE_TO_NAME.get(mode_value)
+                    if mode_value is not None
+                    else None
+                )
+                hvac_mode = MODE_NAME_TO_HVAC.get(name) if name is not None else None
+                if hvac_mode is None and mode_value not in _logged_unknown_push_modes:
+                    _logged_unknown_push_modes.add(mode_value)
+                    _LOGGER.warning(
+                        "Unknown pushed Mode value %r (reg %s) — update "
+                        "registers.PUSHED_MODE_VALUE_TO_NAME after "
+                        "calibration (quickstart 015 §5)",
+                        mode_value,
+                        m_addr,
+                    )
+            s_addr = registers.PUSHED_CONTROL.get("setpoint")
+            if s_addr is not None:
+                target_temp = decode_temp_logged(s_addr, cregs.get(s_addr))
         return cls(
             registers=regs,
-            power=None,
+            power=power,
             boost=None,
-            mode_value=None,
-            hvac_mode=None,
-            target_temp=None,
+            mode_value=mode_value,
+            hvac_mode=hvac_mode,
+            target_temp=target_temp,
             min_target=None,
             max_target=None,
             inlet_temp=None,
@@ -257,6 +319,7 @@ class AquaTempData:
             push_counts=counts,
             push_first_seen=t_cap.first_seen if t_cap is not None else None,
             push_last_seen=t_cap.last_seen if t_cap is not None else None,
+            push_control_raws=control_raws,
         )
 
     @classmethod
@@ -395,6 +458,21 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
             or self.config_entry.options.get("push_temp_confirmed", False)
         )
 
+    @property
+    def push_control_confirmed(self) -> bool:
+        """The CONTROL confirmation gate (spec 015 FR-6, contract 015-A
+        §4): the per-entry `push_control_confirmed` option OR the global
+        registers switch (the push_temp_confirmed pattern). False until
+        the owner re-verifies the pinned control homes (power 2011 /
+        mode 2019, the 2026-10-12 diff-revert evidence) against the
+        app's display (quickstart 015 §5) — unconfirmed homes never
+        reach the entity plane: the control keys decode None and the
+        climate is not created."""
+        return bool(
+            registers.PUSH_CONTROL_CONFIRMED
+            or self.config_entry.options.get("push_control_confirmed", False)
+        )
+
     def now(self) -> float:
         """The coordinator's monotonic clock (the _now seam, contract 007
         §4) — public so the entity platforms share the freshness gate's
@@ -528,7 +606,9 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
                 # Contract 013 §4.2: a base-plane frame in the store
                 # while in push mode — anomaly, logged once, ignored.
                 self._log_push_mode_base_anomaly()
-            return AquaTempData.from_pushes(captures, self.push_temp_confirmed)
+            return AquaTempData.from_pushes(
+                captures, self.push_temp_confirmed, self.push_control_confirmed
+            )
 
     async def async_write_register(self, address: int, value: int) -> None:
         """Serialize a write against reads, then confirm with one refresh."""

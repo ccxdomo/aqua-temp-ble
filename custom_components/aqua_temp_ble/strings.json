@@ -49,10 +49,11 @@
       },
       "confirm_push": {
         "title": "Name your device",
-        "description": "The connection test to {address} succeeded in push mode: the unit never answered our reads with base data, but it answers each poll request with a live-data report that the integration reads — push mode sends one read request per poll cycle and reads the unit's block answer.\n\nIn push mode, only monitoring entities are available — the temperature sensors appear once the captured values are confirmed below (or later in the options). Climate control, the fault code and the firmware version are absent until the unit answers requests again.\n\n- Power: {power}\n- Mode: {mode}\n- Inlet water temperature: {inlet}\n- Outlet water temperature: {outlet}\n- Ambient temperature: {ambient}\n\nChoose a friendly name for this heat pump:",
+        "description": "The connection test to {address} succeeded in push mode: the unit never answered our reads with base data, but it answers each poll request with a live-data report that the integration reads — push mode sends one read request per poll cycle and reads the unit's block answer.\n\nIn push mode, only monitoring entities are available — the temperature sensors appear once the captured values are confirmed below (or later in the options). The climate appears as a read-only mirror of the unit's state once the power/mode calibration is confirmed below (or later in the options); climate control (writes), the fault code and the firmware version stay absent until the unit answers requests again.\n\n- Power: {power}\n- Mode: {mode}\n- Inlet water temperature: {inlet}\n- Outlet water temperature: {outlet}\n- Ambient temperature: {ambient}\n\nChoose a friendly name for this heat pump:",
         "data": {
           "name": "Name",
-          "push_temp_confirmed": "The captured temperatures match the app's parameter view (calibration verified)"
+          "push_temp_confirmed": "The captured temperatures match the app's parameter view (calibration verified)",
+          "push_control_confirmed": "The captured power/mode registers match the app's display (diff-toggle calibration verified)"
         }
       }
     },
@@ -76,7 +77,8 @@
           "poll_interval": "Polling interval (seconds)",
           "temperature_unit": "Display temperature unit",
           "pair_on_connect": "Pair on connect (evidence-gated)",
-          "push_temp_confirmed": "The captured temperatures match the app's parameter view (calibration verified)"
+          "push_temp_confirmed": "The captured temperatures match the app's parameter view (calibration verified)",
+          "push_control_confirmed": "The captured power/mode registers match the app's display (diff-toggle calibration verified)"
         }
       }
     }
