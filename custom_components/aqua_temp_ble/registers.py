@@ -281,6 +281,40 @@ def fault_set_bits(raw: int | None) -> list[int]:
         return []
     return [i for i in range(16) if raw & (1 << i)]
 
+
+# Spec 024 (FR-4): the fault-code SENSOR state — the display face of
+# the SAME fault word (contract 024 §3). "No fault" is a decoded
+# truth, not a guess: raw 0 = clear is proven twice (the 023
+# diff-revert; the 2026-10-12 post-power-cut capture), and the latch
+# gives it an exact meaning — the fault memory is empty since the
+# last power-up. THE LATCH (owner-proven 2026-10-12, research 024
+# §1): a fault SETS the word; the value persists through the
+# machine's logical off and BLE link restarts; ONLY cutting the
+# unit's power supply clears it. A non-zero state therefore reports
+# a MEMORIZED fault, not necessarily an active one.
+PUSHED_FAULT_CLEAR_STATE = "No fault"
+
+
+def fault_code_state(raw: int | None) -> str | None:
+    """The fault word -> the fault-code sensor state (spec 024).
+
+    None -> None (register absent -> the entity's `unknown`, never a
+    guessed "No fault"); 0 -> PUSHED_FAULT_CLEAR_STATE (the latched
+    memory is empty since the last power-up); non-zero -> the PROVEN
+    panel code when the raw is mapped (PUSHED_FAULT_CODE_MAP), else
+    'unknown code (raw N)' (the contract 022 §3 honesty rule, carried
+    into the STATE). The fault word is LATCHED (research 024 §1): the
+    non-zero states report a memorized fault, not necessarily an
+    active one — the docs carry that semantics, the entity reports
+    the register faithfully.
+    """
+    if raw is None:
+        return None
+    if raw == 0:
+        return PUSHED_FAULT_CLEAR_STATE
+    return PUSHED_FAULT_CODE_MAP.get(raw, f"unknown code (raw {raw})")
+
+
 # FR-10: the diagnostics candidates (address -> evidence tag). The
 # push_stream diagnostic exposes these raws gate-independently so the
 # owner can re-run the diff without a terminal (quickstart 015 §1);

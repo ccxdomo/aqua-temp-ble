@@ -152,8 +152,12 @@ reads and writes). The ladder candidates around it (1049/1050/1051/
   (1012+1013) whose 1013 value is unpinned — writing it would clobber
   an unknown register. The climate exposes OFF/HEAT only (both pure
   power writes).
-- **Fault code & firmware**: no home was ever identified in the pushed
-  blocks — no entity is created (never guessed).
+- **Firmware**: no home was ever identified in the pushed blocks — no
+  entity is created (never guessed). **The fault word** (pushed
+  register 2074) IS exposed — a "Fault" binary sensor (spec 023) and
+  a "Fault code" sensor (spec 024); it is **latched**: the unit
+  memorizes a fault until its supply is cut (owner-proven
+  2026-10-12), so a displayed code may outlive the fault itself.
 - **Binary sensors** (compressor/pump/fan/valve/switches): their base
   registers were never pinned and no pushed home exists — the surface
   was pruned in the spec-021 cleanup.

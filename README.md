@@ -35,6 +35,7 @@ cycle is the **expected** world, not an error.
 | Power control (on/off) | **proven** (pump heard) | climate Heat/Off buttons |
 | Setpoint control (10.0-40.0 °C, 0.5 steps) | **proven** (mirror followed) | climate target slider |
 | Fault indicator (code when proven) | **proven** (owner E03 diff-revert) | 1 binary sensor |
+| Fault code | **proven** (owner E03 diff-revert, two independent runs; the fault word is latched — see Troubleshooting) | 1 sensor |
 | Push stream health | diagnostic | 1 sensor (diagnostic) |
 | Register / power / setpoint probes | calibration instruments | 3 buttons + 3 services |
 
@@ -180,6 +181,8 @@ informational — the controls are already active.
 | Ambient temperature (T05) | pushed 2050 | ÷10 |
 | Exhaust temperature (T06) | pushed 2051 | ÷10 |
 | Suction temperature (T01) | pushed 2046 | `0x7FFD` sentinel — sensor absent → `unknown` |
+| Fault (binary) | pushed 2074 (the latched fault word) | `on` = a fault is on record (memorized, not necessarily active); attributes: raw / hex / set_bits / code / code_label |
+| Fault code | pushed 2074 (the latched fault word) | `No fault` / the panel code (`E03`) / `unknown code (raw N)`; a code stays displayed while the unit is powered — cleared only by cutting the unit's supply (latch, owner-proven) |
 | Push stream (diagnostic) | the block store | `on`/`off` + per-block counts, ages, candidate raws |
 | Probe registers / Power write probe / Setpoint write probe (diagnostic) | — | the calibration instruments |
 
@@ -224,7 +227,8 @@ data:
 | Unit not listed in the flow | powered off / out of range → power on, stay in range, **Scan again** |
 | Entities unavailable; `cannot_connect` | the vendor app holds the single BLE link — close it completely |
 | `push stream silent after trigger` | no data report within the window (rebooting unit? radio) — the cycle retries; check distance |
-| Fault: the "Fault" binary sensor | ON when the fault word (register 2074) is non-zero — proven by the owner's E03 run; the `code` attribute shows the panel code when the raw↔code pair was recorded live (E03 = raw 256 — the vendor app itself labels it "water flow problem"), else "unknown code (raw N)". Firmware: still not displayed (no reliable source identified in the data report; the vendor's own fault table lives in the APK) |
+| Fault: the "Fault" binary sensor + "Fault code" sensor | ON / the code on the tile when the fault word (register 2074) is non-zero — proven by the owner's E03 run (two independent runs); the `code` attribute and the tile show the panel code when the raw↔code pair was recorded live (E03 = raw 256 — the vendor app itself labels it "water flow problem"), else "unknown code (raw N)"; the fault word is latched (see the next row). Firmware: still not displayed (no reliable source identified in the data report; the vendor's own fault table lives in the APK) |
+| Fault code shows while the unit is off / healthy | **Normal — the fault word is latched**: the unit memorizes a fault until its power supply is cut (owner-proven 2026-10-12); turning the unit off does NOT clear it. Check the panel: if the machine is fault-free, cut the unit's supply (unplug/replug) to clear the code |
 | `unconfirmed` write, persistent notification | the fresh report never came back — check the panel; the notification says what to do |
 | Log lines at WARNING | the deliberate evidence lines (probe verdicts, block captures, test markers) — read them, they are the diagnostics |
 

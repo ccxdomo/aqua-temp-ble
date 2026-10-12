@@ -9,10 +9,14 @@ high-block polling is a future phase).
 Spec 013 (FR-5/FR-6) adds the pushed-plane surface: entries with
 mode == "push" get ALL six T-family sensors (values from the pushed
 registers — spec 022: active by default, the calibration gate is
-gone) plus the push_stream diagnostic. fault_code and firmware are
-NOT created in push mode — their data has no identified pushed home
-[P/V] (contract 013 §4.4). Classic entries keep today's exact
-creation rules (US-6).
+gone) plus the push_stream diagnostic. Spec 024 (FR-1) adds the
+Fault code sensor — the display face of the pushed fault word
+(register 2074): the panel code on the tile, where a problem
+binary can only show its localized on/off words. The CLASSIC
+fault_code and firmware entries are NOT created in push mode —
+their base registers (47 / 48-51) are unreachable on this firmware
+(law L1, spec 020 §5). Classic entries keep today's exact creation
+rules (US-6).
 """
 
 from __future__ import annotations
@@ -45,6 +49,9 @@ SENSOR_NAMES: dict[str, str] = {
     "firmware": "Firmware",
     # Spec 013 FR-6: the push-stream health diagnostic (push-mode entries).
     "push_stream": "Push stream",
+    # Spec 024 (FR-1): the fault-code display face (push-mode entries)
+    # — the code the panel shows, on the tile.
+    "pushed_fault_code": "Fault code",
 }
 
 
@@ -61,11 +68,14 @@ async def async_setup_entry(
         # Spec 013 FR-5/FR-6 + spec 022 FR-1/FR-3: the pushed-plane
         # entity surface — ACTIVE BY DEFAULT. ALL six T-family sensors
         # are created unconditionally (values from the pushed registers,
-        # sentinel/plausibility-guarded by the shared helper);
-        # fault_code/firmware have no pushed home [P] and are NOT
-        # created (§4.4); the push_stream diagnostic always rides
-        # along (FR-6).
-        entities: list[AquaTempSensorEntity | AquaTempPushStreamEntity] = []
+        # sentinel/plausibility-guarded by the shared helper); the
+        # classic fault_code/firmware RegDefs stay uncreated (law L1);
+        # the push_stream diagnostic always rides along (FR-6).
+        entities: list[
+            AquaTempSensorEntity
+            | AquaTempPushStreamEntity
+            | AquaTempFaultCodeSensorEntity
+        ] = []
         for regdef in registers.SENSORS:
             if regdef.key not in registers.PUSHED_TEMPS:
                 _LOGGER.debug(
@@ -76,6 +86,10 @@ async def async_setup_entry(
                 continue
             entities.append(AquaTempSensorEntity(coordinator, entry, regdef))
         entities.append(AquaTempPushStreamEntity(coordinator, entry))
+        # Spec 024 (FR-1): the fault-code display face — the code on
+        # the tile (a problem binary renders localized on/off words,
+        # so a code cannot ride its state — contract 024 §4).
+        entities.append(AquaTempFaultCodeSensorEntity(coordinator, entry))
         async_add_entities(entities)
         return
     entities = []
@@ -208,4 +222,66 @@ class AquaTempPushStreamEntity(AquaTempEntity, SensorEntity):
                 }
                 for addr, raw in sorted(data.push_control_raws.items())
             }
+        return attrs
+
+
+class AquaTempFaultCodeSensorEntity(AquaTempEntity, SensorEntity):
+    """The fault word 2074 as a code string (spec 024, contract 024 §3).
+
+    The DISPLAY face of the same register the Fault binary reads
+    (one register, one source, two faces): "No fault" when the
+    latched fault memory is empty since the last power-up, the
+    PROVEN panel code when the raw maps (E03 = 256), "unknown code
+    (raw N)" otherwise — never a guessed code, never a bit name
+    (contract 023 §3). The fault word is LATCHED (research 024 §1 —
+    the owner's 2026-10-12 power-cut proof): a non-zero state reports
+    a MEMORIZED fault, not necessarily an active one; the README
+    carries that semantics. `unknown` when the register is absent;
+    unavailable with every entity while the stream is silent (the
+    SHARED freshness gate — no fault-specific staleness code exists,
+    contract 024 §5). NO device_class (a free-form string state; an
+    enum class would demand a closed options list that the open-ended
+    unknown-code family violates); NO timing attributes (contract
+    024 §6 — the store's first_seen/last_seen date the listening
+    window, never the fault; the recorder is the honest timeline).
+    """
+
+    _attr_icon = "mdi:alert-circle"  # the classic fault_code icon
+
+    def __init__(
+        self,
+        coordinator: AquaTempCoordinator,
+        entry: ConfigEntry,
+    ) -> None:
+        AquaTempEntity.__init__(self, coordinator, entry, "pushed_fault_code")
+        self._attr_name = SENSOR_NAMES["pushed_fault_code"]
+
+    @property
+    def native_value(self) -> str | None:
+        data = self.coordinator.data
+        if data is None or data.mode != "push":
+            return None
+        # The same fresh 2046-block capture the binary reads (one
+        # register, one source — the two faces can never disagree).
+        return registers.fault_code_state(
+            data.registers.get(registers.REG_PUSHED_FAULT)
+        )
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        data = self.coordinator.data
+        if data is None or data.mode != "push":
+            return {}
+        raw = data.registers.get(registers.REG_PUSHED_FAULT)
+        attrs: dict[str, Any] = {"register": registers.REG_PUSHED_FAULT}
+        if raw is not None:
+            attrs["raw"] = raw
+            attrs["hex"] = f"0x{raw & 0xFFFF:04X}"
+            attrs["set_bits"] = registers.fault_set_bits(raw)
+            code = registers.fault_code(raw)
+            if code is not None:
+                attrs["code"] = code
+                label = registers.fault_code_app_label(raw)
+                if label is not None:
+                    attrs["code_label"] = label
         return attrs
