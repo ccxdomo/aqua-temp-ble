@@ -855,12 +855,19 @@ def test_read_only_guarantee() -> None:
 
 
 def test_manifest_version() -> None:
-    """AC-10: the manifest bumps to 0.18.0 (the 023->0.17.0
-    precedent; HACS sees the change)."""
+    """AC-10: the manifest was bumped for this spec (the 023->0.17.0
+    precedent; HACS sees the change).
+
+    The assertion checks the bump happened, not an exact string: a later
+    release (0.18.1, brand images) legitimately moves the version on, and
+    pinning the literal here would fail on every subsequent bump.
+    """
     manifest = json.loads(
         (COMPONENT_DIR / "manifest.json").read_text(encoding="utf-8")
     )
-    assert manifest["version"] == "0.18.0", manifest.get("version")
+    version = manifest.get("version", "")
+    parts = tuple(int(p) for p in version.split(".") if p.isdigit())
+    assert parts >= (0, 18, 0), version
 
 
 def main() -> int:
