@@ -2124,9 +2124,13 @@ class AquaTempBleClient:
         """Census one complete frame seen while a request is pending
         (FR-4, contract 008-B §5).
 
-        Block pushes are the E1/E2 decision data (research 008 §7): one
-        INFO line each; other shapes log a generic line; CRC-invalid
-        frames at DEBUG. The counters feed the honest timeout message
+        Block pushes are the E1/E2 decision data (research 008 §7):
+        the per-frame block lines log at DEBUG (contract 018-B, spec
+        018 FR-4 — in push mode the bursts are the NORMAL answer, and
+        the per-frame INFO firehose drove HA's rate limiter past its
+        threshold, muting contract evidence); other shapes log a
+        generic line at the computed level; CRC-invalid frames at
+        DEBUG. The counters feed the honest timeout message
         (research 008 §5 Q3).
         """
         verdict = "OK" if crc_ok else "FAIL"
@@ -2153,8 +2157,15 @@ class AquaTempBleClient:
             start, qty = struct.unpack(">HH", frame[2:6])
             if crc_ok:
                 self._req_block_starts.append(start)
+                # Spec 018 (contract 018-B): the per-frame block
+                # census logs at DEBUG — in push mode the bursts are
+                # the NORMAL answer (≥4 lines/cycle at INFO drove HA's
+                # rate limiter past its threshold, muting contract
+                # evidence; the census survives in the store, the
+                # once-per-connect capture WARNING and the timeout
+                # summary). The counters above are unchanged.
                 _LOGGER.log(
-                    level,
+                    logging.DEBUG,
                     "block push observed: start=%d qty=%d len=%d crc=%s "
                     "(waiting for start %s; t+%.2fs)",
                     start,
@@ -2166,7 +2177,7 @@ class AquaTempBleClient:
                 )
             else:
                 _LOGGER.log(
-                    level,
+                    logging.DEBUG,
                     "block push observed: start=%d qty=%d len=%d crc=%s; "
                     "t+%.2fs",
                     start,

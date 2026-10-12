@@ -288,9 +288,12 @@ def test_census_lines_carry_request_relative_t() -> None:
             const.REQUEST_TIMEOUT = old
         census = [
             m for lvl, m in cap.records
-            if lvl >= logging.INFO and "block push observed" in m
+            # Spec 018 (contract 018-B): the per-frame block census
+            # logs at DEBUG — re-pinned here; the message stays
+            # byte-identical to contract 009 §3.
+            if lvl >= logging.DEBUG and "block push observed" in m
         ]
-        assert census, f"no census INFO lines: {cap.records}"
+        assert census, f"no census DEBUG lines: {cap.records}"
         assert any(
             "block push observed: start=1001 qty=45 len=99 crc=OK" in m
             and "(waiting for start 7; t+0.40s)" in m
@@ -459,9 +462,10 @@ def test_census_never_fatal_mixed_feed_completes() -> None:
         assert regs[26] == 243
         assert regs[27] == -9990
         # the census observed everything on the way (nothing dropped
-        # silently): the non-matching push has its INFO line
+        # silently): the non-matching push has its census line (DEBUG —
+        # contract 018-B, spec 018 FR-4)
         assert any(
-            lvl >= logging.INFO
+            lvl >= logging.DEBUG
             and "block push observed: start=1001" in m
             and "; t+0.90s" in m
             for lvl, m in cap.records

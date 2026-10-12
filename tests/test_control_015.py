@@ -16,11 +16,13 @@ the pushed enum's 4).
 
 Part B (coordinator, synthetic-package import — the 013 pattern):
 from_pushes decodes the CONFIRMED control keys (power flag, mode value,
-hvac_mode via PUSHED_MODE_VALUE_TO_NAME — power False wins, the
-setpoint path when a home is ever pinned); unconfirmed => the control
-keys stay None — the FR-11c gate-closed non-regression (the 0.10.0
-snapshot, registers T-block-only); an unknown pushed mode value warns
-ONCE per session; the push cycle threads the push_control_confirmed
+hvac_mode follows POWER alone — contract 018-A §2 amending contract
+015-A §5: power False renders OFF, power True renders HEAT on this
+heat-only unit, and an unmapped NONZERO mode value logs ONE INFO per
+session per value; the setpoint path when a home is ever pinned);
+unconfirmed => the control keys stay None — the FR-11c gate-closed
+non-regression (the 0.10.0 snapshot, registers T-block-only); the push
+cycle threads the push_control_confirmed
 option (the push_temp_confirmed pattern); the FR-10 diagnostics raws
 (push_control_raws) ride the snapshot gate-independently — the owner
 re-runs the diff without a terminal.
@@ -620,11 +622,15 @@ def test_baseline_capture_decodes_power_off() -> None:
     assert data.hvac_mode == HVACMode.OFF
 
 
-def test_unknown_push_mode_warns_once() -> None:
-    """FR-7/D-3: an unmapped mode VALUE (the enum's other members are
-    unknown) renders hvac_mode None + exactly ONE warning per session
-    (the _logged_unknown_modes pattern, per plane)."""
-    coordinator_mod._logged_unknown_push_modes.clear()
+def test_unmapped_push_mode_heat_and_info_once() -> None:
+    """Spec 018 (contract 018-A §2/§3, amending the 015 FR-7 decode):
+    an unmapped NONZERO mode VALUE no longer degrades the display —
+    power True renders HEAT (the mode mirror never gates the display
+    on this heat-only unit), and the value logs exactly ONE INFO per
+    session per value (the research/calibration signal; a second
+    decode logs nothing). The old 'Unknown pushed Mode' WARNING is
+    GONE at ANY level (contract 018-A §3)."""
+    coordinator_mod._logged_unmapped_push_modes.clear()
     raws = dict(CONTROL_BLOCK_ON)
     raws[2019] = 7  # not in PUSHED_MODE_VALUE_TO_NAME
     caps = {2001: _capture(2001, raws), 2046: _capture(2046, T_WINDOW_RAWS)}
@@ -635,10 +641,14 @@ def test_unknown_push_mode_warns_once() -> None:
     finally:
         logger.removeHandler(cap)
         logger.setLevel(old_level)
-    assert data1.hvac_mode is None and data2.hvac_mode is None
-    warns = [m for lvl, m in cap.records if lvl == logging.WARNING and "Unknown pushed Mode" in m]
-    assert len(warns) == 1, cap.records
-    assert "2019" in warns[0] and "7" in warns[0], warns[0]
+    assert data1.hvac_mode == HVACMode.HEAT and data2.hvac_mode == HVACMode.HEAT
+    infos = [
+        m for lvl, m in cap.records
+        if lvl == logging.INFO and "pushed mode value" in m and "unmapped" in m
+    ]
+    assert len(infos) == 1, cap.records  # once per session per value
+    assert "2019" in infos[0] and "7" in infos[0], infos[0]
+    assert not [m for lvl, m in cap.records if "Unknown pushed Mode" in m], cap.records
 
 
 def test_missing_control_capture_stays_none() -> None:
@@ -962,7 +972,7 @@ def main() -> int:
         test_gate_open_off_vector_decodes,
         test_gate_open_on_vector_decodes,
         test_baseline_capture_decodes_power_off,
-        test_unknown_push_mode_warns_once,
+        test_unmapped_push_mode_heat_and_info_once,
         test_missing_control_capture_stays_none,
         test_setpoint_decode_path_when_pinned,
         test_push_cycle_threads_control_gate,

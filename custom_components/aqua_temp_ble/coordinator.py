@@ -68,12 +68,12 @@ HIGH_BLOCKS: dict[str, int] = {
 # Log each unknown Mode value only once per HA session.
 _logged_unknown_modes: set[int | None] = set()
 
-# Spec 015 (FR-7/D-3): the same once-per-session rule for the PUSHED
-# mode enum — a separate set, because the two planes warn for different
-# registers with different calibration surfaces (PUSHED_MODE_VALUE_TO_NAME
-# vs the base MODE_VALUE_TO_NAME); a value warned on one plane never
-# silences the other.
-_logged_unknown_push_modes: set[int | None] = set()
+# Spec 018 (contract 018-A §3): the once-per-session ledger for
+# unmapped NONZERO pushed mode values — a research/calibration
+# signal, never a display gate (the display follows power on this
+# heat-only unit). 0 and None never enter it: 0 is the observed,
+# expected value after our power-only writes (research 018 §1).
+_logged_unmapped_push_modes: set[int] = set()
 
 # Log one implausible-raw warning per register address per HA session (FR-2,
 # decode-contract.md §7). Sentinels are NOT logged — they are normal "sensor
@@ -247,15 +247,18 @@ class AquaTempData:
         target_temp — ONLY when the CONTROL gate (spec 015 FR-6) is open;
         the pinned homes live in registers.PUSHED_CONTROL (the owner's
         2026-10-12 diff-revert evidence [P]): power decodes as a flag
-        (raw != 0), mode_value as the raw enum, hvac_mode via PUSHED_MODE_
-        VALUE_TO_NAME ([A], D-3 — an unmapped value renders None + ONE
-        warning per session; power False wins and renders OFF), and the
-        setpoint decodes only when a home is ever pinned (None today —
-        no target is displayed, FR-5). Control-unconfirmed => every
-        control key is None — the exact 0.10.0 behaviour (FR-11c). The
-        FR-10 diagnostics raws (push_control_raws) ride the snapshot
-        GATE-INDEPENDENTLY: they are diagnostics with evidence tags,
-        never entity states. Binaries stay empty (their pushed homes are
+        (raw != 0), mode_value as the raw enum, and hvac_mode follows
+        POWER alone (contract 018-A §2, amending contract 015-A §5:
+        power False renders OFF, power True renders HEAT — this unit
+        is heat-only [P panel], so power on IS heating; the mode mirror
+        2019 is a diagnostic that NEVER gates the display, and an
+        unmapped NONZERO value logs ONE INFO per session per value),
+        and the setpoint decodes only when a home is ever pinned
+        (None today — no target is displayed, FR-5). Control-unconfirmed
+        => every control key is None — the exact 0.10.0 behaviour
+        (FR-11c). The FR-10 diagnostics raws (push_control_raws) ride
+        the snapshot GATE-INDEPENDENTLY: they are diagnostics with
+        evidence tags, never entity states. Binaries stay empty (their pushed homes are
         unknown [V]); fault/firmware have no pushed home [P] — None by
         design (contract 013 §4.4, optimistic state forbidden).
         """
@@ -270,7 +273,8 @@ class AquaTempData:
             block = registers.pushed_block_start(addr)
             cap = captures.get(block) if block is not None else None
             control_raws[addr] = cap.registers.get(addr) if cap is not None else None
-        # FR-7 (contract 015-A §5): the confirmed control decode.
+        # FR-7 (contract 015-A §5, amended by contract 018-A §2):
+        # the confirmed control decode.
         power: bool | None = None
         mode_value: int | None = None
         hvac_mode: HVACMode | None = None
@@ -286,18 +290,25 @@ class AquaTempData:
             if power is False:
                 hvac_mode = HVACMode.OFF
             elif power is True:
-                name = (
-                    registers.PUSHED_MODE_VALUE_TO_NAME.get(mode_value)
-                    if mode_value is not None
-                    else None
-                )
-                hvac_mode = MODE_NAME_TO_HVAC.get(name) if name is not None else None
-                if hvac_mode is None and mode_value not in _logged_unknown_push_modes:
-                    _logged_unknown_push_modes.add(mode_value)
-                    _LOGGER.warning(
-                        "Unknown pushed Mode value %r (reg %s) — update "
-                        "registers.PUSHED_MODE_VALUE_TO_NAME after "
-                        "calibration (quickstart 015 §5)",
+                # Spec 018 (contract 018-A §2): the display follows
+                # POWER on this heat-only unit (H06 [P panel]) — a
+                # mode-gated display renders the machine's real
+                # running state `unknown`, because our proven power
+                # write (1011) updates the power mirror 2011 and
+                # never the mode mirror 2019 (research 018 §3, M-1).
+                hvac_mode = HVACMode.HEAT
+                if (
+                    mode_value is not None
+                    and mode_value != 0
+                    and mode_value not in registers.PUSHED_MODE_VALUE_TO_NAME
+                    and mode_value not in _logged_unmapped_push_modes
+                ):
+                    _logged_unmapped_push_modes.add(mode_value)
+                    _LOGGER.info(
+                        "pushed mode value %r (reg %s) unmapped — display "
+                        "follows power (heat-only, spec 018); update "
+                        "registers.PUSHED_MODE_VALUE_TO_NAME for the "
+                        "research map (quickstart 018 §2)",
                         mode_value,
                         m_addr,
                     )

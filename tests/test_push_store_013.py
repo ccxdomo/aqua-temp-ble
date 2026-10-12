@@ -280,9 +280,10 @@ def test_four_pinned_pushes_land_in_store_with_capture_lines() -> None:
     assert hexes[0] == FRAME_BLOCK_1001
     assert hexes[3] == FRAME_BLOCK_2046_PUSH1  # the FIRST push of 2046
 
-    # --- repeat census lines: the 008/009 grammar byte-identical ---
+    # --- repeat census lines: the 008/009 grammar byte-identical;
+    #     level DEBUG per contract 018-B (spec 018 FR-4) ---
     assert any(
-        lvl == logging.INFO
+        lvl == logging.DEBUG
         and "block push observed: start=2046 qty=45 len=99 crc=OK" in m
         and "(waiting for start 7; t+2.00s)" in m
         for lvl, m in cap.records

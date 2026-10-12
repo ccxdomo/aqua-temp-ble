@@ -259,8 +259,8 @@ def test_fc03_response_still_completes() -> None:
 
 def test_push_for_other_block_censused_request_unaffected() -> None:
     """AC-4: a block-1001 push during a pending base read is census-logged
-    at INFO, does NOT complete or fail the request; a later start-7 block
-    still completes it.
+    (at DEBUG — contract 018-B, spec 018 FR-4), does NOT complete or fail
+    the request; a later start-7 block still completes it.
 
     History (c8d8260): the push was dropped by the FC gate and the later
     matching frame was dropped too — AquaTempTimeoutError 'got 0 bytes'.
@@ -279,9 +279,10 @@ def test_push_for_other_block_censused_request_unaffected() -> None:
             const.REQUEST_TIMEOUT = old
         assert len(regs) == 45
         assert regs[26] == 243
-        info_msgs = [msg for lvl, msg in cap.records if lvl >= logging.INFO]
-        census = [m for m in info_msgs if "block push observed" in m]
-        assert census, f"no census INFO line logged; got {info_msgs}"
+        # Spec 018 (contract 018-B): the block census reads at DEBUG.
+        census_msgs = [msg for lvl, msg in cap.records if lvl >= logging.DEBUG]
+        census = [m for m in census_msgs if "block push observed" in m]
+        assert census, f"no census DEBUG line logged; got {census_msgs}"
         assert any(
             "block push observed: start=1001 qty=45 len=99 crc=OK" in m
             and "waiting for start 7" in m
@@ -381,8 +382,9 @@ def test_push_before_echo_discarded_echo_completes() -> None:
         client = _connected([push, echo])
         with _capture_logs() as cap:
             await client.write_registers(8, [1])
-        info_msgs = [msg for lvl, msg in cap.records if lvl >= logging.INFO]
-        assert any("block push observed: start=1001" in m for m in info_msgs), (
+        # Spec 018 (contract 018-B): the block census reads at DEBUG.
+        census_msgs = [msg for lvl, msg in cap.records if lvl >= logging.DEBUG]
+        assert any("block push observed: start=1001" in m for m in census_msgs), (
             "the push must be census-logged while the echo is pending"
         )
 

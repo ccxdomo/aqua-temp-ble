@@ -181,16 +181,19 @@ PUSHED_CONTROL: dict[str, int | None] = {
     "setpoint": None,
 }
 
-# The pushed mode VALUE mapping — deliberately SEPARATE from the base
-# MODE_VALUE_TO_NAME (reg 13's enum, the classic write path's source): the
-# pushed enum is a different register's semantics, and polluting the base
-# map would corrupt HVAC_TO_MODE_VALUE's write values. [A] (D-3): the
-# diff proved 2019 follows the power state, not the enum's full
-# semantics; 4 = the on-state mode on this HEAT-ONLY unit (H06 heat-only
-# [P panel]; the app locks mode changes [P apk]) — "heat" is the honest
-# assumption until the logcat oracle or a mode diff corrects it. An
-# unmapped value renders unknown + ONE warning per session
-# (contract 015-A §5).
+# Spec 018 (contract 018-A §3): the OBSERVED-VALUES registry for the
+# pushed mode mirror — documentation + the unmapped-diagnostic's
+# membership check. It is NO LONGER the display gate: the climate's
+# hvac_mode follows power alone on this heat-only unit (H06 [P
+# panel]). Observed values [P owner, 2026-10-12]:
+#   4 — the app-flow on-state (the 015 diff-revert, 08:31);
+#   0 — the off world AND the on-state after OUR power-only writes
+#       (our 1011 write never touches the mode plane, contract 016
+#       §4 — research 018 §3, M-1): expected, never an error.
+# Other values unknown (research 018 §8 G-3); an unmapped NONZERO
+# value logs ONE INFO per session per value. The base
+# MODE_VALUE_TO_NAME (reg 13, the classic plane) must never be
+# polluted from this map (unchanged).
 PUSHED_MODE_VALUE_TO_NAME: dict[int, str] = {
     4: "heat",
 }

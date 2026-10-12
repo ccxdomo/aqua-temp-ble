@@ -278,8 +278,8 @@ were pinned by the owner's **toggle-and-diff calibration** (2026-10-12,
 
 | quantity | home | the diff evidence | status |
 |---|---|---|---|
-| Power (read) | **2025** | 0 (off) → 1 (on) → 0 (off) across the app's power slide + revert | [P] |
-| Mode (read) | **2034** | 0 → 4 → 0 across the same toggle | [P] |
+| Power (read) | **2011** | 0 (off) → 1 (on) → 0 (off) across the app's power slide + revert | [P] |
+| Mode (read) | **2019** | 0 → 4 → 0 across the same toggle | [P] |
 | Setpoint | none identified | no setpoint-shaped value in any push; the 1046-ladder candidates (1046/1049/1051/1055/1068) stay unconfirmed | [V] |
 
 The mode VALUE mapping (`4` → heat) is an **assumption** — this unit is
@@ -291,12 +291,12 @@ renders `unknown` and logs one warning.
 1. **Baseline**: note the app's displayed on/off state, run one connection
    test, save the four `block push captured` WARNING hex lines.
 2. **Toggle ONE control** in the app (power slide) → capture again →
-   DIFF the hex: register **2025** must flip 0↔1, **2034** 0↔4.
+   DIFF the hex: register **2011** must flip 0↔1, **2019** 0↔4.
 3. **Toggle back** → capture → the registers must follow the revert
    (reversibility is the pinning rule — a one-way change pins nothing).
 4. Watch it live instead of a terminal: the `push_stream` diagnostic
    sensor exposes the candidate raws in its `control_candidates`
-   attribute (2025/2034/2012 + the 1046-ladder five), each with its
+   attribute (2011/2019/2012 + the 1046-ladder five), each with its
    evidence tag. The `probe_registers` service (block `2001`) prints
    the same registers with labels.
 

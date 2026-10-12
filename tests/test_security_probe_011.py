@@ -1880,11 +1880,13 @@ async def test_pairing_ladder_lines_are_warning() -> None:
     ), unavailable
 
 
-async def test_census_lines_stay_info_counterexample() -> None:
-    """Spec 012 counter-example (contract 012 §1.2): the high-volume
-    census diagnostics stay at INFO — a 16-push-per-window stream must
-    not become WARNING noise (the 008/009 census discipline stands;
-    grep-stable formats unchanged)."""
+async def test_census_lines_stay_debug_counterexample() -> None:
+    """Spec 012 counter-example (contract 012 §1.2, amended by
+    contract 018-B for the block line): the high-volume census
+    diagnostics stay at DEBUG — a 16-push-per-window stream must not
+    become WARNING noise (the counter-example discipline stands;
+    grep-stable formats unchanged; spec 018 FR-4 moved the per-frame
+    block line INFO -> DEBUG — re-pinned here)."""
     push = _build_block_frame(1001)  # a CRC-valid non-matching push
     fake = _RecordingBleakClientBase(answer_frames=[push], answer_on_write=1)
     client = _make_probe_client(fake)
@@ -1899,7 +1901,7 @@ async def test_census_lines_stay_info_counterexample() -> None:
         if m.startswith("block push observed")
     ]
     assert census, cap.messages
-    assert all(lvl == "INFO" for _m, lvl in census), census
+    assert all(lvl == "DEBUG" for _m, lvl in census), census
 
 
 async def test_flow_build_marker_logged_once_first() -> None:
@@ -1972,7 +1974,7 @@ def main() -> int:
         test_flow_probe_evidence_lines_are_warning,
         test_flow_all_probe_evidence_lines_are_warning,
         test_pairing_ladder_lines_are_warning,
-        test_census_lines_stay_info_counterexample,
+        test_census_lines_stay_debug_counterexample,
         test_flow_build_marker_logged_once_first,
         test_build_version_matches_manifest,
     ]
