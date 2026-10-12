@@ -5,14 +5,6 @@ the "Aqua Temp" app (`com.phinx.poolheater4`, Piscina Temp, …). It talks to
 the unit directly over **Bluetooth Low Energy** — no vendor cloud, no
 account, no WiFi needed (the unit does not even have WiFi).
 
-> **Status: calibrated, owner-proven, active by default.** The register
-> map was recovered from the vendor APK disassembly, then verified live on
-> the production unit (photo calibration, panel diffs, diff-revert
-> probes). The complete, current reference lives in
-> [`specs/020-integration-reference/`](specs/020-integration-reference/) —
-> read its `spec.md` first. Everything works the moment you add the
-> device (spec 022); the protections that remain are automatic.
-
 ## How it reads: trigger + listen
 
 This firmware never answers a classic Modbus read with classic data, and it
