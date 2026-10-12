@@ -385,6 +385,11 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
     ) -> None:
         self.client = client
         self._io_lock = asyncio.Lock()
+        # Spec 017 FR-3 step 9: the last control write's stage dict —
+        # the climate diagnostics' cheap support surface (read by
+        # extra_state_attributes; never an entity state — the tile's
+        # truth stays the pushed mirror alone).
+        self._last_control_write: dict[str, Any] | None = None
         super().__init__(
             hass,
             _LOGGER,
@@ -477,6 +482,31 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
             registers.PUSH_CONTROL_CONFIRMED
             or self.config_entry.options.get("push_control_confirmed", False)
         )
+
+    @property
+    def write_control_allowed(self) -> bool:
+        """The write-control ACTIVATION gate (spec 017 FR-1, contract
+        017 §2): the global registers switch (WRITE_CONTROL_PROVEN,
+        016 T3 — the calibration-switch precedent; restart) OR the
+        per-entry `write_control` option (the push_control_confirmed
+        pattern — no restart; the climate reads this property live,
+        so saving the option re-renders the entity without a reload).
+        Never set by any code path: the owner's act alone opens it
+        (the option's description names the required probe verdict);
+        the shipped default is False on both surfaces — the
+        integration stays byte-identical to 0.12.0 until then (AC-10)."""
+        return bool(
+            registers.WRITE_CONTROL_PROVEN
+            or self.config_entry.options.get("write_control", False)
+        )
+
+    @property
+    def last_control_write(self) -> dict[str, Any] | None:
+        """Spec 017 FR-3 step 9: the last control write's stage dict
+        (value, verdict, mirror raw + age relative to the write) — the
+        climate's diagnostics attribute (FR-5); the entity state itself
+        never reads it (never optimistic, FR-6)."""
+        return self._last_control_write
 
     def now(self) -> float:
         """The coordinator's monotonic clock (the _now seam, contract 007
@@ -820,7 +850,7 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
                     )
                 # -- step 1: the baseline — trigger + fresh harvest -----
                 t_mark = _now()
-                await self._probe_trigger()
+                await self._trigger_report("power write probe")
                 cap = await self._probe_fresh_control(t_mark)
                 if cap is None:
                     return _finish("no-report", "no-report (no fresh 2001 block)")
@@ -965,13 +995,21 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
                 except Exception:  # noqa: BLE001
                     _LOGGER.debug("probe disconnect failed", exc_info=True)
 
-    async def _probe_trigger(self) -> None:
-        """ONE vendor base read — the proven trigger (spec 014 §6,
-        FR-4 step 1): the frame the unit answers with its block burst.
-        AquaTempTimeoutError is the EXPECTED world (the answer IS the
-        burst — spec 014 M-4); any other AquaTempError is an honest
-        transport failure: logged at WARNING (the stage evidence),
-        re-raised for the caller (the service/button) to report."""
+    async def _trigger_report(self, context: str) -> None:
+        """ONE vendor base read — the proven trigger (spec 014 §6, the
+        probe's FR-4 step 1): the frame the unit answers with its
+        block burst. AquaTempTimeoutError is the EXPECTED world (the
+        answer IS the burst — spec 014 M-4); any other AquaTempError
+        is an honest transport failure: logged at WARNING (the stage
+        evidence), re-raised for the caller (the service/button) to
+        report.
+
+        Spec 017 T3: the pure parameterization — ONE trigger
+        implementation, two callers. The probe passes "power write
+        probe" (its log lines keep their exact 016 strings so the
+        016 suite passes unchanged); the confirmation cycle passes
+        "power write confirm" (FR-3 step 4b — C-3's rule: the write
+        does not wake the report, the trigger does)."""
         address = self.config_entry.data["address"]
         try:
             await self.client.read_registers(
@@ -979,13 +1017,14 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
             )
         except AquaTempTimeoutError:
             _LOGGER.debug(
-                "power write probe [%s]: trigger timed out as expected "
+                "%s [%s]: trigger timed out as expected "
                 "(the answer is the block burst, spec 014 M-4)",
+                context,
                 address,
             )
         except AquaTempError as err:
             _LOGGER.warning(
-                "power write probe [%s]: trigger read failed: %s", address, err
+                "%s [%s]: trigger read failed: %s", context, address, err
             )
             raise
 
@@ -1011,7 +1050,7 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
                 "— sending ONE base-read trigger (FR-4 step 4)",
                 self.config_entry.data["address"],
             )
-            await self._probe_trigger()
+            await self._trigger_report("power write probe")
             cap = await self._wait_fresh_control(before)
         return cap
 
@@ -1028,3 +1067,178 @@ class AquaTempCoordinator(DataUpdateCoordinator[AquaTempData]):
             if _now() >= deadline:
                 return None
             await asyncio.sleep(0.05)
+
+    # ---------------------------------------- spec 017 control writes
+    async def async_control_write_power(self, value: int) -> dict[str, Any]:
+        """The controlled climate's ONLY write path (spec 017 FR-3,
+        contract 017 §3/§5): guard -> connect -> audit -> under the
+        I/O lock: the fire-and-forget write -> ONE trigger -> the
+        fresh-mirror wait -> the cross-check verdicts -> the mirror
+        snapshot push.
+
+        Never optimistic (contract 016 §6 / 017 §5.3): the only state
+        mutation is the snapshot push, built by the SAME from_pushes
+        the poll cycle uses — the entity plane reflects the MIRROR,
+        never the request. The unconfirmed path pushes NO snapshot
+        (the state stays; the next poll cycle retries naturally) and,
+        for an OFF, raises the persistent notification instead
+        (contract 016 §7's revert obligation made visible — a
+        potentially-running unit is never a silent end state). Does
+        NOT disconnect on completion (unlike the probe — the
+        confirmation lives in the steady-state poll world; the next
+        cycle reuses the link).
+
+        Returns the stage dict (FR-3 step 9): the written value, the
+        verdict ("confirmed" | "not-confirmed" | "unconfirmed"), the
+        fresh mirror's raw and its age relative to the write — the
+        tests' oracle and the climate's diagnostics attribute.
+        """
+        address = self.config_entry.data["address"]
+        # 1. The funnel guard, FIRST — before any connect, lock or I/O
+        #    (the funnel rule). The ACTIVATION gate rides the
+        #    control_allowed thread (either owner surface — FR-1); the
+        #    address AND value allowlists stay permanent. While the
+        #    gate is closed this fails loudly with the 016 message and
+        #    ZERO bytes move (AC-3).
+        registers.ensure_writable(
+            registers.WRITE_REG_POWER,
+            value,
+            control_allowed=self.write_control_allowed,
+        )
+        # 2. Connect if needed (the cycle's connect pattern, the pair
+        #    option respected); transport failures propagate to the
+        #    caller (the entity surfaces the error).
+        if not self.client.is_connected:
+            await self.client.connect(
+                pair=self.config_entry.options.get(
+                    "pair_on_connect", const.DEFAULT_PAIR_ON_CONNECT
+                )
+            )
+        # 3. The audit line (FR-4's exact string, verbatim) — one line
+        #    per write, attributable in the owner's log page.
+        _LOGGER.info(
+            "power write via %d = %d — mirror should follow in the next report",
+            registers.WRITE_REG_POWER,
+            value,
+        )
+        mirror_addr = registers.READ_MIRROR_POWER
+        result: dict[str, Any] = {
+            "value": value,
+            "verdict": "unconfirmed",
+            "mirror_raw": None,
+            "mirror_age_s": None,
+        }
+        async with self._io_lock:
+            # 4a. The fire-and-forget write (FR-2) — the pinned frame on
+            #     the _write_frame seam, NEVER write_registers (the
+            #     echo trap, contract 017 §4). A write error propagates
+            #     (AC-9): no trigger, no cross-check, no snapshot push,
+            #     no notification.
+            await self.client.write_control(registers.WRITE_REG_POWER, value)
+            t_write = _now()
+            # 4b. ONE trigger (C-3: the write does not wake the report;
+            #     the trigger does — research 017 §2) ...
+            await self._trigger_report("power write confirm")
+            # 4c. ... then the fresh-mirror wait (the probe's helper,
+            #     UNCHANGED: a 2001 capture with last_seen > t_write,
+            #     bounded by PROBE_MIRROR_TIMEOUT — the oracle must
+            #     postdate the write it verifies).
+            cap = await self._wait_fresh_control(t_write)
+            # 5. The cross-check verdicts (FR-4's exact strings).
+            mirror_raw = (
+                cap.registers.get(mirror_addr) if cap is not None else None
+            )
+            if cap is not None:
+                result["mirror_raw"] = mirror_raw
+                result["mirror_age_s"] = round(cap.last_seen - t_write, 1)
+            if cap is None or mirror_raw is None:
+                # No fresh report (or a capture whose mirror raw is
+                # absent — the same honest verdict): the state is
+                # UNKNOWN, never guessed.
+                result["verdict"] = "unconfirmed"
+                _LOGGER.warning(
+                    "power write unconfirmed (no fresh report within "
+                    "%.0f s) — the unit's state is UNKNOWN: check the "
+                    "panel",
+                    const.PROBE_MIRROR_TIMEOUT,
+                )
+                if value == 0:
+                    self._notify_unconfirmed_off(address)
+            elif mirror_raw == value:
+                result["verdict"] = "confirmed"
+                _LOGGER.info(
+                    "power write confirmed by mirror (%d = %d)",
+                    mirror_addr,
+                    mirror_raw,
+                )
+                self._dismiss_unconfirmed_off(address)
+            else:
+                result["verdict"] = "not-confirmed"
+                _LOGGER.warning(
+                    "power write not confirmed by mirror (mirror %d = "
+                    "%d, requested %d)",
+                    mirror_addr,
+                    mirror_raw,
+                    value,
+                )
+                if value == 0:
+                    self._notify_unconfirmed_off(address)
+            # 6. The snapshot push (confirmed / not-confirmed ONLY —
+            #    the MIRROR's truth, never the request; NO push on the
+            #    unconfirmed path, AC-8).
+            if result["verdict"] in ("confirmed", "not-confirmed"):
+                data = AquaTempData.from_pushes(
+                    dict(self.client.pushed_blocks),
+                    self.push_temp_confirmed,
+                    self.push_control_confirmed,
+                )
+                await self.async_set_updated_data(data)
+        # FR-3 step 9: the stage dict — the tests' oracle + the
+        # climate's diagnostics attribute (FR-5). The displayed state
+        # itself never reads it (never optimistic, FR-6).
+        self._last_control_write = result
+        return result
+
+    def _notify_unconfirmed_off(self, address: str) -> None:
+        """FR-3 step 7 / contract 017 §5.5: the unconfirmed-OFF surface
+        — a potentially-running unit is NEVER a silent end state.
+        The persistent notification names the unit, the requested OFF
+        and the remediation (contract 016 §7's revert obligation,
+        made visible on the dashboard); a later CONFIRMED cycle for
+        the same unit dismisses it."""
+        notification_id = f"aqua_temp_ble_power_unconfirmed_{address}"
+        message = (
+            f"Aqua Temp unit {address}: an OFF command was sent but "
+            "could not be verified — the unit's state is UNKNOWN: "
+            "check the panel; the unit may still be ON — turn it OFF "
+            "from the vendor app or the panel"
+        )
+        try:
+            from homeassistant.components import persistent_notification
+        except ImportError:  # pragma: no cover — ships with Home Assistant
+            _LOGGER.warning(
+                "power write unconfirmed OFF on %s: the persistent "
+                "notification component is unavailable — the unit's "
+                "state is UNKNOWN: check the panel",
+                address,
+            )
+            return
+        persistent_notification.async_create(
+            self.hass,
+            message,
+            title="Aqua Temp: unconfirmed OFF",
+            notification_id=notification_id,
+        )
+
+    def _dismiss_unconfirmed_off(self, address: str) -> None:
+        """FR-3 step 7: a later CONFIRMED cycle for the same unit clears
+        the notification (the unknown is resolved — the mirror
+        decided). Idempotent: HA's dismiss on a missing id is a
+        no-op, so this is safe on every confirmed cycle (a restart's
+        leftover notification included)."""
+        notification_id = f"aqua_temp_ble_power_unconfirmed_{address}"
+        try:
+            from homeassistant.components import persistent_notification
+        except ImportError:  # pragma: no cover — ships with Home Assistant
+            return
+        persistent_notification.async_dismiss(self.hass, notification_id)

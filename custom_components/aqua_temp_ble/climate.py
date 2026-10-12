@@ -75,13 +75,67 @@ class AquaTempClimateEntity(ClimateEntity, AquaTempEntity):
     ) -> None:
         ClimateEntity.__init__(self)
         AquaTempEntity.__init__(self, coordinator, entry, "climate")
-        # Spec 015 FR-8: the push-mode climate is READ-ONLY — no write
-        # feature advertised, no settable hvac_modes (an empty list renders
-        # no mode buttons; the reported hvac_mode stays a free-form state).
+        # Spec 015 FR-8: the push-mode climate is READ-ONLY while the
+        # 017 activation gate is closed — no write feature advertised,
+        # no settable hvac_modes (an empty list renders no mode buttons;
+        # the reported hvac_mode stays a free-form state). Spec 017
+        # FR-5 layers the gate-open surface on TOP via the live
+        # properties below (the option flips without a reload).
         self._read_only = read_only
         if read_only:
             self._attr_supported_features = ClimateEntityFeature(0)
             self._attr_hvac_modes = []
+
+    # ------------------------------------------------- live gate surface
+    # Spec 017 FR-5: the properties read the coordinator's activation
+    # gate LIVE (entry.options is the live mapping), so saving the
+    # write_control option re-renders the entity without a reload —
+    # the quickstart 017 §1 promise. While the gate is closed these
+    # return exactly the 015 read-only surface (byte-identical, AC-3);
+    # the classic entity never enters the branches at all.
+    @property
+    def hvac_modes(self) -> list[HVACMode]:
+        if self._read_only:
+            if self.coordinator.write_control_allowed:
+                # Heat-only unit (FR-8): COOL/AUTO are unsupported —
+                # the vendor's own app refuses mode changes here and
+                # its mode write would clobber an unpinned pair
+                # register (research 017 §5). OFF/HEAT map to the
+                # proven power writes only.
+                return [HVACMode.OFF, HVACMode.HEAT]
+            return []
+        return self._attr_hvac_modes
+
+    @property
+    def supported_features(self) -> ClimateEntityFeature:
+        if self._read_only:
+            if self.coordinator.write_control_allowed:
+                # The shipped HA climate API's turn-on/turn-off
+                # features where the installed HA defines them;
+                # TARGET_TEMPERATURE is NEVER advertised (no setpoint
+                # surface — FR-8).
+                features = ClimateEntityFeature(0)
+                if getattr(ClimateEntityFeature, "TURN_ON", None) is not None:
+                    features |= ClimateEntityFeature.TURN_ON
+                if getattr(ClimateEntityFeature, "TURN_OFF", None) is not None:
+                    features |= ClimateEntityFeature.TURN_OFF
+                return features
+            return ClimateEntityFeature(0)
+        return self._attr_supported_features
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Spec 017 FR-5 diagnostics: the write-control gate + the
+        last power-write verdict — the cheap support surface. The
+        locked surface and the classic entity keep their exact prior
+        surface (byte-identical, AC-3/US-6)."""
+        if not self._read_only or not self.coordinator.write_control_allowed:
+            return None
+        attrs: dict[str, Any] = {"write_control": "allowed"}
+        last = self.coordinator.last_control_write
+        if last is not None:
+            attrs["last_power_write"] = dict(last)
+        return attrs
 
     # ------------------------------------------------------------- unit conv
     @property
@@ -179,21 +233,54 @@ class AquaTempClimateEntity(ClimateEntity, AquaTempEntity):
         )
 
     async def async_turn_on(self) -> None:
-        """Spec 015 FR-8: refused on the read-only entity; the classic
-        entity defers to the base implementation (byte-identical)."""
+        """Spec 015 FR-8 / Spec 017 FR-5: while the activation gate is
+        closed the read-only entity refuses (the 015 surface,
+        byte-identical); with the gate open it sends the PROVEN
+        power-ON write (1011 = 1) through the confirmation cycle —
+        the mirror decides the displayed state, never the button.
+        The classic entity defers to the base implementation
+        (byte-identical)."""
         if self._read_only:
+            if self.coordinator.write_control_allowed:
+                await self.coordinator.async_control_write_power(1)
+                return
             self._refuse_write()
         await super().async_turn_on()
 
     async def async_turn_off(self) -> None:
-        """Spec 015 FR-8: refused on the read-only entity; the classic
-        entity defers to the base implementation (byte-identical)."""
+        """Spec 015 FR-8 / Spec 017 FR-5: the OFF twin — the PROVEN
+        power-OFF write (1011 = 0) through the confirmation cycle;
+        an unconfirmed OFF is never silent (the persistent
+        notification, FR-3 step 7). The classic entity defers to the
+        base implementation (byte-identical)."""
         if self._read_only:
+            if self.coordinator.write_control_allowed:
+                await self.coordinator.async_control_write_power(0)
+                return
             self._refuse_write()
         await super().async_turn_off()
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         if self._read_only:
+            # Spec 017 FR-5/FR-8: with the gate open, OFF/HEAT are both
+            # PURE power writes (the proven pair); anything else is
+            # unsupported — the mode is NOT pilotable on this heat-only
+            # unit (the vendor's own app refuses mode changes and its
+            # mode write would clobber register 1013 with an unpinned
+            # setpoint-shaped value, research 017 §5). With the gate
+            # closed the 015 refusal stands (byte-identical).
+            if self.coordinator.write_control_allowed:
+                if hvac_mode == HVACMode.OFF:
+                    await self.coordinator.async_control_write_power(0)
+                    return
+                if hvac_mode == HVACMode.HEAT:
+                    await self.coordinator.async_control_write_power(1)
+                    return
+                raise HomeAssistantError(
+                    f"unsupported hvac mode {hvac_mode!r}: this unit is "
+                    "heat-only — set_hvac_mode exposes OFF and HEAT only, "
+                    "both pure power writes (spec 017 FR-8)"
+                )
             self._refuse_write()
         if hvac_mode == HVACMode.OFF:
             await self.coordinator.async_write_register(registers.REG_POWER, 0)

@@ -78,7 +78,11 @@
           "temperature_unit": "Display temperature unit",
           "pair_on_connect": "Pair on connect (evidence-gated)",
           "push_temp_confirmed": "The captured temperatures match the app's parameter view (calibration verified)",
-          "push_control_confirmed": "The captured power/mode registers match the app's display (diff-toggle calibration verified)"
+          "push_control_confirmed": "The captured power/mode registers match the app's display (diff-toggle calibration verified)",
+          "write_control": "Allow power control (write)"
+        },
+        "data_description": {
+          "write_control": "Requires your own probe verdict: power write probe: EXECUTED + REVERSIBLE (mirror 2011 followed 0→1→0). While enabled, the climate's Heat/Off buttons really start and stop the pump — the same register write the vendor app's power slide sends."
         }
       }
     }

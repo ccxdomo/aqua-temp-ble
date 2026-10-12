@@ -105,6 +105,17 @@ PUSH_HARVEST_STARTS = frozenset({1001, 1046, 2001, 2046})
 # import — tests patch the module attribute (the _now seam pattern).
 PROBE_MIRROR_TIMEOUT = 20.0
 
+# Spec 017 (the controlled climate — phase 2): the write-control
+# activation's shipped default. The activation is the OWNER's act
+# alone (contract 017 §2 — never automatic, never set by any code
+# path); False keeps the integration byte-identical to 0.12.0 until
+# he checks the option after recording the probe's EXECUTED +
+# REVERSIBLE verdict (research 017 §1 — the decision log). The
+# per-entry option is the no-restart surface (the push_control_confirmed
+# precedent); the global registers.WRITE_CONTROL_PROVEN switch stays
+# the alternative (the calibration-switch precedent; restart).
+DEFAULT_WRITE_CONTROL = False
+
 # Config flow (spec 002) — scanning UX tuning (tasks.md block 1).
 # Flow-facing constants live here, next to the other integration-wide
 # knobs; everything above stays protocol-only.

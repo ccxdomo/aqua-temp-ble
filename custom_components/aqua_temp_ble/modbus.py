@@ -493,6 +493,32 @@ if __name__ == "__main__":
         ok = False
     _check("build_write_control == registers.WRITE_FRAME_* (NFR-2)", ok, failures)
 
+    # 13b. Spec 017 AC-1 — the funnel parity: the classic funnel
+    #     (build_write_registers), the control builder
+    #     (build_write_control) and registers' pinned strings produce
+    #     the SAME proven bytes — one source of truth; the frames the
+    #     confirmation cycle sends are provably the owner-proven
+    #     pair (NFR-2's cross-check extended to the third source).
+    try:
+        import registers as _registers_017
+
+        ok = (
+            build_write_registers(1011, [1])
+            == build_write_control(1011, 1)
+            == bytes.fromhex(_registers_017.WRITE_FRAME_POWER_ON)
+            and build_write_registers(1011, [0])
+            == build_write_control(1011, 0)
+            == bytes.fromhex(_registers_017.WRITE_FRAME_POWER_OFF)
+        )
+    except ImportError:  # pragma: no cover — registers.py sits beside modbus.py
+        ok = False
+    _check(
+        "funnel parity AC-1: build_write_registers(1011,[v]) == "
+        "build_write_control(1011,v) == the pinned power frames",
+        ok,
+        failures,
+    )
+
     # 12. parse_block_response error paths (plan 008 §1.1 validation order)
     corrupt_block = bytearray(frame1001)
     corrupt_block[10] ^= 0xFF

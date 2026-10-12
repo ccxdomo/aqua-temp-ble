@@ -2469,6 +2469,49 @@ class AquaTempBleClient:
             )
         await self._write_frame(frame)
 
+    async def write_control(self, address: int, value: int) -> None:
+        """The control plane's fire-and-forget send (spec 017 FR-2,
+        contract 017 §3/§4).
+
+        Frame: modbus.build_write_control(address, value) — the
+        pinned-parity builder (AC-1 asserts byte-equality with the
+        owner-proven strings; NFR-2's one source of truth). Send: the
+        SAME `_write_frame` seam as every other write (the 011-suite
+        override point), the session's resolved write mode —
+        without-response app parity on the production ff03 bucket
+        (contract 016 §5's parity table). NEVER `write_registers`: the
+        classic funnel's WRITE_ECHO_EXPECTED switch would wait 3 s and
+        raise a missing-echo timeout on every control write — the unit
+        executes without-response writes and no FC10 echo has ever
+        been observed (research 017 §6's echo trap; contract 017 §4:
+        the MIRROR is the confirmation, never an echo).
+
+        Client-side rail (FR-2, the write_probe_frame rail precedent):
+        only (registers.WRITE_REG_POWER, 0|1) may pass — defense in
+        depth under the funnel guard, because this method is public API
+        of the client; anything else raises ValueError BEFORE a byte
+        goes out. Raises AquaTempConnectionError when not connected
+        (the fire-and-forget path's existing precondition check).
+        """
+        if address != registers.WRITE_REG_POWER or value not in (0, 1):
+            raise ValueError(
+                f"write_control accepts only (register "
+                f"{registers.WRITE_REG_POWER}, value 0 or 1) — the proven "
+                "power frames only (contract 017 §3)"
+            )
+        if not self.is_connected:
+            raise AquaTempConnectionError("not connected")
+        frame = modbus.build_write_control(address, value)
+        _LOGGER.debug(
+            "TX control fire-and-forget (%d bytes): %s", len(frame), frame.hex()
+        )
+        try:
+            await self._write_frame(frame)
+        except AquaTempError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise AquaTempConnectionError(f"GATT write failed: {exc}") from exc
+
     # ------------------------------------------------- spec 013 harvest
     async def harvest_pushes(
         self,

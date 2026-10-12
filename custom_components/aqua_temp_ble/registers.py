@@ -336,7 +336,9 @@ ALLOWED_WRITE_CONTROL: dict[int, frozenset[int]] = {
 WRITE_CONTROL_PROVEN = False
 
 
-def ensure_writable(address: int, value: int | None = None) -> None:
+def ensure_writable(
+    address: int, value: int | None = None, *, control_allowed: bool | None = None
+) -> None:
     """Guard the single write funnel: raise ValueError unless allowed.
 
     coordinator.async_write_register calls this as its first statement,
@@ -355,6 +357,17 @@ def ensure_writable(address: int, value: int | None = None) -> None:
     power-write probe (coordinator.async_power_write_probe, which
     sends the pinned frames through the client's own seam, NOT through
     this funnel — contract 016 §5).
+
+    Spec 017 FR-3 step 1 adds the `control_allowed` thread: the
+    coordinator passes its activation property (registers.
+    WRITE_CONTROL_PROVEN OR the per-entry `write_control` option —
+    FR-1) so the OPTION surface honors the control write without a
+    restart. None (the default and every shipped caller) keeps the
+    module switch as the gate, byte-identical to 0.12.0 — no code path
+    may ever SET either surface (contract 017 §2); this thread only
+    reads the caller's own activation state per call. The base-block
+    rules ignore the thread entirely; the address AND value allowlists
+    stay permanent (contract 016 §4's value discipline).
     """
     allowed = ALLOWED_WRITE_BASE
     if WRITE_MODE_SETPOINT_TOO:
@@ -366,7 +379,10 @@ def ensure_writable(address: int, value: int | None = None) -> None:
     if address in allowed:
         return
     if address in ALLOWED_WRITE_CONTROL:
-        if not WRITE_CONTROL_PROVEN:
+        gate = (
+            WRITE_CONTROL_PROVEN if control_allowed is None else bool(control_allowed)
+        )
+        if not gate:
             raise ValueError(
                 f"register {address} is not writable (spec 003 §6; the "
                 "control plane stays locked until the power-write probe's "

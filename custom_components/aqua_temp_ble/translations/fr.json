@@ -78,7 +78,11 @@
           "temperature_unit": "Unité de température affichée",
           "pair_on_connect": "Appairer à la connexion (à activer après preuve)",
           "push_temp_confirmed": "Les températures capturées correspondent à la vue des paramètres de l'application (calibration vérifiée)",
-          "push_control_confirmed": "Les registres marche/arrêt et mode capturés correspondent à l'affichage de l'application (calibration par bascule vérifiée)"
+          "push_control_confirmed": "Les registres marche/arrêt et mode capturés correspondent à l'affichage de l'application (calibration par bascule vérifiée)",
+          "write_control": "Autoriser le pilotage marche/arrêt (écriture)"
+        },
+        "data_description": {
+          "write_control": "Requiert votre propre verdict de sonde : power write probe: EXECUTED + REVERSIBLE (mirror 2011 followed 0→1→0). Activé, les boutons Chauffage/Arrêt du climate démarrent et arrêtent réellement la pompe — la même écriture de registre que le bouton marche/arrêt de l'application du fabricant."
         }
       }
     }

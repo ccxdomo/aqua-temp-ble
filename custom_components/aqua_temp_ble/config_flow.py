@@ -41,6 +41,7 @@ from .const import (
     DEFAULT_PAIR_ON_CONNECT,
     DEFAULT_POLL_INTERVAL,
     DEFAULT_TEMPERATURE_UNIT,
+    DEFAULT_WRITE_CONTROL,
     DOMAIN,
     MAX_OTHER_DEVICES,
     NAME_PREFIXES,
@@ -874,6 +875,25 @@ class AquaTempOptionsFlowHandler(OptionsFlow):
                 vol.Required(
                     "push_control_confirmed",
                     default=current.get("push_control_confirmed", False),
+                )
+            ] = bool
+            # Spec 017 FR-1 (contract 017 §2): the write-control
+            # ACTIVATION — the owner's act alone, never automatic. The
+            # checkbox ships False (the integration stays
+            # byte-identical to 0.12.0); its description names the
+            # required probe verdict (the `power write probe:
+            # EXECUTED + REVERSIBLE` line, contract 016 §4's discipline
+            # surfaced to the UI). Checking it opens the climate's
+            # power-control surface (FR-5): the entities read the
+            # coordinator's gate live, so saving re-renders them — no
+            # Home Assistant restart needed (the push_control_confirmed
+            # precedent for the option's lifetime; the global
+            # registers.WRITE_CONTROL_PROVEN switch stays the
+            # alternative path).
+            schema[
+                vol.Required(
+                    "write_control",
+                    default=current.get("write_control", DEFAULT_WRITE_CONTROL),
                 )
             ] = bool
         return self.async_show_form(step_id="init", data_schema=vol.Schema(schema))
